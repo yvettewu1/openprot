@@ -4,7 +4,7 @@
 load("@pigweed//pw_kernel/tooling:target_codegen.bzl", "target_codegen")
 load("@pigweed//pw_kernel/tooling:target_linker_script.bzl", "target_linker_script")
 load("//target/ast10x0:defs.bzl", "TARGET_COMPATIBLE_WITH")
-load(":spimonitor_test.bzl", "spimonitor_setup_all", "spimonitor_test")
+load(":spimonitor_test.bzl", "spimonitor_ast2700_bmc_boot", "spimonitor_setup_all", "spimonitor_test")
 
 filegroup(
     name = "system_config",
@@ -35,6 +35,8 @@ spimonitor_test(3, TARGET_COMPATIBLE_WITH)
 spimonitor_test(4, TARGET_COMPATIBLE_WITH)
 
 spimonitor_setup_all(TARGET_COMPATIBLE_WITH)
+
+spimonitor_ast2700_bmc_boot(TARGET_COMPATIBLE_WITH)
 
 alias(
     name = "target",

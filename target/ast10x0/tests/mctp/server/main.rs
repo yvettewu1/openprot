@@ -62,9 +62,10 @@ use userspace::time::{Clock, Duration, Instant, SystemClock};
 
 use app_mctp_server::handle;
 
-const OWN_EID: u8 = 8;
-const OWN_I2C_ADDR: u8 = 0x10;
-const REMOTE_I2C_ADDR: u8 = 0x42;
+const OWN_EID: u8 = 11;
+//const OWN_I2C_ADDR: u8 = 0x70; //net2 
+const OWN_I2C_ADDR: u8 = 0x38; //net1
+const REMOTE_I2C_ADDR: u8 = 0x10;
 const I2C_RX_MAX: usize = MAX_PAYLOAD_SIZE;
 
 // ---------------------------------------------------------------------------

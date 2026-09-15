@@ -1,7 +1,7 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-//! I2C server app: board init + open Bus 2 + run the server-runtime loop.
+//! I2C server app: board init + open Bus 1 + run the server-runtime loop.
 
 #![no_main]
 #![no_std]
@@ -13,37 +13,28 @@ use userspace::entry;
 
 const SLAVE_CFG: I2cConfig = I2cConfig {
     speed: I2cSpeed::Standard,
-    xfer_mode: I2cXferMode::DmaMode,
-    multi_master: false,
+    xfer_mode: I2cXferMode::BufferMode,
+    multi_master: true,
     smbus_timeout: false,
     smbus_alert: false,
     clock_config: ClockConfig::ast1060_default(),
 };
 
-#[unsafe(link_section = ".ram_nc")]
-static mut MASTER_DMA_BUF: [u8; 4096] = [0u8; 4096];
-#[unsafe(link_section = ".ram_nc")]
-static mut SLAVE_DMA_BUF: [u8; 256] = [0u8; 256];
-
 #[entry]
 fn entry() {
-    // SAFETY: board init ran init_bus(2) in the kernel; buffers are non-cached and owned here.
-    let master_dma_buf: &'static mut [u8] =
-        unsafe { &mut *core::ptr::addr_of_mut!(MASTER_DMA_BUF) };
-    let slave_dma_buf: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(SLAVE_DMA_BUF) };
-    let driver =
-        match unsafe { i2c_backend::open_bus_dma(2, &SLAVE_CFG, master_dma_buf, slave_dma_buf) } {
-            Ok(d) => d,
-            Err(_) => {
-                pw_log::error!("open_bus_dma(2) failed");
-                loop {}
-            }
-        };
+    // SAFETY: board init ran init_bus(1) in the kernel; the server owns bus 1.
+    let driver = match unsafe { i2c_backend::open_bus(1, &SLAVE_CFG) } {
+        Ok(d) => d,
+        Err(_) => {
+            pw_log::error!("open_bus(1) failed");
+            loop {}
+        }
+    };
 
-    pw_log::info!("I2C server ready on Bus 2");
+    pw_log::info!("I2C server ready on Bus 1");
 
-    let mut buses = [Bus::new(handle::I2C, handle::I2C2_IRQ, driver)];
-    run(handle::WG, signals::I2C2, &mut buses);
+    let mut buses = [Bus::new(handle::I2C, handle::I2C1_IRQ, driver)];
+    run(handle::WG, signals::I2C1, &mut buses);
 }
 
 #[panic_handler]

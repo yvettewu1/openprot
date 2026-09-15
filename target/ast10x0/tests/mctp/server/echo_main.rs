@@ -9,9 +9,9 @@ use openprot_mctp_client_ipc::IpcMctpClient;
 use openprot_mctp_echo::{prepare_listener_with_eid_and_timeout, run_with_peer};
 use userspace::{entry, syscall};
 
-// Primary echo endpoint at EID 8, sends to peer at EID 9.
-const ECHO_EID: u8 = 8;
-const PEER_EID: u8 = 9;
+// Primary echo endpoint at EID 11, sends to peer at EID 10.
+const ECHO_EID: u8 = 11;
+const PEER_EID: u8 = 10;
 const LISTEN_TIMEOUT_MS: u32 = 100;
 #[entry]
 fn entry() {

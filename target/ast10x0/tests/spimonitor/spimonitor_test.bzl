@@ -98,3 +98,54 @@ def spimonitor_setup_all(target_compatible_with):
         binary = ":setup_all_spim_image",
         tags = ["kernel"],
     )
+
+def spimonitor_ast2700_bmc_boot(target_compatible_with):
+    rust_binary(
+        name = "target_ast2700_bmc_boot",
+        srcs = [
+            "target_ast2700_bmc_boot.rs",
+            "test_common.rs",
+        ],
+        crate_root = "target_ast2700_bmc_boot.rs",
+        edition = "2024",
+        tags = ["kernel"],
+        target_compatible_with = target_compatible_with,
+        deps = [
+            ":codegen",
+            ":linker_script",
+            "//target/ast10x0:entry",
+            "//target/ast10x0/board:ast10x0_board",
+            "//target/ast10x0/peripherals",
+            "@pigweed//pw_kernel/subsys/console:console_backend",
+            "@pigweed//pw_kernel/target:target_common",
+            "@pigweed//pw_log/rust:pw_log",
+        ],
+    )
+
+    system_image(
+        name = "ast2700_bmc_boot_image",
+        kernel = ":target_ast2700_bmc_boot",
+        platform = "//target/ast10x0",
+        system_config = ":system_config",
+        tags = ["kernel"],
+        target_compatible_with = target_compatible_with,
+        userspace = False,
+        visibility = ["//visibility:public"],
+    )
+
+    system_image_test(
+        name = "ast2700_bmc_boot_evb_test",
+        image = ":ast2700_bmc_boot_image",
+        tags = ["hardware"],
+        target_compatible_with = select({
+            "//target/ast10x0:qemu_enabled": ["@platforms//:incompatible"],
+            "//conditions:default": [],
+        }),
+        visibility = ["//visibility:public"],
+    )
+
+    rust_binary_no_panics_test(
+        name = "ast2700_bmc_boot_no_panics_test",
+        binary = ":ast2700_bmc_boot_image",
+        tags = ["kernel"],
+    )

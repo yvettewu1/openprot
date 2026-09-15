@@ -317,6 +317,7 @@ pub fn run<C: TestConfig>() -> Result<(), TestError> {
     let configured = initialize_monitor::<C>(log_buffer())?;
     test_passthrough_control(&configured)?;
     test_command_policy(&configured)?;
+    
     test_address_policy(&configured)?;
     test_policy_locking(configured)?;
 

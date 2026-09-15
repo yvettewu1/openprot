@@ -13,8 +13,8 @@
 use ast1060_pac as device;
 use ast10x0_peripherals::scu::{
     pinctrl::{
-        PINCTRL_GPIOL2, PINCTRL_GPIOL3, PINCTRL_SPIM1_DEFAULT, PINCTRL_SPIM2_DEFAULT,
-        PINCTRL_SPIM3_DEFAULT, PINCTRL_SPIM4_DEFAULT,
+        PINCTRL_GPIOH2, PINCTRL_GPIOL2, PINCTRL_GPIOL3, PINCTRL_GPIOM5, PINCTRL_SPIM1_DEFAULT,
+        PINCTRL_SPIM2_DEFAULT, PINCTRL_SPIM3_DEFAULT, PINCTRL_SPIM4_DEFAULT,
     },
     ScuError, ScuExtMuxSelect, ScuRegisters, SpiMonitorInstance, SpiMonitorPassthrough,
     SpiMonitorSource,
@@ -282,59 +282,50 @@ pub fn enable_flash_power(scu: &ScuRegisters) -> bool {
 
 /// Assert or release the active-low BMC reset outputs.
 ///
-/// The prot board routes BMC_SRST to SGPIOM output 8 and BMC_EXTRST to
-/// SGPIOM output 9. On assertion EXTRST is driven low first; on release SRST
-/// is driven high first.
+/// The AST2700 DCSCM board routes BMC_SRST to GPIO_M5 and BMC_EXTRST to
+/// GPIO_H2, matching the Zephyr `ast2700_dcscm_gpio_common.dts` mapping.
+/// On assertion EXTRST is driven low first; on release SRST is driven high
+/// first.
 #[must_use]
 pub fn set_bmc_resets(asserted: bool) -> bool {
-    const BMC_SRST_MASK: u32 = 1 << 8;
-    const BMC_EXTRST_MASK: u32 = 1 << 9;
-
-    let scu = unsafe { &*device::Scu::ptr() };
-    scu.scu41c().modify(|_, w| {
-        w.enbl_sgpiomaster_ckfn_pin()
-            .set_bit()
-            .enbl_sgpiomaster_ldfn_pin()
-            .set_bit()
-            .enbl_sgpiomaster_dofn_pin()
-            .set_bit()
-            .enbl_sgpiomaster_difn_pin()
-            .set_bit()
-    });
-
-    let sgpio = unsafe { &*device::Sgpiom::ptr() };
-    sgpio.gpio554().modify(|_, w| unsafe {
-        w.enbl_of_serial_gpio()
-            .set_bit()
-            .numbers_of_serial_gpiopins()
-            .bits(16)
-            .serial_gpioclk_division()
-            .bits(24)
-    });
-
+    const BMC_SRST_GPIO_M5: u32 = 1 << 5;
+    const BMC_EXTRST_GPIO_H2: u32 = 1 << 26;
     let output_high = !asserted;
-    let first_mask = if asserted {
-        BMC_EXTRST_MASK
+    let scu = unsafe { ScuRegisters::new_global_unlocked() };
+    scu.apply_pinctrl_group(PINCTRL_GPIOM5);
+    scu.apply_pinctrl_group(PINCTRL_GPIOH2);
+
+    let gpio = unsafe { &*device::Gpio::ptr() };
+    let first = if asserted {
+        BMC_EXTRST_GPIO_H2
     } else {
-        BMC_SRST_MASK
+        BMC_SRST_GPIO_M5
     };
-    let second_mask = if asserted {
-        BMC_SRST_MASK
+    let second = if asserted {
+        BMC_SRST_GPIO_M5
     } else {
-        BMC_EXTRST_MASK
+        BMC_EXTRST_GPIO_H2
     };
 
-    for mask in [first_mask, second_mask] {
-        let latch = sgpio.gpio570().read().bits();
-        sgpio
-            .gpio500()
-            .write(|w| unsafe { w.bits(update_bit(latch, mask, output_high)) });
+    gpio.gpio07c()
+        .modify(|r, w| unsafe { w.bits(r.bits() | BMC_SRST_GPIO_M5) });
+    gpio.gpio024()
+        .modify(|r, w| unsafe { w.bits(r.bits() | BMC_EXTRST_GPIO_H2) });
+
+    for mask in [first, second] {
+        if mask == BMC_SRST_GPIO_M5 {
+            gpio.gpio078()
+                .modify(|r, w| unsafe { w.bits(update_bit(r.bits(), mask, output_high)) });
+        } else {
+            gpio.gpio020()
+                .modify(|r, w| unsafe { w.bits(update_bit(r.bits(), mask, output_high)) });
+        }
         crate::delay_us(10_000);
     }
 
-    let latch = sgpio.gpio570().read().bits();
-    let reset_mask = BMC_SRST_MASK | BMC_EXTRST_MASK;
-    (latch & reset_mask == reset_mask) == output_high
+    let srst_high = gpio.gpio0cc().read().bits() & BMC_SRST_GPIO_M5 != 0;
+    let extrst_high = gpio.gpio0c4().read().bits() & BMC_EXTRST_GPIO_H2 != 0;
+    srst_high == output_high && extrst_high == output_high
 }
 
 #[derive(Clone, Copy)]
