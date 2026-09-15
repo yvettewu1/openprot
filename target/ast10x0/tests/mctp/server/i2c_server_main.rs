@@ -1,7 +1,7 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-//! I2C server app: board init + open Bus 1 + run the server-runtime loop.
+//! I2C server app: board init + open Bus 0 + run the server-runtime loop.
 
 #![no_main]
 #![no_std]
@@ -22,7 +22,7 @@ const SLAVE_CFG: I2cConfig = I2cConfig {
 
 #[entry]
 fn entry() {
-    // SAFETY: board init ran init_bus(1) in the kernel; the server owns bus 0.
+    // SAFETY: board init ran init_bus(0) in the kernel; the server owns bus 0.
     let driver = match unsafe { i2c_backend::open_bus(0, &SLAVE_CFG) } {
         Ok(d) => d,
         Err(_) => {

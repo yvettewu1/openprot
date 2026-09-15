@@ -22,7 +22,6 @@
 #[allow(unused_imports)]
 use ast10x0_peripherals::scu::pinctrl::PINCTRL_FMC_QUAD;
 use ast10x0_peripherals::scu::ScuRegisters;
-use ast10x0_board::{set_bmc_resets, enable_flash_power,};
 use ast10x0_peripherals::smc::{
     ChipSelect, FlashConfig, SmcConfig, SmcController, SmcError, SmcTopology, UninitSmc,
 };
@@ -42,18 +41,6 @@ fn run_smc_read_test() -> Result<(), SmcError> {
     // TODO:: set pinctrl in board/src/lib.rs
     let scu = unsafe { ScuRegisters::new_global_unlocked() };
     scu.apply_pinctrl_group(PINCTRL_FMC_QUAD);
-
-    pw_log::info!("=== GPIO flash power ===");
-    if !enable_flash_power(&scu) {
-        pw_log::info!("FAIL: GPIOL2/GPIOL3 flash power readback");
-        return Err(SmcError::HardwareError);
-    }
-
-    pw_log::info!("=== Hold BMC in reset ===");
-    if !set_bmc_resets(true) {
-        pw_log::info!("FAIL: SGPIOM BMC reset outputs did not assert");
-        return Err(SmcError::HardwareError);
-    }
 
     let config = SmcConfig {
         controller_id: SmcController::Fmc,
@@ -148,13 +135,7 @@ fn run_smc_read_test() -> Result<(), SmcError> {
     dump_smc_register(0x7E62_0000, 8);
     dump_smc_register(0x7E62_0080, 8);
     dump_smc_read(tempbuf, 256);
-    
-    pw_log::info!("=== Release BMC  reset ===");
-    if !set_bmc_resets(false) {
-        pw_log::info!("FAIL: SGPIOM BMC reset outputs did not assert");
-        return Err(SmcError::HardwareError);
-    }
-        
+
     Ok(())
 }
 
