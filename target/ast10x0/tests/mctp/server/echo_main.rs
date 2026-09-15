@@ -10,8 +10,8 @@ use openprot_mctp_echo::{prepare_listener_with_eid_and_timeout, run_with_peer};
 use userspace::{entry, syscall};
 
 // Primary echo endpoint at EID 11, sends to peer at EID 10.
-const ECHO_EID: u8 = 11;
-const PEER_EID: u8 = 10;
+const ECHO_EID: u8 = 13; // local EID
+const PEER_EID: u8 = 12; // ast2700 peer EID
 const LISTEN_TIMEOUT_MS: u32 = 100;
 #[entry]
 fn entry() {
