@@ -36,12 +36,12 @@
                             type: "channel_handler",
                         },
                         {
-                            name: "i2c1_irq",
+                            name: "i2c0_irq",
                             type: "interrupt",
                             irqs: [
                                 {
-                                    name: "i2c1",
-                                    number: 111,
+                                    name: "i2c0",
+                                    number: 110,
                                 },
                             ],
                         },

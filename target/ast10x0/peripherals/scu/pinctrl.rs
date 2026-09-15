@@ -537,6 +537,7 @@ paste! {
     gen_pin_pairs!(SCU6B0, 0x6B0, 31);
 }
 
+pub const PINCTRL_I2C0: &[PinctrlPin] = &[PIN_SCU414_28, PIN_SCU414_29];
 /// I2C1 pin group: SCL2/SDA2 mux selection on SCU414[30:31].
 ///
 /// The SVD names these EnblSCL2FnPin/EnblSDA2FnPin, but they correspond to

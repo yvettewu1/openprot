@@ -22,19 +22,19 @@ const SLAVE_CFG: I2cConfig = I2cConfig {
 
 #[entry]
 fn entry() {
-    // SAFETY: board init ran init_bus(1) in the kernel; the server owns bus 1.
-    let driver = match unsafe { i2c_backend::open_bus(1, &SLAVE_CFG) } {
+    // SAFETY: board init ran init_bus(1) in the kernel; the server owns bus 0.
+    let driver = match unsafe { i2c_backend::open_bus(0, &SLAVE_CFG) } {
         Ok(d) => d,
         Err(_) => {
-            pw_log::error!("open_bus(1) failed");
+            pw_log::error!("open_bus(0) failed");
             loop {}
         }
     };
 
-    pw_log::info!("I2C server ready on Bus 1");
+    pw_log::info!("I2C server ready on Bus 0");
 
-    let mut buses = [Bus::new(handle::I2C, handle::I2C1_IRQ, driver)];
-    run(handle::WG, signals::I2C1, &mut buses);
+    let mut buses = [Bus::new(handle::I2C, handle::I2C0_IRQ, driver)];
+    run(handle::WG, signals::I2C0, &mut buses);
 }
 
 #[panic_handler]

@@ -23,7 +23,7 @@ use target_common::{declare_target, TargetInterface};
 
 pub struct Target;
 
-const I2C1_CFG: I2cConfig = I2cConfig {
+const I2C0_CFG: I2cConfig = I2cConfig {
     speed: I2cSpeed::Standard,
     xfer_mode: I2cXferMode::BufferMode,
     multi_master: true,
@@ -32,10 +32,10 @@ const I2C1_CFG: I2cConfig = I2cConfig {
     clock_config: ClockConfig::ast1060_default(),
 };
 
-static PINCTRL_GROUPS: [&[ast10x0_peripherals::scu::PinctrlPin]; 1] = [pinctrl::PINCTRL_I2C1];
+static PINCTRL_GROUPS: [&[ast10x0_peripherals::scu::PinctrlPin]; 1] = [pinctrl::PINCTRL_I2C0];
 static I2C_BUSES: [I2cBusCfg; 1] = [I2cBusCfg {
-    bus: 1,
-    config: I2C1_CFG,
+    bus: 0,
+    config: I2C0_CFG,
 }];
 
 const WRITE_PROTECTED_LENGTH: u32 = 0x0010_0000;
