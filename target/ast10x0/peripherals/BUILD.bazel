@@ -48,6 +48,12 @@ rust_library(
         "i3c/mod.rs",
         "i3c/registers.rs",
         "i3c/types.rs",
+        "i3c_hci/constants.rs",
+        "i3c_hci/core.rs",
+        "i3c_hci/error.rs",
+        "i3c_hci/mod.rs",
+        "i3c_hci/registers.rs",
+        "i3c_hci/types.rs",
         "lib.rs",
         "otp/common.rs",
         "otp/mod.rs",
@@ -98,6 +104,7 @@ rust_library(
     deps = [
         "//hal/blocking",
         "@ast1060_pac",
+        "@ast1080_pac",
         "@pigweed//pw_log/rust:pw_log",
         "@rust_crates//:bitflags",
         "@rust_crates//:cortex-m",
@@ -141,5 +148,24 @@ rust_test(
     target_compatible_with = [
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",
+    ],
+)
+
+rust_library(
+    name = "i3c_hci",
+    srcs = [
+        "i3c_hci/constants.rs",
+        "i3c_hci/core.rs",
+        "i3c_hci/error.rs",
+        "i3c_hci/mod.rs",
+        "i3c_hci/registers.rs",
+        "i3c_hci/types.rs",
+    ],
+    crate_name = "ast10x0_i3c_hci",
+    crate_root = "i3c_hci/mod.rs",
+    edition = "2024",
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    deps = [
+        "@ast1080_pac",
     ],
 )

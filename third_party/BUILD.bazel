@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 exports_files([
-    "ast1060_pac.BUILD.bazel",
+    "ast1080_pac.BUILD.bazel",
+    #"ast1060_pac.BUILD.bazel",
     "vcell.BUILD.bazel",
 ])

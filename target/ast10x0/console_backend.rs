@@ -7,7 +7,7 @@
 
 #![no_std]
 
-use ast1060_pac as device;
+use ast1080_pac as device;
 use ast10x0_peripherals::uart::Usart;
 use embedded_io::Write;
 use kernel::sync::spinlock::SpinLock;

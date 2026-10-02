@@ -20,7 +20,7 @@ use core::ptr::{self, addr_of};
 unsafe fn jtag_init() {
     // Enable JTAG pins via SCU pinmux - must happen very early
     // Scu::steal() is safe here: it's a zero-sized type with no RAM allocation
-    let scu = unsafe { ast1060_pac::Scu::steal() };
+    let scu = unsafe { ast1080_pac::Scu::steal() };
 
     // SCU41C: Multi-function Pin Control - enable ARM JTAG pins
     scu.scu41c().modify(|_, w| {
@@ -53,9 +53,10 @@ unsafe fn jtag_init() {
 /// # Safety
 /// Caller must have exclusive early-boot ownership of SCU MMIO and must have
 /// already unlocked SCU write protection.
+/* ast1080 has no cache register in scu
 unsafe fn init_cache() {
     // SAFETY: see function-level safety contract.
-    let scu = unsafe { &*ast1060_pac::Scu::ptr() };
+    let scu = unsafe { &*ast1080_pac::Scu::ptr() };
 
     // Disable cache.
     scu.scua58().write(|w| unsafe { w.bits(0) });
@@ -69,22 +70,22 @@ unsafe fn init_cache() {
     // Re-enable cache.
     scu.scua58().write(|w| unsafe { w.bits(1) });
 }
-
+*/
 // Pre-kernel hardware initialization
 /// Runs before RAM is initialized, before main()
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
     // SAFETY: pre-init has exclusive early-boot ownership of SCU MMIO.
-    let scu = unsafe { &*ast1060_pac::Scu::ptr() };
+    let scu = unsafe { &*ast1080_pac::Scu::ptr() };
 
     // Unlock SCU write-protected registers.
-    scu.scu000().write(|w| unsafe { w.bits(0x1688_A8A8) });
+    scu.scu000().write(|w| unsafe { w.bits(0x8100_0000 ) });
 
     #[cfg(feature = "jtag-halt")]
     jtag_init();
 
     // SAFETY: SCU is unlocked above; pre-init has exclusive ownership.
-    unsafe { init_cache() };
+    // unsafe { init_cache() };
 }
 
 #[unsafe(no_mangle)]

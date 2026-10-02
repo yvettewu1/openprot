@@ -1,7 +1,7 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-use ast1060_pac as device;
+use ast1080_pac as device;
 use bitflags::bitflags;
 use core::marker::PhantomData;
 use embedded_hal_nb::serial as serial_nb;

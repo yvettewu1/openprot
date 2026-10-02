@@ -1010,6 +1010,17 @@ pub const PINCTRL_I3C2: &[PinctrlPin] = &[PIN_SCU418_20, PIN_SCU418_21];
 /// I3C bus 3 (PAC `I3c3`) — LV pads: SCL/SDA on SCU418[22:23].
 pub const PINCTRL_I3C3: &[PinctrlPin] = &[PIN_SCU418_22, PIN_SCU418_23];
 
+//AST1040/ast1080
+/// I3C HCI bus 0 (PAC `I3c`) — LV pads: SCL on SCU400[00:02]/SDA on SCU400[04:06]
+pub const PINCTRL_I3C_HCI0: &[PinctrlPin] = &[PIN_SCU400_00, PIN_SCU400_04];
+/// I3C HCI bus 1 (PAC `I3c1`) — LV pads: SCL on SCU400[08:10]/SDA on SCU400[12:14].
+pub const PINCTRL_I3C_HCI1: &[PinctrlPin] = &[PIN_SCU400_08, PIN_SCU400_12];
+/// I3C HCI bus 2 (PAC `I3c2`) — LV pads: SC Lon SCU400[16:18]/SDA on SCU400[20:22].
+pub const PINCTRL_I3C_HCI2: &[PinctrlPin] = &[PIN_SCU400_16, PIN_SCU400_20];
+/// I3C HCI bus 3 (PAC `I3c3`) — LV pads: SCL on SCU400[24:26]/SDA on SCU400[28:30].
+pub const PINCTRL_I3C_HCI3: &[PinctrlPin] = &[PIN_SCU400_24, PIN_SCU400_28];
+
+
 /// I3C bus 0 (PAC `I3c`) — HV pads: SCU4B8[8:9], clearing LV SCU418[8:9],[16:17].
 pub const PINCTRL_HVI3C0: &[PinctrlPin] = &[
     CLR_PIN_SCU418_8,

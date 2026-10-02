@@ -122,6 +122,13 @@ ast1060_pac_ext = use_extension(
 )
 use_repo(ast1060_pac_ext, "ast1060_pac", "vcell")
 
+# ── AST1080 Peripheral Access Crate (svd2rust-generated) ──
+ast1080_pac_ext = use_extension(
+    "//third_party:ast1080_pac.bzl",
+    "ast1080_pac_ext",
+)
+use_repo(ast1080_pac_ext, "ast1080_pac")
+
 hsm = use_extension("//third_party/hsm:extensions.bzl", "hsm")
 use_repo(hsm, "cloud_kms_hsm")
 
