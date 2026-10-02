@@ -6,7 +6,7 @@
 
 use ast10x0_i3c_hci::{
     constants, discover_sections_from_regs, parse_hci_version, select_command_descriptor,
-    CommandDescriptor, I3cHciConfig, I3cHciError, IoMode,
+    CommandDescriptor, I3cHciConfig, I3cHciError, I3cHciRegisters, IoMode,
 };
 use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
@@ -113,6 +113,51 @@ fn run_core_logic_tests() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn run_hardware_register_smoke_test() -> Result<(), &'static str> {
+    // SAFETY: This test is the only code touching HCI bus 0.
+    let regs = unsafe { I3cHciRegisters::new(0) }.ok_or("invalid I3C HCI bus")?;
+
+    let raw_version = regs.hci_version();
+    let version = parse_hci_version(raw_version).map_err(|_| "unsupported HCI version")?;
+    let caps = regs.hc_capabilities();
+    let dat = regs.dat_section();
+    let dct = regs.dct_section();
+    let rhs = regs.ring_headers_section();
+    let pio = regs.pio_section();
+    let ext = regs.ext_caps_section();
+    let sections = discover_sections_from_regs(version, dat, dct, rhs, pio, ext)
+        .map_err(|_| "invalid HCI section registers")?;
+
+    pw_log::info!(
+        "HCI{} version raw={:08x} major={} minor={} rev={} caps={:08x}",
+        regs.bus() as u32,
+        raw_version as u32,
+        version.major as u32,
+        version.minor as u32,
+        version.revision as u32,
+        caps as u32
+    );
+    pw_log::info!(
+        "HCI sections DAT off={:04x} entries={} size={} DCT off={:04x} entries={} size={}",
+        sections.dat.offset as u32,
+        sections.dat.entries as u32,
+        sections.dat.entry_size as u32,
+        sections.dct.offset as u32,
+        sections.dct.entries as u32,
+        sections.dct.entry_size as u32
+    );
+    pw_log::info!(
+        "HCI sections RHS={:04x} PIO={:04x} EXT={:04x} present={:08x} pio_q={:08x}",
+        sections.ring_headers_offset as u32,
+        sections.pio_offset as u32,
+        sections.ext_caps_offset as u32,
+        regs.present_state() as u32,
+        regs.pio_queue_size() as u32
+    );
+
+    Ok(())
+}
+
 fn run_i3c_hci_init_smoke_test() -> Result<(), &'static str> {
     pw_log::info!("=== AST10x0 I3C HCI init smoke test ===");
 
@@ -123,6 +168,9 @@ fn run_i3c_hci_init_smoke_test() -> Result<(), &'static str> {
 
     run_core_logic_tests()?;
     pw_log::info!("I3C HCI core logic checks passed");
+
+    run_hardware_register_smoke_test()?;
+    pw_log::info!("I3C HCI hardware register smoke checks passed");
 
     pw_log::info!("=== AST10x0 I3C HCI init smoke test complete ===");
     Ok(())
