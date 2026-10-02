@@ -3,6 +3,7 @@
 
 //! AST10x0 System Control Unit (SCU) module.
 
+/*
 pub mod cache;
 pub mod clock;
 pub mod pinctrl;
@@ -19,3 +20,12 @@ pub use types::{
     ClockRegisterHalf, ScuError, ScuExtMuxSelect, ScuRegisterHalf, SpiMonitorInstance,
     SpiMonitorPassthrough, SpiMonitorSource,
 };
+*/
+pub mod pinctrl;
+pub mod registers;
+pub mod reset;
+pub mod status;
+pub mod types;
+
+pub use pinctrl::PinctrlPin;
+pub use registers::ScuRegisters;

@@ -19,6 +19,7 @@ impl ScuRegisters {
     }
 
     /// Read the raw SCU690 multi-function control register value.
+    /*
     #[must_use]
     pub fn multi_func_690_raw(&self) -> u32 {
         self.regs().scu690().read().bits()
@@ -29,4 +30,5 @@ impl ScuRegisters {
     pub fn multi_func_694_raw(&self) -> u32 {
         self.regs().scu694().read().bits()
     }
+  */
 }

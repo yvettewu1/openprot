@@ -41,6 +41,39 @@ macro_rules! gen_pin_pairs {
 
 // Generate individual pin constants for each SCU register and bit position
 paste! {
+    gen_pin_pairs!(SCU400, 0x400, 0);
+    gen_pin_pairs!(SCU400, 0x400, 1);
+    gen_pin_pairs!(SCU400, 0x400, 2);
+    gen_pin_pairs!(SCU400, 0x400, 3);
+    gen_pin_pairs!(SCU400, 0x400, 4);
+    gen_pin_pairs!(SCU400, 0x400, 5);
+    gen_pin_pairs!(SCU400, 0x400, 6);
+    gen_pin_pairs!(SCU400, 0x400, 7);
+    gen_pin_pairs!(SCU400, 0x400, 8);
+    gen_pin_pairs!(SCU400, 0x400, 9);
+    gen_pin_pairs!(SCU400, 0x400, 10);
+    gen_pin_pairs!(SCU400, 0x400, 11);
+    gen_pin_pairs!(SCU400, 0x400, 12);
+    gen_pin_pairs!(SCU400, 0x400, 13);
+    gen_pin_pairs!(SCU400, 0x400, 14);
+    gen_pin_pairs!(SCU400, 0x400, 15);
+    gen_pin_pairs!(SCU400, 0x400, 16);
+    gen_pin_pairs!(SCU400, 0x400, 17);
+    gen_pin_pairs!(SCU400, 0x400, 18);
+    gen_pin_pairs!(SCU400, 0x400, 19);
+    gen_pin_pairs!(SCU400, 0x400, 20);
+    gen_pin_pairs!(SCU400, 0x400, 21);
+    gen_pin_pairs!(SCU400, 0x400, 22);
+    gen_pin_pairs!(SCU400, 0x400, 23);
+    gen_pin_pairs!(SCU400, 0x400, 24);
+    gen_pin_pairs!(SCU400, 0x400, 25);
+    gen_pin_pairs!(SCU400, 0x400, 26);
+    gen_pin_pairs!(SCU400, 0x400, 27);
+    gen_pin_pairs!(SCU400, 0x400, 28);
+    gen_pin_pairs!(SCU400, 0x400, 29);
+    gen_pin_pairs!(SCU400, 0x400, 30);
+    gen_pin_pairs!(SCU400, 0x400, 31);
+
     gen_pin_pairs!(SCU410, 0x410, 0);
     gen_pin_pairs!(SCU410, 0x410, 1);
     gen_pin_pairs!(SCU410, 0x410, 2);
@@ -1012,14 +1045,13 @@ pub const PINCTRL_I3C3: &[PinctrlPin] = &[PIN_SCU418_22, PIN_SCU418_23];
 
 //AST1040/ast1080
 /// I3C HCI bus 0 (PAC `I3c`) — LV pads: SCL on SCU400[00:02]/SDA on SCU400[04:06]
-pub const PINCTRL_I3C_HCI0: &[PinctrlPin] = &[PIN_SCU400_00, PIN_SCU400_04];
+pub const PINCTRL_I3C_HCI0: &[PinctrlPin] = &[PIN_SCU400_0, PIN_SCU400_4];
 /// I3C HCI bus 1 (PAC `I3c1`) — LV pads: SCL on SCU400[08:10]/SDA on SCU400[12:14].
-pub const PINCTRL_I3C_HCI1: &[PinctrlPin] = &[PIN_SCU400_08, PIN_SCU400_12];
+pub const PINCTRL_I3C_HCI1: &[PinctrlPin] = &[PIN_SCU400_8, PIN_SCU400_12];
 /// I3C HCI bus 2 (PAC `I3c2`) — LV pads: SC Lon SCU400[16:18]/SDA on SCU400[20:22].
 pub const PINCTRL_I3C_HCI2: &[PinctrlPin] = &[PIN_SCU400_16, PIN_SCU400_20];
 /// I3C HCI bus 3 (PAC `I3c3`) — LV pads: SCL on SCU400[24:26]/SDA on SCU400[28:30].
 pub const PINCTRL_I3C_HCI3: &[PinctrlPin] = &[PIN_SCU400_24, PIN_SCU400_28];
-
 
 /// I3C bus 0 (PAC `I3c`) — HV pads: SCU4B8[8:9], clearing LV SCU418[8:9],[16:17].
 pub const PINCTRL_HVI3C0: &[PinctrlPin] = &[
@@ -1104,6 +1136,10 @@ impl ScuRegisters {
         let regs = self.regs();
         for pin in pins {
             match pin.offset {
+                0x400 => modify_reg!(regs.scu400(), pin.bit, pin.clear),
+                0x404 => modify_reg!(regs.scu404(), pin.bit, pin.clear),
+                0x408 => modify_reg!(regs.scu408(), pin.bit, pin.clear),
+                0x40C => modify_reg!(regs.scu40c(), pin.bit, pin.clear),
                 0x410 => modify_reg!(regs.scu410(), pin.bit, pin.clear),
                 0x414 => modify_reg!(regs.scu414(), pin.bit, pin.clear),
                 0x418 => modify_reg!(regs.scu418(), pin.bit, pin.clear),
@@ -1114,11 +1150,13 @@ impl ScuRegisters {
                 0x4B4 => modify_reg!(regs.scu4b4(), pin.bit, pin.clear),
                 0x4B8 => modify_reg!(regs.scu4b8(), pin.bit, pin.clear),
                 0x4BC => modify_reg!(regs.scu4bc(), pin.bit, pin.clear),
+                /*
                 0x690 => modify_reg!(regs.scu690(), pin.bit, pin.clear),
                 0x694 => modify_reg!(regs.scu694(), pin.bit, pin.clear),
                 0x698 => modify_reg!(regs.scu698(), pin.bit, pin.clear),
                 0x69C => modify_reg!(regs.scu69c(), pin.bit, pin.clear),
                 0x6B0 => modify_reg!(regs.scu6b0(), pin.bit, pin.clear),
+                */
                 _ => {} // Unknown offset, silently ignore
             }
         }

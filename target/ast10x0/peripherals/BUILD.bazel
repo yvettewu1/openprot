@@ -154,6 +154,7 @@ rust_test(
 rust_library(
     name = "i3c_hci",
     srcs = [
+        "i3c_hci_crate.rs",
         "i3c_hci/constants.rs",
         "i3c_hci/core.rs",
         "i3c_hci/error.rs",
@@ -162,8 +163,27 @@ rust_library(
         "i3c_hci/types.rs",
     ],
     crate_name = "ast10x0_i3c_hci",
-    crate_root = "i3c_hci/mod.rs",
+    crate_root = "i3c_hci_crate.rs",
     edition = "2024",
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    deps = [
+        "@ast1080_pac",
+    ],
+)
+
+rust_library(
+    name = "scu_pinctrl",
+    srcs = [
+        "scu/pinctrl.rs",
+        "scu/registers.rs",
+        "scu_pinctrl.rs",
+    ],
+    crate_name = "ast10x0_scu_pinctrl",
+    crate_root = "scu_pinctrl.rs",
+    edition = "2024",
+    proc_macro_deps = [
+        "@rust_crates//:paste",
+    ],
     target_compatible_with = TARGET_COMPATIBLE_WITH,
     deps = [
         "@ast1080_pac",

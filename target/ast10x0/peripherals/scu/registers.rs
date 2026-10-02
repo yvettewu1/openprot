@@ -3,7 +3,8 @@
 
 //! AST10x0 SCU low-level register access.
 
-use ast1060_pac as device;
+//use ast1060_pac as device;
+use ast1080_pac as device;
 use core::marker::PhantomData;
 
 const SCU_UNLOCK_KEY: u32 = 0x1688_A8A8;
@@ -67,6 +68,8 @@ impl ScuRegisters {
     ///
     /// Call this once before a sequence of SCU writes, following the aspeed-rust
     /// pattern of a single unlock per batch of register operations.
+    //TODO: ast1040 SCU register are different from 1060
+    // there is no unlock register
     #[inline]
     pub(crate) fn unlock_write_protection(&self) {
         self.regs()

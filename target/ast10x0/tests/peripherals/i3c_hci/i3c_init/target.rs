@@ -4,16 +4,26 @@
 #![no_std]
 #![no_main]
 
-use ast10x0_board::{Ast10x0Board, Ast10x0BoardDescriptor};
 use ast10x0_i3c_hci::{
     constants, discover_sections_from_regs, parse_hci_version, select_command_descriptor,
     CommandDescriptor, I3cHciConfig, I3cHciError, IoMode,
 };
-use ast10x0_peripherals::scu::pinctrl;
+use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
-use console_backend::console_backend_write_all;
 use entry as _;
 use target_common::{declare_target, TargetInterface};
+
+const UART5_BASE: *const ast1080_pac::uart::RegisterBlock = 0x7e78_4000 as *const _;
+
+#[unsafe(no_mangle)]
+pub fn console_backend_write_all(buf: &[u8]) -> pw_status::Result<()> {
+    let uart = unsafe { &*UART5_BASE };
+    for byte in buf {
+        while !uart.uartlsr().read().thre().bit() {}
+        uart.uartthr().write(|w| unsafe { w.bits(*byte as u32) });
+    }
+    Ok(())
+}
 
 pub struct Target {}
 
@@ -106,14 +116,10 @@ fn run_core_logic_tests() -> Result<(), &'static str> {
 fn run_i3c_hci_init_smoke_test() -> Result<(), &'static str> {
     pw_log::info!("=== AST10x0 I3C HCI init smoke test ===");
 
-    let board = Ast10x0Board::new(Ast10x0BoardDescriptor {
-        pinctrl_groups: &[pinctrl::PINCTRL_I3C_HCI0],
-        i2c_buses: &[],
-    });
-    // SAFETY: Test target runs once at boot with exclusive access to the board.
-    // TODO: board init sequence and SCU programming may need HCI-specific updates.
-    unsafe { board.init() }.map_err(|_| "board init failed")?;
-    pw_log::info!("Board-level pinctrl applied for I3C HCI0");
+    // SAFETY: Test target runs once at boot with exclusive access to SCU.
+    let scu = unsafe { ScuRegisters::new_global_unlocked() };
+    scu.apply_pinctrl_group(pinctrl::PINCTRL_I3C_HCI0);
+    pw_log::info!("SCU pinctrl applied for I3C HCI0");
 
     run_core_logic_tests()?;
     pw_log::info!("I3C HCI core logic checks passed");
