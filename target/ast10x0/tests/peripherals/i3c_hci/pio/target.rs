@@ -7,8 +7,9 @@
 use ast10x0_i3c_hci::{
     bytes_from_word, classify_entdaa_response, i2c_mode, i3c_sdr_mode, odd_parity7,
     prepare_entdaa_step, prepare_next_entdaa_step, valid_i3c_address, validate_pio_transfer,
-    word_from_bytes, AddressSlots, DaaResponse, DatAllocator, DatEntryV1, HciCommandKind,
-    HciCommandV1, HciResponse, I3cHciError, PioTransfer,
+    word_from_bytes, AddressSlots, DaaResponse, DatAllocator, DatEntryV1, DctEntryV1,
+    HciCommandKind, HciCommandV1, HciDeviceTable, HciI3cDevice, HciResponse, I3cHciError,
+    PioTransfer,
 };
 use codegen as _;
 use entry as _;
@@ -90,6 +91,23 @@ fn run_pio_tests() -> Result<(), &'static str> {
     expect_true(read.words[0] == 0xe004_0030, "private read word0")?;
     expect_true(read.words[1] == 0x0008_0000, "private read word1")?;
 
+    let regular_write_for_status = HciCommandV1::i3c_private_write_regular(3, 10, 2, 0)
+        .map_err(|_| "private regular status write encode failed")?
+        .with_roc()
+        .with_toc();
+    expect_true(
+        regular_write_for_status.kind == HciCommandKind::Regular,
+        "private status write kind",
+    )?;
+    expect_true(
+        regular_write_for_status.words[0] == 0xc003_0050,
+        "private status write word0",
+    )?;
+    expect_true(
+        regular_write_for_status.words[1] == 0x0002_0000,
+        "private status write word1",
+    )?;
+
     let ccc = HciCommandV1::ccc(0, 7, false, 0x06, &[0x5a], 0, None)
         .map_err(|_| "CCC immediate encode failed")?;
     expect_true(ccc.words[0] == 0x0080_8339, "CCC immediate word0")?;
@@ -106,6 +124,13 @@ fn run_pio_tests() -> Result<(), &'static str> {
         ccc_with_db.words[1] == 0x0000_007e,
         "CCC defining-byte word1",
     )?;
+
+    let ccc_regular = HciCommandV1::ccc_regular(3, 11, false, 0x89, 5, 0, None)
+        .map_err(|_| "CCC regular write encode failed")?
+        .with_roc()
+        .with_toc();
+    expect_true(ccc_regular.words[0] == 0xc003_c458, "CCC regular word0")?;
+    expect_true(ccc_regular.words[1] == 0x0005_0000, "CCC regular word1")?;
 
     let internal =
         HciCommandV1::internal(8, 0x6, 0x12345).map_err(|_| "internal command encode failed")?;
@@ -126,6 +151,32 @@ fn run_pio_tests() -> Result<(), &'static str> {
     expect_true(dat.dynamic_addr() == 0x0a, "bad DAT dynamic address")?;
     expect_true(dat.word0 == 0x000a_6000, "bad DAT dynamic address word")?;
     expect_true(odd_parity7(0x0a), "bad odd parity helper")?;
+
+    let dct = DctEntryV1::from_words([0x1234_5678, 0x0000_9abc, 0x0000_abcd, 0]);
+    expect_true(dct.pid == 0x1234_5678_9abc, "bad DCT PID decode")?;
+    expect_true(dct.dcr == 0xcd, "bad DCT DCR decode")?;
+    expect_true(dct.bcr == 0xab, "bad DCT BCR decode")?;
+
+    let mut devices = HciDeviceTable::<2>::new();
+    let first_device = HciI3cDevice {
+        dat_index: 0x0a,
+        dynamic_addr: 0x0a,
+        pid: dct.pid,
+        bcr: dct.bcr,
+        dcr: dct.dcr,
+    };
+    devices
+        .push(first_device)
+        .map_err(|_| "device table push failed")?;
+    expect_true(devices.len() == 1, "bad device table len")?;
+    expect_true(
+        devices.by_dynamic_addr(0x0a) == Some(first_device),
+        "dynamic-address lookup failed",
+    )?;
+    expect_true(
+        devices.by_pid(dct.pid) == Some(first_device),
+        "PID lookup failed",
+    )?;
 
     let daa = prepare_entdaa_step(0x0a, 0x0a, 3).map_err(|_| "ENTDAA prepare failed")?;
     expect_true(daa.dynamic_addr == 0x0a, "bad DAA dynamic address")?;
@@ -162,6 +213,17 @@ fn run_pio_tests() -> Result<(), &'static str> {
     expect_true(
         planned_daa.dat_entry.word0 == 0x000a_6000,
         "bad planned DAT word",
+    )?;
+
+    let mut too_small_address_indexed_dat = DatAllocator::new(2, true);
+    expect_true(
+        prepare_next_entdaa_step(
+            &AddressSlots::new(),
+            &mut too_small_address_indexed_dat,
+            None,
+            5,
+        ) == Err(I3cHciError::NoSpace),
+        "address-indexed DAT fallback accepted",
     )?;
 
     let assigned = HciResponse::parse(0x0400_0000);

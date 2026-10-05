@@ -221,6 +221,48 @@ impl I3cHciRegisters {
     }
 
     #[inline]
+    fn table_word_ptr(
+        &self,
+        section_offset: u16,
+        entry_size: u8,
+        index: u8,
+        word: u8,
+    ) -> Option<*mut u32> {
+        if section_offset == 0 || entry_size == 0 || word >= 4 {
+            return None;
+        }
+        let byte_offset = usize::from(section_offset)
+            + usize::from(index) * usize::from(entry_size)
+            + usize::from(word) * core::mem::size_of::<u32>();
+        Some(unsafe { (self.regs as *mut u8).add(byte_offset).cast::<u32>() })
+    }
+
+    #[inline]
+    pub fn table_word(
+        &self,
+        section_offset: u16,
+        entry_size: u8,
+        index: u8,
+        word: u8,
+    ) -> Option<u32> {
+        self.table_word_ptr(section_offset, entry_size, index, word)
+            .map(|ptr| unsafe { core::ptr::read_volatile(ptr) })
+    }
+
+    #[inline]
+    pub fn write_table_word(
+        &self,
+        section_offset: u16,
+        entry_size: u8,
+        index: u8,
+        word: u8,
+        value: u32,
+    ) -> Option<()> {
+        self.table_word_ptr(section_offset, entry_size, index, word)
+            .map(|ptr| unsafe { core::ptr::write_volatile(ptr, value) })
+    }
+
+    #[inline]
     pub fn dat_entry0(&self) -> u32 {
         self.regs().hcidatsingle000().read().bits()
     }

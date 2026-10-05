@@ -103,6 +103,9 @@ impl DatAllocator {
                 self.mark(slot);
                 return Ok(slot);
             }
+            if self.address_indexed {
+                return Err(I3cHciError::NoSpace);
+            }
         }
 
         let mut slot = 0;

@@ -12,7 +12,9 @@ pub mod constants;
 pub mod core;
 pub mod daa;
 pub mod dat;
+pub mod dct;
 pub mod error;
+pub mod master;
 pub mod pio;
 pub mod registers;
 pub mod types;
@@ -28,7 +30,11 @@ pub use daa::{
     AddressSlots, DaaResponse, DaaStep, I3C_CCC_ENTDAA,
 };
 pub use dat::{odd_parity7, DatAllocator, DatEntryV1};
+pub use dct::{read_dct_entry_v1, DctEntryV1, DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS};
 pub use error::{I3cHciError, Result};
+pub use master::{
+    HciDeviceTable, HciDeviceTableIter, HciI3cDevice, I3cHciMaster, I3C_BROADCAST_ADDR,
+};
 pub use pio::{
     bytes_from_word, validate_pio_transfer, word_from_bytes, I3cHciPio, PioTransfer,
     PioTransferResult,

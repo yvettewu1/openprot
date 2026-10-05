@@ -117,6 +117,15 @@ impl HciCommandV1 {
         Self::i3c_private(dat_index, tid, false, data, mode)
     }
 
+    pub fn i3c_private_write_regular(
+        dat_index: u8,
+        tid: u8,
+        data_len: usize,
+        mode: u8,
+    ) -> Result<Self> {
+        Self::regular(dat_index, tid, false, data_len, mode, None, false, None)
+    }
+
     pub fn i3c_private_read(dat_index: u8, tid: u8, len: usize, mode: u8) -> Result<Self> {
         Self::regular(dat_index, tid, true, len, mode, None, false, None)
     }
@@ -135,6 +144,27 @@ impl HciCommandV1 {
             tid,
             read,
             data,
+            mode,
+            Some(ccc),
+            true,
+            defining_byte,
+        )
+    }
+
+    pub fn ccc_regular(
+        dat_index: u8,
+        tid: u8,
+        read: bool,
+        ccc: u8,
+        data_len: usize,
+        mode: u8,
+        defining_byte: Option<u8>,
+    ) -> Result<Self> {
+        Self::regular(
+            dat_index,
+            tid,
+            read,
+            data_len,
             mode,
             Some(ccc),
             true,

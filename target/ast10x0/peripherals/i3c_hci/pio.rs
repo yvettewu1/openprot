@@ -99,6 +99,21 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         Ok(PioTransferResult { response, rx_len })
     }
 
+    pub fn submit_v1_no_response(&mut self, transfer: PioTransfer<'_>) -> Result<()> {
+        validate_pio_transfer(&transfer)?;
+        if transfer.command.expects_response() {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        self.check_errors()?;
+        self.write_tx_data(transfer.tx)?;
+        self.wait_status(STAT_CMD_QUEUE_READY)?;
+        self.regs
+            .write_pio_command_queue_port(transfer.command.words[0]);
+        self.regs
+            .write_pio_command_queue_port(transfer.command.words[1]);
+        Ok(())
+    }
+
     fn write_tx_data(&mut self, tx: &[u8]) -> Result<()> {
         let mut offset = 0;
         while offset < tx.len() {
