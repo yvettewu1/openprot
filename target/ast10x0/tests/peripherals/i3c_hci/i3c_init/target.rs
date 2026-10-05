@@ -5,8 +5,9 @@
 #![no_main]
 
 use ast10x0_i3c_hci::{
-    constants, discover_sections_from_regs, parse_hci_version, select_command_descriptor,
-    CommandDescriptor, I3cHciConfig, I3cHciError, I3cHciRegisters, IoMode,
+    bytes_from_word, constants, discover_sections_from_regs, i3c_sdr_mode, parse_hci_version,
+    select_command_descriptor, word_from_bytes, CommandDescriptor, HciCommandKind, HciCommandV1,
+    HciResponse, I3cHciConfig, I3cHciError, I3cHciRegisters, IoMode,
 };
 use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
@@ -113,6 +114,55 @@ fn run_core_logic_tests() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn run_phase2_command_logic_tests() -> Result<(), &'static str> {
+    expect_true(i3c_sdr_mode(12_500_000) == 0, "bad SDR0 mode")?;
+    expect_true(i3c_sdr_mode(8_000_000) == 1, "bad SDR1 boundary")?;
+    expect_true(i3c_sdr_mode(2_000_000) == 4, "bad SDR4 boundary")?;
+
+    expect_true(
+        word_from_bytes(&[0x11, 0x22, 0x33, 0x44]) == 0x4433_2211,
+        "bad TX word pack",
+    )?;
+    let mut unpacked = [0u8; 3];
+    bytes_from_word(0x00cc_bbaa, &mut unpacked);
+    expect_true(unpacked == [0xaa, 0xbb, 0xcc], "bad RX word unpack")?;
+
+    let immediate = HciCommandV1::i3c_private_write(3, 5, &[0xaa, 0xbb], 0)
+        .map_err(|_| "private immediate encode failed")?;
+    expect_true(
+        immediate.kind == HciCommandKind::Immediate,
+        "private immediate kind",
+    )?;
+    expect_true(immediate.tid == 5, "private immediate tid")?;
+    expect_true(immediate.words[0] == 0x0103_0029, "private immediate word0")?;
+    expect_true(immediate.words[1] == 0x0000_bbaa, "private immediate word1")?;
+
+    let read =
+        HciCommandV1::i3c_private_read(4, 6, 8, 0).map_err(|_| "private read encode failed")?;
+    expect_true(read.kind == HciCommandKind::Regular, "private read kind")?;
+    expect_true(read.words[0] == 0x2004_0030, "private read word0")?;
+    expect_true(read.words[1] == 0x0008_0000, "private read word1")?;
+
+    let ccc = HciCommandV1::ccc(0, 7, false, 0x06, &[0x5a], 0, None)
+        .map_err(|_| "CCC immediate encode failed")?;
+    expect_true(ccc.words[0] == 0x0080_8339, "CCC immediate word0")?;
+    expect_true(ccc.words[1] == 0x0000_005a, "CCC immediate word1")?;
+
+    let internal =
+        HciCommandV1::internal(8, 0x6, 0x12345).map_err(|_| "internal command encode failed")?;
+    expect_true(internal.kind == HciCommandKind::Internal, "internal kind")?;
+    expect_true(internal.expects_response(), "internal response expectation")?;
+    expect_true(internal.words[0] == 0x1234_5647, "internal word0")?;
+
+    let response = HciResponse::parse(0x0500_0010);
+    expect_true(response.status == 0, "response status")?;
+    expect_true(response.tid == 5, "response tid")?;
+    expect_true(response.data_len == 16, "response data length")?;
+    expect_true(response.success(), "response success")?;
+
+    Ok(())
+}
+
 fn run_hardware_register_smoke_test() -> Result<(), &'static str> {
     // SAFETY: This test is the only code touching HCI bus 0.
     let regs = unsafe { I3cHciRegisters::new(0) }.ok_or("invalid I3C HCI bus")?;
@@ -168,6 +218,9 @@ fn run_i3c_hci_init_smoke_test() -> Result<(), &'static str> {
 
     run_core_logic_tests()?;
     pw_log::info!("I3C HCI core logic checks passed");
+
+    run_phase2_command_logic_tests()?;
+    pw_log::info!("I3C HCI phase 2 command logic checks passed");
 
     run_hardware_register_smoke_test()?;
     pw_log::info!("I3C HCI hardware register smoke checks passed");

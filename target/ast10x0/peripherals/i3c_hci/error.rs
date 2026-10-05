@@ -10,6 +10,9 @@ pub enum I3cHciError {
     Timeout,
     Busy,
     Unsupported,
+    NoSpace,
+    Transfer(u8),
+    TransferStatus(u32),
 }
 
 pub type Result<T> = core::result::Result<T, I3cHciError>;
