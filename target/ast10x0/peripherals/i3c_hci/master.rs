@@ -78,6 +78,23 @@ impl<const N: usize> HciDeviceTable<N> {
         Ok(())
     }
 
+    pub fn push_or_replace(&mut self, device: HciI3cDevice) -> Result<()> {
+        let mut idx = 0;
+        while idx < self.len {
+            if let Some(entry) = self.entries[idx] {
+                if entry.dat_index == device.dat_index
+                    || (device.pid != 0 && entry.pid == device.pid)
+                {
+                    self.entries[idx] = Some(device);
+                    return Ok(());
+                }
+            }
+            idx += 1;
+        }
+
+        self.push(device)
+    }
+
     #[must_use]
     pub fn by_dynamic_addr(&self, dynamic_addr: u8) -> Option<HciI3cDevice> {
         self.iter()
@@ -158,6 +175,16 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         self.write_dat_entry(
             dat_index,
             DatEntryV1::rejected().with_dynamic_addr(dynamic_addr),
+        )
+    }
+
+    pub fn attach_static_i3c_device(&mut self, dat_index: u8, static_addr: u8) -> Result<()> {
+        if !valid_i3c_addr(static_addr) {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        self.write_dat_entry(
+            dat_index,
+            DatEntryV1::rejected().with_static_addr(static_addr),
         )
     }
 
@@ -483,4 +510,9 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         self.next_tid = self.next_tid.wrapping_add(1) & 0x0f;
         tid
     }
+}
+
+#[must_use]
+const fn valid_i3c_addr(address: u8) -> bool {
+    address > 0x07 && address < I3C_BROADCAST_ADDR
 }

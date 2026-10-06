@@ -178,6 +178,45 @@ fn run_pio_tests() -> Result<(), &'static str> {
         "PID lookup failed",
     )?;
 
+    let moved_device = HciI3cDevice {
+        dat_index: first_device.dat_index,
+        dynamic_addr: 0x0b,
+        pid: first_device.pid,
+        bcr: first_device.bcr,
+        dcr: first_device.dcr,
+    };
+    devices
+        .push_or_replace(moved_device)
+        .map_err(|_| "device table replace failed")?;
+    expect_true(devices.len() == 1, "device table replace changed len")?;
+    expect_true(
+        devices.by_dynamic_addr(0x0b) == Some(moved_device),
+        "dynamic-address replace failed",
+    )?;
+
+    let static_device = HciI3cDevice {
+        dat_index: 0x0c,
+        dynamic_addr: 0x0c,
+        pid: 0,
+        bcr: 0,
+        dcr: 0,
+    };
+    devices
+        .push_or_replace(static_device)
+        .map_err(|_| "unknown-PID table push failed")?;
+    expect_true(devices.len() == 2, "unknown-PID push changed wrong len")?;
+    let other_static_device = HciI3cDevice {
+        dat_index: 0x0d,
+        dynamic_addr: 0x0d,
+        pid: 0,
+        bcr: 0,
+        dcr: 0,
+    };
+    expect_true(
+        devices.push_or_replace(other_static_device) == Err(I3cHciError::NoSpace),
+        "unknown-PID device replaced unrelated entry",
+    )?;
+
     let daa = prepare_entdaa_step(0x0a, 0x0a, 3).map_err(|_| "ENTDAA prepare failed")?;
     expect_true(daa.dynamic_addr == 0x0a, "bad DAA dynamic address")?;
     expect_true(daa.dat_index == 0x0a, "bad DAA DAT index")?;
