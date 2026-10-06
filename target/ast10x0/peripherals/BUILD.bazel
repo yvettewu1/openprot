@@ -55,6 +55,7 @@ rust_library(
         "i3c_hci/dat.rs",
         "i3c_hci/dct.rs",
         "i3c_hci/error.rs",
+        "i3c_hci/irq.rs",
         "i3c_hci/mod.rs",
         "i3c_hci/master.rs",
         "i3c_hci/pio.rs",
@@ -168,6 +169,7 @@ rust_library(
         "i3c_hci/dat.rs",
         "i3c_hci/dct.rs",
         "i3c_hci/error.rs",
+        "i3c_hci/irq.rs",
         "i3c_hci/mod.rs",
         "i3c_hci/master.rs",
         "i3c_hci/pio.rs",
@@ -180,6 +182,7 @@ rust_library(
     target_compatible_with = TARGET_COMPATIBLE_WITH,
     deps = [
         "@ast1080_pac",
+        "@rust_crates//:critical-section",
     ],
 )
 

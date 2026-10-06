@@ -9,6 +9,7 @@
 
 use super::constants;
 use super::error::{I3cHciError, Result};
+use super::irq::IsrCtx;
 use super::registers::I3cHciRegisters;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +136,42 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.select_io_ops()?;
         Ok(())
     }
+    
+    pub fn isr_ctx(&self) -> Result<IsrCtx> {
+        let io_mode = self.selected_io.ok_or(I3cHciError::InvalidArgs)?;
+
+        // SAFETY:
+        // This creates a second facade over the same MMIO registers solely for
+        // interrupt context. The ISR does not share Rust-owned mutable state with
+        // this core object.
+        unsafe { IsrCtx::new(self.config.bus, io_mode) }
+            .ok_or(I3cHciError::InvalidBus)
+    }
+    
+    pub fn enable_irq_signals(&self) {
+        let status = self.regs.intr_status();
+
+        if status != 0 {
+            self.regs.write_intr_status(status);
+        }
+
+        self.regs
+            .write_intr_status_enable(constants::MIPI_I3C_HCI_CORE_IRQS);
+        self.regs
+            .write_intr_signal_enable(constants::MIPI_I3C_HCI_CORE_IRQS);
+
+        let pio_irqs =
+            super::pio::STAT_RESP_READY
+            | super::pio::STAT_ALL_ERRORS;
+
+        self.regs.write_pio_intr_status_enable(pio_irqs);
+        self.regs.write_pio_intr_signal_enable(pio_irqs);
+    }
+
+    pub fn disable_irq_signals(&self) {
+        self.regs.write_intr_signal_enable(0);
+        self.regs.write_pio_intr_signal_enable(0);
+    }
 
     fn detect_version(&mut self) -> Result<()> {
         self.version = Some(parse_hci_version(self.regs.hci_version())?);
@@ -154,7 +191,7 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         )?;
         Ok(())
     }
-
+    
     fn soft_reset(&mut self) -> Result<()> {
         self.wait_reset_clear()?;
         self.regs.write_reset_control(constants::SOFT_RST);

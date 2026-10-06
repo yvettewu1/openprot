@@ -9,6 +9,9 @@ use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
 use entry as _;
 use target_common::{declare_target, TargetInterface};
+use ast10x0_i3c_hci::dispatch_i3c_hci_irq;
+use kernel::Kernel;
+use cortex_m::peripheral::NVIC;
 
 const UART5_BASE: *const ast1080_pac::uart::RegisterBlock = 0x7e78_4000 as *const _;
 const I3C_BUS: u8 = 0;
@@ -18,6 +21,11 @@ const MAX_I3C_DEVICES: usize = 8;
 const EXPECTED_MIN_DEVICES: usize = 2;
 const ADDRESS_INDEXED_DAT: bool = true;
 const I3C_CCC_GETPID: u8 = 0x8d;
+
+pub fn i3c0_irq<K: Kernel>(_kernel: K) {
+    dispatch_i3c_hci_irq(I3C_BUS as usize);
+}
+
 
 #[unsafe(no_mangle)]
 pub fn console_backend_write_all(buf: &[u8]) -> pw_status::Result<()> {
@@ -53,6 +61,28 @@ fn run_master_multi_test() -> Result<(), &'static str> {
     expect_true(sections.dat.entries > 0, "HCI DAT table missing")?;
     expect_true(sections.dct.entries > 0, "HCI DCT table missing")?;
 
+    // enable irq
+    let ctx = core
+    .isr_ctx()
+    .map_err(|_| "HCI ISR context create failed")?;
+
+    if !ast10x0_i3c_hci::register_i3c_hci_irq_handler(
+        I3C_BUS as usize,
+        ctx,
+    ) {
+        return Err("HCI IRQ registration failed");
+    }
+
+    core.enable_irq_signals();
+    // The kernel vector (system.json5 IRQ 96 -> `i3c0_irq`) is in place and
+    // the handler is registered; this integration layer owns the NVIC line
+    // for the bus it selected (`I3C_BUS` = 0 -> `Interrupt::i3c0`), so unmask
+    // it now.
+    // SAFETY: handler registered and hardware initialized (Ready state);
+    // unmasking cannot deliver an IRQ into partially-initialized state.
+    unsafe {
+        NVIC::unmask(ast1080_pac::Interrupt::i3c);
+    }
     let dat_entries = if sections.dat.entries > 128 {
         128
     } else {
@@ -88,6 +118,16 @@ fn run_master_multi_test() -> Result<(), &'static str> {
             .ccc_direct_read_addr(&table, device.dynamic_addr, I3C_CCC_GETPID, None, &mut pid)
             .map_err(|_| "GETPID by dynamic address failed")?;
         expect_true(result.rx_len == pid.len(), "GETPID short read")?;
+
+        let irq_status = ast10x0_i3c_hci::isr_events(I3C_BUS as usize)
+            .ok_or("missing HCI ISR events")?
+            .take_io_status();
+
+        expect_true(
+            irq_status & ast10x0_i3c_hci::pio::STAT_RESP_READY != 0,
+            "PIO response IRQ not observed",
+        )?;
+
         pw_log::info!(
             "GETPID da={:02x} bytes={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             device.dynamic_addr as u32,

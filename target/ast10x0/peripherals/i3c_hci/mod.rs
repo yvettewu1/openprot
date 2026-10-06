@@ -14,6 +14,7 @@ pub mod daa;
 pub mod dat;
 pub mod dct;
 pub mod error;
+pub mod irq;
 pub mod master;
 pub mod pio;
 pub mod registers;
@@ -32,6 +33,10 @@ pub use daa::{
 pub use dat::{odd_parity7, DatAllocator, DatEntryV1};
 pub use dct::{read_dct_entry_v1, DctEntryV1, DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS};
 pub use error::{I3cHciError, Result};
+pub use irq::{
+    dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler,
+    unregister_i3c_hci_irq_handler, IsrCtx, IsrEvents,
+};
 pub use master::{
     HciDeviceTable, HciDeviceTableIter, HciI3cDevice, I3cHciMaster, I3C_BROADCAST_ADDR,
 };
