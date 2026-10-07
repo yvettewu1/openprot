@@ -9,9 +9,14 @@
 //! - private controller -> target writes
 //! - target -> controller read data
 //!
-//! IBI and Hot-Join belong to Phase 7.
+//! Phase 7 adds target IBI and Hot-Join request helpers.
 
 use super::cmd::TID_TARGET_RD_DATA;
+use super::constants::{
+    ASPEED_I3C_SLV_CAP_CTRL_HJ_REQ, ASPEED_I3C_SLV_CAP_CTRL_HJ_WAIT,
+    ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ, ASPEED_I3C_SLV_CAP_CTRL_IBI_WAIT, ASPEED_I3C_SLV_STS1_HJ_EN,
+    ASPEED_I3C_SLV_STS1_IBI_EN,
+};
 use super::daa::valid_i3c_address;
 use super::error::{I3cHciError, Result};
 use super::pio::{I3cHciPio, TargetResponse, STAT_ALL_ERRORS, STAT_RESP_READY};
@@ -104,11 +109,11 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
          */
         self.regs.aspeed_init(InitMode::Target);
 
-        /*
-         * Enable only what Phase 6 needs.
-         *
-         * IBI/HJ/etc. will be added in Phase 7.
-         */
+        let cap_ctrl = self.regs.aspeed_slave_cap_ctrl();
+        self.regs.write_aspeed_slave_cap_ctrl(
+            cap_ctrl | ASPEED_I3C_SLV_CAP_CTRL_IBI_WAIT | ASPEED_I3C_SLV_CAP_CTRL_HJ_WAIT,
+        );
+
         self.regs.write_pio_intr_status_enable(TARGET_PIO_IRQS);
 
         self.regs.write_pio_intr_signal_enable(TARGET_PIO_IRQS);
@@ -154,6 +159,49 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         }
 
         self.pio.target_queue_read_data(data)
+    }
+
+    /// Queue optional IBI payload bytes before requesting an IBI.
+    pub fn queue_ibi_payload(&mut self, data: &[u8]) -> Result<()> {
+        if !self.enabled {
+            return Err(I3cHciError::Busy);
+        }
+
+        self.pio.target_queue_ibi_payload(data)
+    }
+
+    /// Raise a target interrupt IBI.
+    ///
+    /// ASPEED target mode follows Zephyr/AST2700 behavior: first make sure the
+    /// active controller enabled SIR for this target, then set the private
+    /// IBI request bit and wait for hardware to consume it.
+    pub fn request_ibi(&mut self) -> Result<()> {
+        if !self.enabled {
+            return Err(I3cHciError::Busy);
+        }
+
+        if (self.regs.aspeed_slave_status1() & ASPEED_I3C_SLV_STS1_IBI_EN) == 0 {
+            return Err(I3cHciError::Busy);
+        }
+
+        self.request_slave_capability(ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ)
+    }
+
+    /// Request Hot-Join while the target has no dynamic address.
+    pub fn request_hotjoin(&mut self) -> Result<()> {
+        if !self.enabled {
+            return Err(I3cHciError::Busy);
+        }
+
+        if self.dynamic_addr().is_some() {
+            return Err(I3cHciError::InvalidArgs);
+        }
+
+        if (self.regs.aspeed_slave_status1() & ASPEED_I3C_SLV_STS1_HJ_EN) == 0 {
+            return Err(I3cHciError::Busy);
+        }
+
+        self.request_slave_capability(ASPEED_I3C_SLV_CAP_CTRL_HJ_REQ)
     }
 
     /// Wait for and process the next target response.
@@ -202,5 +250,12 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         self.regs.write_pio_intr_signal_enable(TARGET_PIO_IRQS);
 
         Ok(event)
+    }
+
+    fn request_slave_capability(&mut self, request_bit: u32) -> Result<()> {
+        let cap_ctrl = self.regs.aspeed_slave_cap_ctrl();
+        self.regs
+            .write_aspeed_slave_cap_ctrl(cap_ctrl | request_bit);
+        self.pio.wait_aspeed_cap_ctrl_clear(request_bit)
     }
 }

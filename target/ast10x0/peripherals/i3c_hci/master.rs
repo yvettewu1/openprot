@@ -9,13 +9,25 @@ use super::daa::{
     classify_entdaa_response, prepare_entdaa_step, prepare_next_entdaa_step, AddressSlots,
     DaaResponse,
 };
-use super::dat::{DatAllocator, DatEntryV1, DAT_V1_ENTRY_SIZE};
+use super::dat::{
+    DatAllocator, DatEntryV1, DAT_0_IBI_PAYLOAD, DAT_0_SIR_REJECT, DAT_V1_ENTRY_SIZE,
+};
 use super::dct::{read_dct_entry_v1, DctEntryV1};
 use super::error::{I3cHciError, Result};
-use super::pio::{I3cHciPio, PioTransfer, PioTransferResult};
+use super::pio::{
+    I3cHciPio, IbiStatus, PioTransfer, PioTransferResult, STAT_ALL_ERRORS, STAT_IBI_STATUS_THLD,
+};
 use super::registers::I3cHciRegisters;
 
 pub const I3C_BROADCAST_ADDR: u8 = 0x7e;
+pub const I3C_HOT_JOIN_ADDR: u8 = 0x02;
+pub const I3C_CCC_ENEC_BROADCAST: u8 = 0x00;
+pub const I3C_CCC_DISEC_BROADCAST: u8 = 0x01;
+pub const I3C_CCC_ENEC_DIRECT: u8 = 0x80;
+pub const I3C_CCC_DISEC_DIRECT: u8 = 0x81;
+pub const I3C_CCC_EVENT_SIR: u8 = 1 << 0;
+pub const I3C_CCC_EVENT_MR: u8 = 1 << 1;
+pub const I3C_CCC_EVENT_HJ: u8 = 1 << 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HciI3cDevice {
@@ -138,6 +150,22 @@ impl<const N: usize> Iterator for HciDeviceTableIter<'_, N> {
         }
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HciIbiEvent {
+    TargetInterrupt {
+        device: HciI3cDevice,
+        status: IbiStatus,
+        payload_len: usize,
+    },
+    HotJoin {
+        status: IbiStatus,
+    },
+    Unknown {
+        status: IbiStatus,
+        payload_len: usize,
+    },
 }
 
 pub struct I3cHciMaster<'a, Y: FnMut(u32)> {
@@ -467,6 +495,107 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         self.ccc_direct_read(device.dat_index, ccc, defining_byte, out)
     }
 
+    pub fn enable_ibi(&mut self, device: HciI3cDevice, payload: bool) -> Result<PioTransferResult> {
+        let mut entry = self.read_dat_entry(device.dat_index)?;
+        entry = entry.clear_flags(DAT_0_SIR_REJECT, 0);
+        if payload {
+            entry = entry.set_flags(DAT_0_IBI_PAYLOAD, 0);
+        } else {
+            entry = entry.clear_flags(DAT_0_IBI_PAYLOAD, 0);
+        }
+        self.write_dat_entry(device.dat_index, entry)?;
+        self.ccc_direct_write(device.dat_index, I3C_CCC_ENEC_DIRECT, &[I3C_CCC_EVENT_SIR])
+    }
+
+    pub fn disable_ibi(&mut self, device: HciI3cDevice) -> Result<()> {
+        let mut entry = self.read_dat_entry(device.dat_index)?;
+        entry = entry.set_flags(DAT_0_SIR_REJECT, 0);
+        self.write_dat_entry(device.dat_index, entry)?;
+
+        /*
+         * Match Zephyr/Linux behavior: after the DAT entry rejects SIR, DISEC
+         * failures do not leave the controller accepting unexpected IBIs.
+         */
+        let _ = self.ccc_direct_write(device.dat_index, I3C_CCC_DISEC_DIRECT, &[I3C_CCC_EVENT_SIR]);
+        Ok(())
+    }
+
+    pub fn enable_ibi_addr<const N: usize>(
+        &mut self,
+        table: &HciDeviceTable<N>,
+        dynamic_addr: u8,
+        payload: bool,
+    ) -> Result<PioTransferResult> {
+        let device = table
+            .by_dynamic_addr(dynamic_addr)
+            .ok_or(I3cHciError::InvalidArgs)?;
+        self.enable_ibi(device, payload)
+    }
+
+    pub fn disable_ibi_addr<const N: usize>(
+        &mut self,
+        table: &HciDeviceTable<N>,
+        dynamic_addr: u8,
+    ) -> Result<()> {
+        let device = table
+            .by_dynamic_addr(dynamic_addr)
+            .ok_or(I3cHciError::InvalidArgs)?;
+        self.disable_ibi(device)
+    }
+
+    pub fn enable_hotjoin(&mut self) -> Result<()> {
+        self.regs
+            .clear_hc_control(super::constants::HC_CONTROL_HOT_JOIN_CTRL);
+        if let Err(error) = self.ccc_broadcast_write(I3C_CCC_ENEC_BROADCAST, &[I3C_CCC_EVENT_HJ]) {
+            self.regs
+                .set_hc_control(super::constants::HC_CONTROL_HOT_JOIN_CTRL);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn disable_hotjoin(&mut self) {
+        self.regs
+            .set_hc_control(super::constants::HC_CONTROL_HOT_JOIN_CTRL);
+    }
+
+    pub fn enable_ibi_irq_events(&self) {
+        self.regs
+            .write_pio_intr_status_enable(STAT_IBI_STATUS_THLD | STAT_ALL_ERRORS);
+        self.rearm_ibi_irq_events();
+    }
+
+    pub fn rearm_ibi_irq_events(&self) {
+        self.regs.write_pio_intr_signal_enable(STAT_IBI_STATUS_THLD);
+    }
+
+    pub fn next_ibi_event<const N: usize>(
+        &mut self,
+        table: &HciDeviceTable<N>,
+        payload: &mut [u8],
+    ) -> Result<HciIbiEvent> {
+        let status = self.pio.next_ibi_status(payload)?;
+        let payload_len = status.data_len;
+
+        let event = if status.target_addr == I3C_HOT_JOIN_ADDR {
+            HciIbiEvent::HotJoin { status }
+        } else if let Some(device) = table.by_dynamic_addr(status.target_addr) {
+            HciIbiEvent::TargetInterrupt {
+                device,
+                status,
+                payload_len,
+            }
+        } else {
+            HciIbiEvent::Unknown {
+                status,
+                payload_len,
+            }
+        };
+
+        self.rearm_ibi_irq_events();
+        Ok(event)
+    }
+
     pub fn bus_reset(&mut self) -> Result<PioTransferResult> {
         let tid = self.next_tid();
         let command = HciCommandV1::internal(tid, 0x4, 0)?.with_toc();
@@ -476,6 +605,36 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             tx: &[],
             rx: &mut rx,
         })
+    }
+
+    fn read_dat_entry(&self, dat_index: u8) -> Result<DatEntryV1> {
+        if self.sections.dat.offset == 0
+            || self.sections.dat.entry_size != DAT_V1_ENTRY_SIZE
+            || u16::from(dat_index) >= self.sections.dat.entries
+        {
+            return Err(I3cHciError::InvalidArgs);
+        }
+
+        let word0 = self
+            .regs
+            .table_word(
+                self.sections.dat.offset,
+                self.sections.dat.entry_size,
+                dat_index,
+                0,
+            )
+            .ok_or(I3cHciError::InvalidArgs)?;
+        let word1 = self
+            .regs
+            .table_word(
+                self.sections.dat.offset,
+                self.sections.dat.entry_size,
+                dat_index,
+                1,
+            )
+            .ok_or(I3cHciError::InvalidArgs)?;
+
+        Ok(DatEntryV1 { word0, word1 })
     }
 
     fn write_dat_entry(&self, dat_index: u8, entry: DatEntryV1) -> Result<()> {

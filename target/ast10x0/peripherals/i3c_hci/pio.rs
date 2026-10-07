@@ -25,6 +25,7 @@ pub const STAT_TRANSFER_ERR: u32 = 1 << 9;
 pub const STAT_TRANSFER_ABORT: u32 = 1 << 5;
 pub const STAT_RESP_READY: u32 = 1 << 4;
 pub const STAT_CMD_QUEUE_READY: u32 = 1 << 3;
+pub const STAT_IBI_STATUS_THLD: u32 = 1 << 2;
 pub const STAT_RX_THLD: u32 = 1 << 1;
 pub const STAT_TX_THLD: u32 = 1 << 0;
 
@@ -50,6 +51,32 @@ pub struct PioTransfer<'a> {
 pub struct PioTransferResult {
     pub response: HciResponse,
     pub rx_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IbiStatus {
+    pub raw: u32,
+    pub error: bool,
+    pub last: bool,
+    pub chunks: u8,
+    pub target_addr: u8,
+    pub read: bool,
+    pub data_len: usize,
+}
+
+impl IbiStatus {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Self {
+        Self {
+            raw,
+            error: ((raw >> 30) & 1) != 0,
+            last: ((raw >> 24) & 1) != 0,
+            chunks: ((raw >> 16) & 0xff) as u8,
+            target_addr: ((raw >> 9) & 0x7f) as u8,
+            read: ((raw >> 8) & 1) != 0,
+            data_len: (raw & 0xff) as usize,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,11 +224,32 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
 
     pub fn target_queue_read_data(&mut self, data: &[u8]) -> Result<()> {
         let command = HciTargetCommand::read_data(data.len())?;
+        self.target_queue_command(command, data)
+    }
 
+    pub fn target_queue_ibi_payload(&mut self, data: &[u8]) -> Result<()> {
+        let command = HciTargetCommand::ibi_payload(data.len())?;
+        self.target_queue_command(command, data)
+    }
+
+    pub fn next_ibi_status(&mut self, payload: &mut [u8]) -> Result<IbiStatus> {
+        self.wait_status(STAT_IBI_STATUS_THLD)?;
+
+        let status = IbiStatus::parse(self.regs.pio_ibi_port());
+        let read = self.read_ibi_data(payload, status.data_len);
+
+        if status.error {
+            return Err(I3cHciError::TransferStatus(status.raw));
+        }
+
+        read.map(|_| status)
+    }
+
+    fn target_queue_command(&mut self, command: HciTargetCommand, data: &[u8]) -> Result<()> {
         self.check_errors()?;
 
         /*
-         * Zephyr queues target TX data before putting the target read-data
+         * Zephyr queues target TX/IBI data before putting the target
          * descriptor into the command queue.
          */
         self.write_tx_data(data)?;
@@ -214,6 +262,20 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         self.regs.write_pio_command_queue_port(command.word);
 
         Ok(())
+    }
+
+    pub fn wait_aspeed_cap_ctrl_clear(&mut self, mask: u32) -> Result<()> {
+        let mut remaining = self.timeout_us;
+        loop {
+            if (self.regs.aspeed_slave_cap_ctrl() & mask) == 0 {
+                return Ok(());
+            }
+            if remaining == 0 {
+                return Err(I3cHciError::Timeout);
+            }
+            (self.yield_us)(1);
+            remaining -= 1;
+        }
     }
 
     fn write_tx_data(&mut self, tx: &[u8]) -> Result<()> {
@@ -239,6 +301,34 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             offset += chunk;
         }
         Ok(offset)
+    }
+
+    fn read_ibi_data(&mut self, buf: &mut [u8], count: usize) -> Result<usize> {
+        let copy_len = core::cmp::min(buf.len(), count);
+
+        let mut copied = 0usize;
+        let mut remaining = count;
+
+        while remaining != 0 {
+            self.wait_status(STAT_IBI_STATUS_THLD)?;
+
+            let word = self.regs.pio_ibi_port();
+            let chunk = core::cmp::min(4, remaining);
+
+            if copied < copy_len {
+                let copy_chunk = core::cmp::min(chunk, copy_len - copied);
+                bytes_from_word(word, &mut buf[copied..copied + copy_chunk]);
+                copied += copy_chunk;
+            }
+
+            remaining -= chunk;
+        }
+
+        if count > buf.len() {
+            return Err(I3cHciError::NoSpace);
+        }
+
+        Ok(copied)
     }
 
     fn wait_response(&mut self, tid: u8) -> Result<HciResponse> {

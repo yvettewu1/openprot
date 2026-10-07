@@ -42,10 +42,12 @@ pub use irq::{
     IsrCtx, IsrEvents,
 };
 pub use master::{
-    HciDeviceTable, HciDeviceTableIter, HciI3cDevice, I3cHciMaster, I3C_BROADCAST_ADDR,
+    HciDeviceTable, HciDeviceTableIter, HciI3cDevice, HciIbiEvent, I3cHciMaster,
+    I3C_BROADCAST_ADDR, I3C_CCC_DISEC_BROADCAST, I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST,
+    I3C_CCC_ENEC_DIRECT, I3C_CCC_EVENT_HJ, I3C_CCC_EVENT_MR, I3C_CCC_EVENT_SIR, I3C_HOT_JOIN_ADDR,
 };
 pub use pio::{
-    bytes_from_word, validate_pio_transfer, word_from_bytes, I3cHciPio, PioTransfer,
+    bytes_from_word, validate_pio_transfer, word_from_bytes, I3cHciPio, IbiStatus, PioTransfer,
     PioTransferResult, TargetResponse,
 };
 pub use registers::I3cHciRegisters;

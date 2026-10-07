@@ -61,14 +61,22 @@ pub struct HciTargetCommand {
 }
 
 impl HciTargetCommand {
+    /// Queue IBI payload bytes that will be sent when the ASPEED target IBI
+    /// request bit is asserted.
+    pub fn ibi_payload(len: usize) -> Result<Self> {
+        Self::target_command(TID_TARGET_IBI, len, true)
+    }
+
     /// Queue data that will be returned when the active controller performs
     /// a private read from this target.
     pub fn read_data(len: usize) -> Result<Self> {
-        if len == 0 || len > u16::MAX as usize {
+        Self::target_command(TID_TARGET_RD_DATA, len, false)
+    }
+
+    fn target_command(tid: u8, len: usize, allow_zero: bool) -> Result<Self> {
+        if (!allow_zero && len == 0) || len > u16::MAX as usize {
             return Err(I3cHciError::InvalidArgs);
         }
-
-        let tid = TID_TARGET_RD_DATA;
 
         let word = ((len as u32) << CMD_T0_DATA_LENGTH_SHIFT)
             | ((u32::from(tid) << CMD_T0_TID_SHIFT) & CMD_T0_TID_MASK);
