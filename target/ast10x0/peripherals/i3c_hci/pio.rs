@@ -7,7 +7,7 @@
 //! queue response expectation, write command descriptor words, then process the
 //! response and trailing RX in polling mode.
 
-use super::cmd::{HciCommandV1, HciResponse};
+use super::cmd::{HciCommandV1, HciResponse, HciTargetCommand};
 use super::error::{I3cHciError, Result};
 use super::registers::I3cHciRegisters;
 
@@ -50,6 +50,41 @@ pub struct PioTransfer<'a> {
 pub struct PioTransferResult {
     pub response: HciResponse,
     pub rx_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetResponse {
+    pub raw: u32,
+    pub status: u8,
+
+    /// true means the target received data:
+    /// controller -> target private write.
+    pub target_received: bool,
+
+    pub ccc: bool,
+    pub tid: u8,
+    pub ccc_hdr: u8,
+    pub data_len: usize,
+}
+
+impl TargetResponse {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Self {
+        Self {
+            raw,
+            status: ((raw >> 28) & 0x0f) as u8,
+            target_received: ((raw >> 27) & 1) != 0,
+            ccc: ((raw >> 26) & 1) != 0,
+            tid: ((raw >> 24) & 0x03) as u8,
+            ccc_hdr: ((raw >> 16) & 0xff) as u8,
+            data_len: (raw & 0xffff) as usize,
+        }
+    }
+
+    #[must_use]
+    pub const fn success(self) -> bool {
+        self.status == 0
+    }
 }
 
 pub struct I3cHciPio<'a, Y: FnMut(u32)> {
@@ -111,6 +146,73 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             .write_pio_command_queue_port(transfer.command.words[0]);
         self.regs
             .write_pio_command_queue_port(transfer.command.words[1]);
+        Ok(())
+    }
+
+    pub fn target_next_response(&mut self) -> Result<TargetResponse> {
+        self.wait_status(STAT_RESP_READY)?;
+
+        let raw = self.regs.pio_response_queue_port();
+        let response = TargetResponse::parse(raw);
+
+        if !response.success() {
+            return Err(I3cHciError::Transfer(response.status));
+        }
+
+        Ok(response)
+    }
+
+    pub fn target_read_rx(&mut self, buf: &mut [u8], count: usize) -> Result<usize> {
+        let copy_len = core::cmp::min(buf.len(), count);
+
+        let mut copied = 0usize;
+        let mut remaining = count;
+
+        /*
+         * Always drain the complete hardware FIFO even when the caller's
+         * buffer is too small. Otherwise the next target transaction starts
+         * with stale RX data.
+         */
+        while remaining != 0 {
+            self.wait_status(STAT_RX_THLD)?;
+
+            let word = self.regs.pio_rx_data_port();
+            let chunk = core::cmp::min(4, remaining);
+
+            if copied < copy_len {
+                let copy_chunk = core::cmp::min(chunk, copy_len - copied);
+                bytes_from_word(word, &mut buf[copied..copied + copy_chunk]);
+                copied += copy_chunk;
+            }
+
+            remaining -= chunk;
+        }
+
+        if count > buf.len() {
+            return Err(I3cHciError::NoSpace);
+        }
+
+        Ok(copied)
+    }
+
+    pub fn target_queue_read_data(&mut self, data: &[u8]) -> Result<()> {
+        let command = HciTargetCommand::read_data(data.len())?;
+
+        self.check_errors()?;
+
+        /*
+         * Zephyr queues target TX data before putting the target read-data
+         * descriptor into the command queue.
+         */
+        self.write_tx_data(data)?;
+
+        self.wait_status(STAT_CMD_QUEUE_READY)?;
+
+        /*
+         * Target command descriptors are one word.
+         */
+        self.regs.write_pio_command_queue_port(command.word);
+
         Ok(())
     }
 

@@ -41,6 +41,45 @@ pub const MODE_I3C_SDR3: u8 = 0x3;
 pub const MODE_I3C_SDR4: u8 = 0x4;
 pub const MODE_I2C_FM: u8 = 0x0;
 pub const MODE_I2C_FMP: u8 = 0x1;
+pub const TID_TARGET_IBI: u8 = 0x1;
+pub const TID_TARGET_RD_DATA: u8 = 0x2;
+
+const CMD_T0_TID_SHIFT: u32 = 3;
+const CMD_T0_TID_MASK: u32 = 0x3 << CMD_T0_TID_SHIFT;
+const CMD_T0_DATA_LENGTH_SHIFT: u32 = 16;
+const CMD_T0_DATA_LENGTH_MASK: u32 = 0xffff << CMD_T0_DATA_LENGTH_SHIFT;
+
+/// One-word command descriptor used while operating as an I3C target.
+///
+/// Target descriptors are different from the normal two-word HCI v1
+/// controller descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HciTargetCommand {
+    pub word: u32,
+    pub tid: u8,
+    pub data_len: usize,
+}
+
+impl HciTargetCommand {
+    /// Queue data that will be returned when the active controller performs
+    /// a private read from this target.
+    pub fn read_data(len: usize) -> Result<Self> {
+        if len == 0 || len > u16::MAX as usize {
+            return Err(I3cHciError::InvalidArgs);
+        }
+
+        let tid = TID_TARGET_RD_DATA;
+
+        let word = ((len as u32) << CMD_T0_DATA_LENGTH_SHIFT)
+            | ((u32::from(tid) << CMD_T0_TID_SHIFT) & CMD_T0_TID_MASK);
+
+        Ok(Self {
+            word: word & (CMD_T0_DATA_LENGTH_MASK | CMD_T0_TID_MASK),
+            tid,
+            data_len: len,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HciCommandKind {

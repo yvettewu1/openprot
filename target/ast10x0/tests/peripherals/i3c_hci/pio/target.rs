@@ -335,7 +335,7 @@ impl TargetInterface for Target {
         let sentinel: &[u8] = match run_pio_tests() {
             Ok(()) => b"TEST_RESULT:PASS\n",
             Err(error) => {
-                pw_log::error!("I3C HCI PIO test failed: {}", error);
+                pw_log::error!("I3C HCI PIO test failed: {}", error as &str);
                 b"TEST_RESULT:FAIL\n"
             }
         };

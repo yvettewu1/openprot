@@ -18,9 +18,13 @@ pub mod irq;
 pub mod master;
 pub mod pio;
 pub mod registers;
+pub mod target;
 pub mod types;
 
-pub use cmd::{i2c_mode, i3c_sdr_mode, HciCommandKind, HciCommandV1, HciResponse};
+pub use cmd::{
+    i2c_mode, i3c_sdr_mode, HciCommandKind, HciCommandV1, HciResponse, HciTargetCommand,
+    TID_TARGET_IBI, TID_TARGET_RD_DATA,
+};
 pub use constants::*;
 pub use core::{
     discover_sections_from_regs, parse_hci_version, select_command_descriptor, CommandDescriptor,
@@ -34,15 +38,16 @@ pub use dat::{odd_parity7, DatAllocator, DatEntryV1};
 pub use dct::{read_dct_entry_v1, DctEntryV1, DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS};
 pub use error::{I3cHciError, Result};
 pub use irq::{
-    dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler,
-    unregister_i3c_hci_irq_handler, IsrCtx, IsrEvents,
+    dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler, unregister_i3c_hci_irq_handler,
+    IsrCtx, IsrEvents,
 };
 pub use master::{
     HciDeviceTable, HciDeviceTableIter, HciI3cDevice, I3cHciMaster, I3C_BROADCAST_ADDR,
 };
 pub use pio::{
     bytes_from_word, validate_pio_transfer, word_from_bytes, I3cHciPio, PioTransfer,
-    PioTransferResult,
+    PioTransferResult, TargetResponse,
 };
 pub use registers::I3cHciRegisters;
+pub use target::{HciTargetConfig, HciTargetEvent, I3cHciTarget};
 pub use types::{InitMode, TargetRole};

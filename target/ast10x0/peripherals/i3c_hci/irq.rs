@@ -17,8 +17,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use critical_section::Mutex;
 
 use super::constants::{
-    ASPEED_INTR_SUM_CAP, ASPEED_INTR_SUM_INHOUSE, ASPEED_INTR_SUM_PIO,
-    ASPEED_INTR_SUM_RHS, MAX_BUSES, MIPI_I3C_HCI_CORE_IRQS,
+    ASPEED_INTR_SUM_CAP, ASPEED_INTR_SUM_INHOUSE, ASPEED_INTR_SUM_PIO, ASPEED_INTR_SUM_RHS,
+    MAX_BUSES, MIPI_I3C_HCI_CORE_IRQS,
 };
 use super::core::IoMode;
 use super::pio::STAT_ALL_ERRORS;
@@ -217,10 +217,10 @@ fn isr_service(ctx: &IsrCtx) {
              * architecture later.
              */
             IoMode::Dma => {
-                events
-                    .io_status
-                    .fetch_or(summary & (ASPEED_INTR_SUM_PIO | ASPEED_INTR_SUM_RHS),
-                              Ordering::AcqRel);
+                events.io_status.fetch_or(
+                    summary & (ASPEED_INTR_SUM_PIO | ASPEED_INTR_SUM_RHS),
+                    Ordering::AcqRel,
+                );
             }
         }
 
