@@ -21,6 +21,7 @@ use super::constants::{
     MAX_BUSES, MIPI_I3C_HCI_CORE_IRQS,
 };
 use super::core::IoMode;
+use super::dma::RHS_INTR_ALL_RINGS;
 use super::pio::STAT_ALL_ERRORS;
 use super::registers::I3cHciRegisters;
 
@@ -211,17 +212,7 @@ fn isr_service(ctx: &IsrCtx) {
         match ctx.io_mode {
             IoMode::Pio => handle_pio_irq(regs, events),
 
-            /*
-             * DMA is not implemented by the current HCI driver yet.
-             * Keep the dispatch shape here so DMA can plug into the same
-             * architecture later.
-             */
-            IoMode::Dma => {
-                events.io_status.fetch_or(
-                    summary & (ASPEED_INTR_SUM_PIO | ASPEED_INTR_SUM_RHS),
-                    Ordering::AcqRel,
-                );
-            }
+            IoMode::Dma => handle_rhs_irq(regs, events),
         }
 
         summary &= !(ASPEED_INTR_SUM_PIO | ASPEED_INTR_SUM_RHS);
@@ -274,6 +265,16 @@ fn handle_core_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
     regs.write_intr_status(status);
 }
 
+fn handle_rhs_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
+    let status = regs.rhs_intr_status();
+
+    if status == 0 {
+        return;
+    }
+
+    events.io_status.fetch_or(status, Ordering::AcqRel);
+    regs.write_rhs_intr_status(status & RHS_INTR_ALL_RINGS);
+}
 fn handle_pio_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
     let status = regs.pio_intr_status();
 

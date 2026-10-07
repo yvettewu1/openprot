@@ -13,6 +13,7 @@ pub mod core;
 pub mod daa;
 pub mod dat;
 pub mod dct;
+pub mod dma;
 pub mod error;
 pub mod irq;
 pub mod master;
@@ -36,6 +37,7 @@ pub use daa::{
 };
 pub use dat::{odd_parity7, DatAllocator, DatEntryV1};
 pub use dct::{read_dct_entry_v1, DctEntryV1, DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS};
+pub use dma::{init_rhs, parse_rhs_control, rhs_info, RhsInfo};
 pub use error::{I3cHciError, Result};
 pub use irq::{
     dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler, unregister_i3c_hci_irq_handler,

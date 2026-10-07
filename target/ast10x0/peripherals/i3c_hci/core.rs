@@ -64,6 +64,15 @@ impl I3cHciConfig {
             data_big_endian: false,
         }
     }
+
+    #[must_use]
+    pub const fn dma(bus: u8) -> Self {
+        Self {
+            bus,
+            io_mode: IoMode::Dma,
+            data_big_endian: false,
+        }
+    }
 }
 
 pub struct I3cHciCore<Y: FnMut(u32)> {
@@ -240,7 +249,7 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
     fn select_io_ops(&mut self) -> Result<()> {
         match self.config.io_mode {
             IoMode::Pio => self.select_pio(),
-            IoMode::Dma => Err(I3cHciError::Unsupported),
+            IoMode::Dma => self.select_dma(),
         }
     }
 
@@ -257,6 +266,17 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
             return Err(I3cHciError::Busy);
         }
         self.selected_io = Some(IoMode::Pio);
+        Ok(())
+    }
+
+    fn select_dma(&mut self) -> Result<()> {
+        if self.sections.ring_headers_offset == 0 {
+            return Err(I3cHciError::Unsupported);
+        }
+
+        super::dma::init_rhs(&self.regs, self.sections, 1)?;
+        self.regs.clear_hc_control(constants::HC_CONTROL_PIO_MODE);
+        self.selected_io = Some(IoMode::Dma);
         Ok(())
     }
 }
