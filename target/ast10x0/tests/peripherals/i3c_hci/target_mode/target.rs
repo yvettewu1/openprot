@@ -1,7 +1,7 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 6: I3C HCI Target Mode Test
+//! I3C HCI Target Mode Test
 //!
 //! Purpose:
 //! Validate AST1080 MIPI I3C HCI target-mode operation using two HCI
@@ -52,7 +52,7 @@
 //!     I3C0 private write      -> I3C1 receives and verifies data
 //!     I3C1 queues read data   -> I3C0 private read receives and verifies data
 //!
-//! This test validates the Phase 6 target-mode foundation:
+//! This test validates the target-mode foundation:
 //!
 //!     - target identity configuration
 //!     - target enable/mode selection
@@ -60,7 +60,7 @@
 //!     - target RX/private-write path
 //!     - target TX/private-read path
 //!
-//! IBI and Hot-Join are not part of this test; they belong to Phase 7.
+//! IBI and Hot-Join are validated by the dedicated IBI test.
 
 #![no_std]
 #![no_main]
@@ -683,7 +683,7 @@ fn run_target_mode_test() -> Result<(), &'static str> {
 
     /*
      * ===============================================================
-     * Phase 6 complete.
+     * Target-mode flow complete.
      * ===============================================================
      */
     pw_log::info!(

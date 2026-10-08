@@ -220,9 +220,8 @@ fn isr_service(ctx: &IsrCtx) {
 
     if (summary & ASPEED_INTR_SUM_INHOUSE) != 0 {
         /*
-         * Full ASPEED private interrupt decoding is added with the later
-         * Phase-5/Phase-7 event work. For now preserve the fact that a vendor
-         * interrupt occurred without touching target/IBI state in the ISR.
+         * Preserve the fact that a vendor interrupt occurred without touching
+         * target/IBI state in the ISR. Normal context can decode it later.
          */
         events
             .vendor_status
@@ -304,7 +303,7 @@ fn handle_pio_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
 
     /*
      * Prevent a level-sensitive PIO source from continuously refiring before
-     * normal context has drained the queue. Phase 5 will re-enable the desired
+     * normal context has drained the queue. Normal context re-enables the desired
      * PIO signals after the deferred event is consumed.
      */
     regs.write_pio_intr_signal_enable(0);

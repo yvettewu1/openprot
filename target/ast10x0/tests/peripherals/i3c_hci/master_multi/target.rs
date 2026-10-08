@@ -4,14 +4,15 @@
 #![no_std]
 #![no_main]
 
-use ast10x0_i3c_hci::{DatAllocator, HciDeviceTable, I3cHciConfig, I3cHciCore, I3cHciMaster};
+use ast10x0_i3c_hci::dispatch_i3c_hci_irq;
+use ast10x0_i3c_hci::{
+    DatAllocator, HciDeviceTable, I3cHciConfig, I3cHciCore, I3cHciMaster, I3C_CCC_GETPID,
+};
 use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
+use cortex_m::peripheral::NVIC;
 use entry as _;
 use target_common::{declare_target, TargetInterface};
-use ast10x0_i3c_hci::dispatch_i3c_hci_irq;
-use kernel::Kernel;
-use cortex_m::peripheral::NVIC;
 
 const UART5_BASE: *const ast1080_pac::uart::RegisterBlock = 0x7e78_4000 as *const _;
 const I3C_BUS: u8 = 0;
@@ -20,12 +21,11 @@ const DAA_TIMEOUT_US: u32 = 1_000_000;
 const MAX_I3C_DEVICES: usize = 8;
 const EXPECTED_MIN_DEVICES: usize = 2;
 const ADDRESS_INDEXED_DAT: bool = true;
-const I3C_CCC_GETPID: u8 = 0x8d;
 
-pub fn i3c0_irq<K: Kernel>(_kernel: K) {
+#[unsafe(no_mangle)]
+pub extern "C" fn interrupt_handler_96() {
     dispatch_i3c_hci_irq(I3C_BUS as usize);
 }
-
 
 #[unsafe(no_mangle)]
 pub fn console_backend_write_all(buf: &[u8]) -> pw_status::Result<()> {
@@ -63,18 +63,15 @@ fn run_master_multi_test() -> Result<(), &'static str> {
 
     // enable irq
     let ctx = core
-    .isr_ctx()
-    .map_err(|_| "HCI ISR context create failed")?;
+        .isr_ctx()
+        .map_err(|_| "HCI ISR context create failed")?;
 
-    if !ast10x0_i3c_hci::register_i3c_hci_irq_handler(
-        I3C_BUS as usize,
-        ctx,
-    ) {
+    if !ast10x0_i3c_hci::register_i3c_hci_irq_handler(I3C_BUS as usize, ctx) {
         return Err("HCI IRQ registration failed");
     }
 
     core.enable_irq_signals();
-    // The kernel vector (system.json5 IRQ 96 -> `i3c0_irq`) is in place and
+    // The kernel vector (system.json5 IRQ 96 -> `interrupt_handler_96`) is in place and
     // the handler is registered; this integration layer owns the NVIC line
     // for the bus it selected (`I3C_BUS` = 0 -> `Interrupt::i3c0`), so unmask
     // it now.
@@ -151,7 +148,7 @@ impl TargetInterface for Target {
         let sentinel: &[u8] = match run_master_multi_test() {
             Ok(()) => b"TEST_RESULT:PASS\n",
             Err(error) => {
-                pw_log::error!("I3C HCI master multi-device test failed: {}", error);
+                pw_log::error!("I3C HCI master multi-device test failed: {}", error as &str);
                 b"TEST_RESULT:FAIL\n"
             }
         };

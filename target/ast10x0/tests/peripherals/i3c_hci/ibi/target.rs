@@ -217,7 +217,7 @@ fn run_ibi_test() -> Result<(), &'static str> {
     pw_log::info!("IBI polling PASS");
 
     /*
-     * Then prove the Phase-5 ISR latch path. The board vector can call
+     * Then prove the ISR latch path. The board vector can call
      * dispatch_i3c_hci_irq() directly; this self-test invokes the same
      * dispatcher in its wait loop so the HCI ISR service and IsrEvents latch
      * are covered without adding another IBI queue.

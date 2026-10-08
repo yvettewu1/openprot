@@ -3,13 +3,8 @@
 
 //! AST1080 MIPI I3C HCI target-mode support.
 //!
-//! Phase 6:
-//! - target identity
-//! - target mode selection
-//! - private controller -> target writes
-//! - target -> controller read data
-//!
-//! Phase 7 adds target IBI and Hot-Join request helpers.
+//! Covers target identity, target mode selection, private write/read handling,
+//! target IBI requests, and Hot-Join requests.
 
 use super::cmd::TID_TARGET_RD_DATA;
 use super::constants::{
@@ -63,7 +58,7 @@ pub enum HciTargetEvent {
     /// Previously queued target read-data was consumed.
     ReadComplete { len: usize },
 
-    /// Valid target response that is not used by Phase 6.
+    /// Valid target response that does not map to a high-level target event.
     Other(TargetResponse),
 }
 
@@ -243,7 +238,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         };
 
         /*
-         * Phase-5 ISR masks PIO signaling after latching a status to avoid
+         * The ISR masks PIO signaling after latching a status to avoid
          * a level-triggered IRQ storm. Once normal context has drained the
          * response/FIFO we can safely re-arm it.
          */

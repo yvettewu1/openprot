@@ -1,7 +1,7 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-// AST10x0 Kernel I2C Test Configuration
+// AST10x0 Kernel I3C HCI Test Configuration
 // Uses the same memory layout as the kernel-only tests.
 {
     arch: {

@@ -3,9 +3,11 @@
 
 //! Dynamic address assignment helpers for MIPI I3C HCI.
 //!
-//! This is the Phase 3 DAA preparation layer. Hardware submission is handled
-//! by the PIO path; assigned-target details come from the HCI DCT registers.
+//! This module prepares command descriptors and DAT entries. Hardware
+//! submission is handled by the PIO path; assigned-target details come from
+//! the HCI DCT registers.
 
+use super::ccc::I3C_CCC_ENTDAA;
 use super::cmd::{
     HciCommandKind, HciCommandV1, HciResponse, CMD_0_ROC, CMD_0_TOC, RESP_ERR_ADDR_HEADER,
     RESP_ERR_NACK,
@@ -13,7 +15,6 @@ use super::cmd::{
 use super::dat::{DatAllocator, DatEntryV1};
 use super::error::{I3cHciError, Result};
 
-pub const I3C_CCC_ENTDAA: u8 = 0x7;
 pub const DEFAULT_DYNAMIC_ADDR_START: u8 = 0x09;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

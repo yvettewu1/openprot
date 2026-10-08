@@ -7,6 +7,7 @@
 //! Zephyr's drivers/i3c/mipi_hci logic into OpenProt. Protocol layers should
 //! build on [I3cHciRegisters] rather than touching PAC-generated names.
 
+pub mod ccc;
 pub mod cmd;
 pub mod constants;
 pub mod core;
@@ -22,6 +23,10 @@ pub mod registers;
 pub mod target;
 pub mod types;
 
+pub use ccc::{
+    I3C_CCC_DISEC_BROADCAST, I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST, I3C_CCC_ENEC_DIRECT,
+    I3C_CCC_ENTDAA, I3C_CCC_EVENT_HJ, I3C_CCC_EVENT_MR, I3C_CCC_EVENT_SIR, I3C_CCC_GETPID,
+};
 pub use cmd::{
     i2c_mode, i3c_sdr_mode, HciCommandKind, HciCommandV1, HciResponse, HciTargetCommand,
     TID_TARGET_IBI, TID_TARGET_RD_DATA,
@@ -33,7 +38,7 @@ pub use core::{
 };
 pub use daa::{
     classify_entdaa_response, prepare_entdaa_step, prepare_next_entdaa_step, valid_i3c_address,
-    AddressSlots, DaaResponse, DaaStep, I3C_CCC_ENTDAA,
+    AddressSlots, DaaResponse, DaaStep,
 };
 pub use dat::{odd_parity7, DatAllocator, DatEntryV1};
 pub use dct::{read_dct_entry_v1, DctEntryV1, DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS};
@@ -45,8 +50,7 @@ pub use irq::{
 };
 pub use master::{
     HciDeviceTable, HciDeviceTableIter, HciI3cDevice, HciIbiEvent, I3cHciMaster,
-    I3C_BROADCAST_ADDR, I3C_CCC_DISEC_BROADCAST, I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST,
-    I3C_CCC_ENEC_DIRECT, I3C_CCC_EVENT_HJ, I3C_CCC_EVENT_MR, I3C_CCC_EVENT_SIR, I3C_HOT_JOIN_ADDR,
+    I3C_BROADCAST_ADDR, I3C_HOT_JOIN_ADDR,
 };
 pub use pio::{
     bytes_from_word, validate_pio_transfer, word_from_bytes, I3cHciPio, IbiStatus, PioTransfer,

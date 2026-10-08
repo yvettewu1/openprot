@@ -236,7 +236,7 @@ impl TargetInterface for Target {
         let sentinel: &[u8] = match run_i3c_hci_init_smoke_test() {
             Ok(()) => b"TEST_RESULT:PASS\n",
             Err(error) => {
-                pw_log::error!("I3C HCI init smoke test failed: {}", error);
+                pw_log::error!("I3C HCI init smoke test failed: {}", error as &str);
                 b"TEST_RESULT:FAIL\n"
             }
         };

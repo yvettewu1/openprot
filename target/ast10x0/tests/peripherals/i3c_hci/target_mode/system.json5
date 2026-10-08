@@ -1,13 +1,13 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-// AST10x0 Kernel I2C Test Configuration
+// AST10x0 Kernel I3C HCI Test Configuration
 // Uses the same memory layout as the kernel-only tests.
 {
     arch: {
         type: "armv7m",
         vector_table_start_address: 0x00000000,
-        vector_table_size_bytes: 2048,  // 0x800 ( 512vectors)
+        vector_table_size_bytes: 2048,  // 0x800 (512 vectors)
     },
     kernel: {
         flash_start_address: 0x00000800,  // After vector table

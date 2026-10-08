@@ -49,6 +49,7 @@ rust_library(
         "i3c/registers.rs",
         "i3c/types.rs",
         "i3c_hci/cmd.rs",
+        "i3c_hci/ccc.rs",
         "i3c_hci/constants.rs",
         "i3c_hci/core.rs",
         "i3c_hci/daa.rs",
@@ -165,6 +166,7 @@ rust_library(
     srcs = [
         "i3c_hci_crate.rs",
         "i3c_hci/cmd.rs",
+        "i3c_hci/ccc.rs",
         "i3c_hci/constants.rs",
         "i3c_hci/core.rs",
         "i3c_hci/daa.rs",

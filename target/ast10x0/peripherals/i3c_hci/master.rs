@@ -3,6 +3,10 @@
 
 //! Minimal OpenProt-facing MIPI I3C HCI master API.
 
+use super::ccc::{
+    I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST, I3C_CCC_ENEC_DIRECT, I3C_CCC_EVENT_HJ,
+    I3C_CCC_EVENT_SIR,
+};
 use super::cmd::{i3c_sdr_mode, HciCommandV1};
 use super::core::HciSections;
 use super::daa::{
@@ -21,13 +25,6 @@ use super::registers::I3cHciRegisters;
 
 pub const I3C_BROADCAST_ADDR: u8 = 0x7e;
 pub const I3C_HOT_JOIN_ADDR: u8 = 0x02;
-pub const I3C_CCC_ENEC_BROADCAST: u8 = 0x00;
-pub const I3C_CCC_DISEC_BROADCAST: u8 = 0x01;
-pub const I3C_CCC_ENEC_DIRECT: u8 = 0x80;
-pub const I3C_CCC_DISEC_DIRECT: u8 = 0x81;
-pub const I3C_CCC_EVENT_SIR: u8 = 1 << 0;
-pub const I3C_CCC_EVENT_MR: u8 = 1 << 1;
-pub const I3C_CCC_EVENT_HJ: u8 = 1 << 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HciI3cDevice {
