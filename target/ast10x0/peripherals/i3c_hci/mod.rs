@@ -57,5 +57,7 @@ pub use pio::{
     PioTransferResult, TargetResponse,
 };
 pub use registers::I3cHciRegisters;
-pub use target::{HciTargetConfig, HciTargetEvent, I3cHciTarget};
+pub use target::{
+    classify_target_ccc, HciTargetCcc, HciTargetConfig, HciTargetEvent, I3cHciTarget,
+};
 pub use types::{InitMode, TargetRole};

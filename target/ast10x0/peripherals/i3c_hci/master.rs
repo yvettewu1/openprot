@@ -290,7 +290,20 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         dat_allocator: &mut DatAllocator,
     ) -> Result<usize> {
         table.clear();
+        self.entdaa_new_devices(table, dat_allocator)
+    }
+
+    pub fn entdaa_new_devices<const N: usize>(
+        &mut self,
+        table: &mut HciDeviceTable<N>,
+        dat_allocator: &mut DatAllocator,
+    ) -> Result<usize> {
+        let initial_len = table.len();
         let mut address_slots = AddressSlots::new();
+
+        for device in table.iter() {
+            address_slots.mark_used(device.dynamic_addr)?;
+        }
 
         loop {
             if table.is_full() {
@@ -342,7 +355,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                 Ok(DaaResponse::NoMoreDevices) => {
                     self.write_dat_entry(step.dat_index, DatEntryV1::rejected())?;
                     dat_allocator.free(step.dat_index)?;
-                    return Ok(table.len());
+                    return Ok(table.len() - initial_len);
                 }
                 Err(error) => {
                     let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
@@ -690,6 +703,14 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
 
     pub fn rearm_ibi_irq_events(&self) {
         self.regs.write_pio_intr_signal_enable(STAT_IBI_STATUS_THLD);
+    }
+
+    pub fn accept_hotjoin<const N: usize>(
+        &mut self,
+        table: &mut HciDeviceTable<N>,
+        dat_allocator: &mut DatAllocator,
+    ) -> Result<usize> {
+        self.entdaa_new_devices(table, dat_allocator)
     }
 
     pub fn next_ibi_event<const N: usize>(

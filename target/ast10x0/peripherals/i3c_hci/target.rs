@@ -6,10 +6,19 @@
 //! Covers target identity, target mode selection, private write/read handling,
 //! target IBI requests, and Hot-Join requests.
 
+use super::ccc::{
+    I3C_CCC_DISEC_BROADCAST, I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST, I3C_CCC_ENEC_DIRECT,
+    I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMRL, I3C_CCC_GETMWL, I3C_CCC_GETMXDS,
+    I3C_CCC_GETPID, I3C_CCC_GETSTATUS, I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_RSTDAA_DIRECT,
+    I3C_CCC_SETDASA, I3C_CCC_SETMRL_BROADCAST, I3C_CCC_SETMRL_DIRECT, I3C_CCC_SETMWL_BROADCAST,
+    I3C_CCC_SETMWL_DIRECT, I3C_CCC_SETNEWDA,
+};
 use super::cmd::TID_TARGET_RD_DATA;
 use super::constants::{
-    ASPEED_I3C_SLV_CAP_CTRL_HJ_REQ, ASPEED_I3C_SLV_CAP_CTRL_HJ_WAIT,
-    ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ, ASPEED_I3C_SLV_CAP_CTRL_IBI_WAIT, ASPEED_I3C_SLV_STS1_HJ_EN,
+    ASPEED_I3C_SLV_CAP_CTRL_ACCEPT_CR, ASPEED_I3C_SLV_CAP_CTRL_HJ_REQ,
+    ASPEED_I3C_SLV_CAP_CTRL_HJ_WAIT, ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ,
+    ASPEED_I3C_SLV_CAP_CTRL_IBI_WAIT, ASPEED_I3C_SLV_CAP_CTRL_MR_REQ,
+    ASPEED_I3C_SLV_CAP_CTRL_MR_WAIT, ASPEED_I3C_SLV_STS1_CR_EN, ASPEED_I3C_SLV_STS1_HJ_EN,
     ASPEED_I3C_SLV_STS1_IBI_EN,
 };
 use super::daa::valid_i3c_address;
@@ -48,6 +57,46 @@ impl HciTargetConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HciTargetCcc {
+    EnableEvents,
+    DisableEvents,
+    ResetDynamicAddress,
+    SetDynamicAddressFromStatic,
+    SetNewDynamicAddress,
+    SetMaxWriteLength,
+    SetMaxReadLength,
+    GetMaxWriteLength,
+    GetMaxReadLength,
+    GetPid,
+    GetBcr,
+    GetDcr,
+    GetStatus,
+    GetMaxDataSpeed,
+    Unknown(u8),
+}
+
+#[must_use]
+pub const fn classify_target_ccc(ccc: u8) -> HciTargetCcc {
+    match ccc {
+        I3C_CCC_ENEC_BROADCAST | I3C_CCC_ENEC_DIRECT => HciTargetCcc::EnableEvents,
+        I3C_CCC_DISEC_BROADCAST | I3C_CCC_DISEC_DIRECT => HciTargetCcc::DisableEvents,
+        I3C_CCC_RSTDAA_BROADCAST | I3C_CCC_RSTDAA_DIRECT => HciTargetCcc::ResetDynamicAddress,
+        I3C_CCC_SETDASA => HciTargetCcc::SetDynamicAddressFromStatic,
+        I3C_CCC_SETNEWDA => HciTargetCcc::SetNewDynamicAddress,
+        I3C_CCC_SETMWL_BROADCAST | I3C_CCC_SETMWL_DIRECT => HciTargetCcc::SetMaxWriteLength,
+        I3C_CCC_SETMRL_BROADCAST | I3C_CCC_SETMRL_DIRECT => HciTargetCcc::SetMaxReadLength,
+        I3C_CCC_GETMWL => HciTargetCcc::GetMaxWriteLength,
+        I3C_CCC_GETMRL => HciTargetCcc::GetMaxReadLength,
+        I3C_CCC_GETPID => HciTargetCcc::GetPid,
+        I3C_CCC_GETBCR => HciTargetCcc::GetBcr,
+        I3C_CCC_GETDCR => HciTargetCcc::GetDcr,
+        I3C_CCC_GETSTATUS => HciTargetCcc::GetStatus,
+        I3C_CCC_GETMXDS => HciTargetCcc::GetMaxDataSpeed,
+        other => HciTargetCcc::Unknown(other),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HciTargetEvent {
     /// Active controller performed a private write to us.
     PrivateWrite { len: usize },
@@ -60,6 +109,16 @@ pub enum HciTargetEvent {
 
     /// Valid target response that does not map to a high-level target event.
     Other(TargetResponse),
+}
+
+impl HciTargetEvent {
+    #[must_use]
+    pub const fn ccc_kind(self) -> Option<HciTargetCcc> {
+        match self {
+            Self::Ccc { ccc, .. } => Some(classify_target_ccc(ccc)),
+            _ => None,
+        }
+    }
 }
 
 pub struct I3cHciTarget<'a, Y: FnMut(u32)> {
@@ -106,7 +165,10 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
 
         let cap_ctrl = self.regs.aspeed_slave_cap_ctrl();
         self.regs.write_aspeed_slave_cap_ctrl(
-            cap_ctrl | ASPEED_I3C_SLV_CAP_CTRL_IBI_WAIT | ASPEED_I3C_SLV_CAP_CTRL_HJ_WAIT,
+            cap_ctrl
+                | ASPEED_I3C_SLV_CAP_CTRL_IBI_WAIT
+                | ASPEED_I3C_SLV_CAP_CTRL_HJ_WAIT
+                | ASPEED_I3C_SLV_CAP_CTRL_MR_WAIT,
         );
 
         self.regs.write_pio_intr_status_enable(TARGET_PIO_IRQS);
@@ -180,6 +242,29 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         }
 
         self.request_slave_capability(ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ)
+    }
+
+    pub fn accept_controller_role_requests(&self, enable: bool) {
+        let mut cap_ctrl = self.regs.aspeed_slave_cap_ctrl();
+        if enable {
+            cap_ctrl |= ASPEED_I3C_SLV_CAP_CTRL_ACCEPT_CR;
+        } else {
+            cap_ctrl &= !ASPEED_I3C_SLV_CAP_CTRL_ACCEPT_CR;
+        }
+        self.regs.write_aspeed_slave_cap_ctrl(cap_ctrl);
+    }
+
+    /// Request controller-role ownership from the active controller.
+    pub fn request_controller_role(&mut self) -> Result<()> {
+        if !self.enabled {
+            return Err(I3cHciError::Busy);
+        }
+
+        if (self.regs.aspeed_slave_status1() & ASPEED_I3C_SLV_STS1_CR_EN) == 0 {
+            return Err(I3cHciError::Busy);
+        }
+
+        self.request_slave_capability(ASPEED_I3C_SLV_CAP_CTRL_MR_REQ)
     }
 
     /// Request Hot-Join while the target has no dynamic address.

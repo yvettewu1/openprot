@@ -5,11 +5,12 @@
 #![no_main]
 
 use ast10x0_i3c_hci::{
-    bytes_from_word, constants, discover_sections_from_regs, dynamic_address_payload, i2c_mode,
-    i3c_sdr_mode, parse_hci_version, select_command_descriptor, word_from_bytes, CommandDescriptor,
-    DatEntryV1, HciCommandKind, HciCommandV1, HciResponse, I3cHciConfig, I3cHciError,
-    I3cHciRegisters, IoMode, DAT_0_I2C_DEVICE, I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS,
-    I3C_CCC_GETPID, I3C_CCC_GETSTATUS, I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_SETDASA, I3C_CCC_SETNEWDA,
+    bytes_from_word, classify_target_ccc, constants, discover_sections_from_regs,
+    dynamic_address_payload, i2c_mode, i3c_sdr_mode, parse_hci_version, select_command_descriptor,
+    word_from_bytes, CommandDescriptor, DatEntryV1, HciCommandKind, HciCommandV1, HciResponse,
+    HciTargetCcc, I3cHciConfig, I3cHciError, I3cHciRegisters, IoMode, DAT_0_I2C_DEVICE,
+    I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS, I3C_CCC_GETPID, I3C_CCC_GETSTATUS,
+    I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_SETDASA, I3C_CCC_SETNEWDA,
 };
 use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
@@ -180,6 +181,19 @@ fn run_command_logic_tests() -> Result<(), &'static str> {
     expect_true(
         dynamic_address_payload(0x09).map_err(|_| "dynamic address payload failed")? == 0x13,
         "bad dynamic-address payload",
+    )?;
+
+    expect_true(
+        classify_target_ccc(I3C_CCC_GETPID) == HciTargetCcc::GetPid,
+        "bad target GETPID classification",
+    )?;
+    expect_true(
+        classify_target_ccc(I3C_CCC_SETDASA) == HciTargetCcc::SetDynamicAddressFromStatic,
+        "bad target SETDASA classification",
+    )?;
+    expect_true(
+        classify_target_ccc(0xff) == HciTargetCcc::Unknown(0xff),
+        "bad target unknown CCC classification",
     )?;
 
     let ccc = HciCommandV1::ccc(0, 7, false, 0x06, &[0x5a], 0, None)
