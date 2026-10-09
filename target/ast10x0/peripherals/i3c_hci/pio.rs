@@ -9,6 +9,7 @@
 
 use super::cmd::{HciCommandV1, HciResponse, HciTargetCommand};
 use super::error::{I3cHciError, Result};
+use super::irq::{isr_events, IsrEvents};
 use super::registers::I3cHciRegisters;
 
 pub const STAT_TRANSFER_BLOCKED: u32 = 1 << 25;
@@ -118,6 +119,8 @@ pub struct I3cHciPio<'a, Y: FnMut(u32)> {
     regs: &'a I3cHciRegisters,
     yield_us: Y,
     timeout_us: u32,
+    irq_events: Option<&'static IsrEvents>,
+    pending_irq_status: u32,
 }
 
 impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
@@ -127,12 +130,23 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             regs,
             yield_us,
             timeout_us: 10_000,
+            irq_events: None,
+            pending_irq_status: 0,
         }
     }
 
     #[must_use]
     pub const fn with_timeout_us(mut self, timeout_us: u32) -> Self {
         self.timeout_us = timeout_us;
+        self
+    }
+
+    #[must_use]
+    pub fn with_irq_events(mut self, bus: usize) -> Self {
+        self.irq_events = isr_events(bus);
+        if let Some(events) = self.irq_events {
+            self.pending_irq_status = events.take_io_status();
+        }
         self
     }
 
@@ -158,6 +172,7 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             .write_pio_command_queue_port(transfer.command.words[1]);
         let response = self.wait_response(transfer.command.tid)?;
         let rx_len = self.read_rx_data(transfer.rx, response.data_len)?;
+        self.rearm_pio_irqs(STAT_RESP_READY | STAT_RX_THLD | STAT_TX_THLD | STAT_ALL_ERRORS);
         Ok(PioTransferResult { response, rx_len })
     }
 
@@ -173,6 +188,7 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             .write_pio_command_queue_port(transfer.command.words[0]);
         self.regs
             .write_pio_command_queue_port(transfer.command.words[1]);
+        self.rearm_pio_irqs(STAT_CMD_QUEUE_READY | STAT_TX_THLD | STAT_ALL_ERRORS);
         Ok(())
     }
 
@@ -186,6 +202,7 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             return Err(I3cHciError::Transfer(response.status));
         }
 
+        self.rearm_pio_irqs(STAT_RESP_READY | STAT_ALL_ERRORS);
         Ok(response)
     }
 
@@ -344,14 +361,39 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         let mut remaining = self.timeout_us;
         loop {
             self.check_errors()?;
-            if (self.regs.pio_intr_status() & mask) != 0 {
+
+            let status = self.regs.pio_intr_status();
+            if (status & mask) != 0 {
                 return Ok(());
             }
+
+            if let Some(events) = self.irq_events {
+                self.pending_irq_status |= events.take_io_status();
+                let pending = self.pending_irq_status;
+
+                if (pending & STAT_ALL_ERRORS) != 0 {
+                    let errors = pending & STAT_ALL_ERRORS;
+                    self.pending_irq_status &= !STAT_ALL_ERRORS;
+                    return Err(I3cHciError::TransferStatus(errors));
+                }
+
+                if (pending & mask) != 0 {
+                    self.pending_irq_status &= !mask;
+                    return Ok(());
+                }
+            }
+
             if remaining == 0 {
                 return Err(I3cHciError::Timeout);
             }
             (self.yield_us)(1);
             remaining -= 1;
+        }
+    }
+
+    fn rearm_pio_irqs(&self, mask: u32) {
+        if self.irq_events.is_some() {
+            self.regs.write_pio_intr_signal_enable(mask);
         }
     }
 

@@ -179,6 +179,38 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.regs.write_pio_intr_signal_enable(0);
     }
 
+    pub fn resume(&self) {
+        self.regs.set_hc_control(constants::HC_CONTROL_RESUME);
+    }
+
+    pub fn abort(&mut self) -> Result<()> {
+        self.regs.set_hc_control(constants::HC_CONTROL_ABORT);
+        self.wait_hc_control_clear(constants::HC_CONTROL_ABORT)
+    }
+
+    pub fn reset_pio_queues(&mut self) -> Result<()> {
+        self.reset_queues(
+            constants::RX_FIFO_RST | constants::TX_FIFO_RST | constants::RESP_QUEUE_RST,
+        )
+    }
+
+    pub fn reset_all_queues(&mut self) -> Result<()> {
+        self.reset_queues(
+            constants::CMD_QUEUE_RST
+                | constants::RESP_QUEUE_RST
+                | constants::RX_FIFO_RST
+                | constants::TX_FIFO_RST
+                | constants::IBI_QUEUE_RST,
+        )
+    }
+
+    pub fn recover_pio(&mut self) -> Result<()> {
+        self.abort()?;
+        self.reset_pio_queues()?;
+        self.resume();
+        Ok(())
+    }
+
     fn detect_version(&mut self) -> Result<()> {
         self.version = Some(parse_hci_version(self.regs.hci_version())?);
         Ok(())
@@ -205,9 +237,30 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
     }
 
     fn wait_reset_clear(&mut self) -> Result<()> {
+        self.wait_reset_bits_clear(constants::SOFT_RST)
+    }
+
+    fn reset_queues(&mut self, mask: u32) -> Result<()> {
+        self.regs.write_reset_control(mask);
+        self.wait_reset_bits_clear(mask)
+    }
+
+    fn wait_reset_bits_clear(&mut self, mask: u32) -> Result<()> {
         let mut remaining = constants::MIPI_I3C_HCI_RESET_TIMEOUT_US;
         while remaining > 0 {
-            if (self.regs.reset_control() & constants::SOFT_RST) == 0 {
+            if (self.regs.reset_control() & mask) == 0 {
+                return Ok(());
+            }
+            (self.yield_us)(1);
+            remaining -= 1;
+        }
+        Err(I3cHciError::Timeout)
+    }
+
+    fn wait_hc_control_clear(&mut self, mask: u32) -> Result<()> {
+        let mut remaining = constants::MIPI_I3C_HCI_RESET_TIMEOUT_US;
+        while remaining > 0 {
+            if (self.regs.hc_control() & mask) == 0 {
                 return Ok(());
             }
             (self.yield_us)(1);
@@ -242,8 +295,13 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
     }
 
     fn select_cmd_ops(&mut self) -> Result<()> {
-        self.command_descriptor = Some(select_command_descriptor(self.caps)?);
-        Ok(())
+        let descriptor = select_command_descriptor(self.caps)?;
+        self.command_descriptor = Some(descriptor);
+
+        match descriptor {
+            CommandDescriptor::V1 => Ok(()),
+            CommandDescriptor::V2 => Err(I3cHciError::Unsupported),
+        }
     }
 
     fn select_io_ops(&mut self) -> Result<()> {

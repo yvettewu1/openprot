@@ -5,7 +5,9 @@
 
 use super::ccc::{
     I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST, I3C_CCC_ENEC_DIRECT, I3C_CCC_EVENT_HJ,
-    I3C_CCC_EVENT_SIR,
+    I3C_CCC_EVENT_SIR, I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS, I3C_CCC_GETPID,
+    I3C_CCC_GETSTATUS, I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_RSTDAA_DIRECT, I3C_CCC_SETDASA,
+    I3C_CCC_SETNEWDA,
 };
 use super::cmd::{i2c_mode, i3c_sdr_mode, HciCommandV1};
 use super::core::HciSections;
@@ -202,6 +204,12 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
     #[must_use]
     pub fn with_i2c_scl_hz(mut self, i2c_scl_hz: u32) -> Self {
         self.i2c_mode = i2c_mode(i2c_scl_hz);
+        self
+    }
+
+    #[must_use]
+    pub fn with_irq_events(mut self, bus: usize) -> Self {
+        self.pio = self.pio.with_irq_events(bus);
         self
     }
 
@@ -476,6 +484,50 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         }
     }
 
+    pub fn rstdaa_broadcast(&mut self) -> Result<()> {
+        self.ccc_broadcast_write(I3C_CCC_RSTDAA_BROADCAST, &[])
+    }
+
+    pub fn rstdaa_direct(&mut self, dat_index: u8) -> Result<PioTransferResult> {
+        self.ccc_direct_write(dat_index, I3C_CCC_RSTDAA_DIRECT, &[])
+    }
+
+    pub fn setdasa(&mut self, dat_index: u8, dynamic_addr: u8) -> Result<PioTransferResult> {
+        self.ccc_direct_write(
+            dat_index,
+            I3C_CCC_SETDASA,
+            &[dynamic_address_payload(dynamic_addr)?],
+        )
+    }
+
+    pub fn setnewda(&mut self, dat_index: u8, dynamic_addr: u8) -> Result<PioTransferResult> {
+        self.ccc_direct_write(
+            dat_index,
+            I3C_CCC_SETNEWDA,
+            &[dynamic_address_payload(dynamic_addr)?],
+        )
+    }
+
+    pub fn getpid(&mut self, dat_index: u8, out: &mut [u8; 6]) -> Result<PioTransferResult> {
+        self.ccc_direct_read(dat_index, I3C_CCC_GETPID, None, out)
+    }
+
+    pub fn getbcr(&mut self, dat_index: u8, out: &mut [u8; 1]) -> Result<PioTransferResult> {
+        self.ccc_direct_read(dat_index, I3C_CCC_GETBCR, None, out)
+    }
+
+    pub fn getdcr(&mut self, dat_index: u8, out: &mut [u8; 1]) -> Result<PioTransferResult> {
+        self.ccc_direct_read(dat_index, I3C_CCC_GETDCR, None, out)
+    }
+
+    pub fn getstatus(&mut self, dat_index: u8, out: &mut [u8; 2]) -> Result<PioTransferResult> {
+        self.ccc_direct_read(dat_index, I3C_CCC_GETSTATUS, None, out)
+    }
+
+    pub fn getmxds(&mut self, dat_index: u8, out: &mut [u8]) -> Result<PioTransferResult> {
+        self.ccc_direct_read(dat_index, I3C_CCC_GETMXDS, None, out)
+    }
+
     pub fn ccc_direct_write(
         &mut self,
         dat_index: u8,
@@ -745,4 +797,18 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
 #[must_use]
 const fn valid_i3c_addr(address: u8) -> bool {
     address > 0x07 && address < I3C_BROADCAST_ADDR
+}
+
+#[must_use]
+pub fn dynamic_address_payload(address: u8) -> Result<u8> {
+    if !valid_i3c_addr(address) {
+        return Err(I3cHciError::InvalidArgs);
+    }
+
+    let parity = if super::dat::odd_parity7(address) {
+        0
+    } else {
+        1
+    };
+    Ok((address << 1) | parity)
 }

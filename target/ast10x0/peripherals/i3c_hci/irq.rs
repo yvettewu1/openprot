@@ -82,6 +82,11 @@ impl IsrEvents {
         self.io_status.swap(0, Ordering::AcqRel)
     }
 
+    /// Peek at pending PIO/DMA interrupt bits without clearing them.
+    pub fn pending_io_status(&self) -> u32 {
+        self.io_status.load(Ordering::Acquire)
+    }
+
     /// Atomically take pending ASPEED vendor/private summary bits.
     pub fn take_vendor_status(&self) -> u32 {
         self.vendor_status.swap(0, Ordering::AcqRel)

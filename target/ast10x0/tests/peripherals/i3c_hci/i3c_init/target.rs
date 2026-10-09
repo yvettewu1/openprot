@@ -5,10 +5,11 @@
 #![no_main]
 
 use ast10x0_i3c_hci::{
-    bytes_from_word, constants, discover_sections_from_regs, i2c_mode, i3c_sdr_mode,
-    parse_hci_version, select_command_descriptor, word_from_bytes, CommandDescriptor, DatEntryV1,
-    HciCommandKind, HciCommandV1, HciResponse, I3cHciConfig, I3cHciError, I3cHciRegisters, IoMode,
-    DAT_0_I2C_DEVICE,
+    bytes_from_word, constants, discover_sections_from_regs, dynamic_address_payload, i2c_mode,
+    i3c_sdr_mode, parse_hci_version, select_command_descriptor, word_from_bytes, CommandDescriptor,
+    DatEntryV1, HciCommandKind, HciCommandV1, HciResponse, I3cHciConfig, I3cHciError,
+    I3cHciRegisters, IoMode, DAT_0_I2C_DEVICE, I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS,
+    I3C_CCC_GETPID, I3C_CCC_GETSTATUS, I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_SETDASA, I3C_CCC_SETNEWDA,
 };
 use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
@@ -167,6 +168,19 @@ fn run_command_logic_tests() -> Result<(), &'static str> {
     expect_true(i2c_read.kind == HciCommandKind::Regular, "I2C read kind")?;
     expect_true(i2c_read.words[0] == 0x2402_0050, "I2C read word0")?;
     expect_true(i2c_read.words[1] == 0x0003_0000, "I2C read word1")?;
+
+    expect_true(I3C_CCC_RSTDAA_BROADCAST == 0x06, "bad RSTDAA broadcast CCC")?;
+    expect_true(I3C_CCC_SETDASA == 0x87, "bad SETDASA CCC")?;
+    expect_true(I3C_CCC_SETNEWDA == 0x88, "bad SETNEWDA CCC")?;
+    expect_true(I3C_CCC_GETPID == 0x8d, "bad GETPID CCC")?;
+    expect_true(I3C_CCC_GETBCR == 0x8e, "bad GETBCR CCC")?;
+    expect_true(I3C_CCC_GETDCR == 0x8f, "bad GETDCR CCC")?;
+    expect_true(I3C_CCC_GETSTATUS == 0x90, "bad GETSTATUS CCC")?;
+    expect_true(I3C_CCC_GETMXDS == 0x94, "bad GETMXDS CCC")?;
+    expect_true(
+        dynamic_address_payload(0x09).map_err(|_| "dynamic address payload failed")? == 0x13,
+        "bad dynamic-address payload",
+    )?;
 
     let ccc = HciCommandV1::ccc(0, 7, false, 0x06, &[0x5a], 0, None)
         .map_err(|_| "CCC immediate encode failed")?;
