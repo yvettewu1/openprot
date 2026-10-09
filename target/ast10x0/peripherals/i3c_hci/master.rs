@@ -7,14 +7,15 @@ use super::ccc::{
     I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST, I3C_CCC_ENEC_DIRECT, I3C_CCC_EVENT_HJ,
     I3C_CCC_EVENT_SIR,
 };
-use super::cmd::{i3c_sdr_mode, HciCommandV1};
+use super::cmd::{i2c_mode, i3c_sdr_mode, HciCommandV1};
 use super::core::HciSections;
 use super::daa::{
     classify_entdaa_response, prepare_entdaa_step, prepare_next_entdaa_step, AddressSlots,
     DaaResponse,
 };
 use super::dat::{
-    DatAllocator, DatEntryV1, DAT_0_IBI_PAYLOAD, DAT_0_SIR_REJECT, DAT_V1_ENTRY_SIZE,
+    DatAllocator, DatEntryV1, DAT_0_I2C_DEVICE, DAT_0_IBI_PAYLOAD, DAT_0_SIR_REJECT,
+    DAT_V1_ENTRY_SIZE,
 };
 use super::dct::{read_dct_entry_v1, DctEntryV1};
 use super::error::{I3cHciError, Result};
@@ -171,6 +172,7 @@ pub struct I3cHciMaster<'a, Y: FnMut(u32)> {
     pio: I3cHciPio<'a, Y>,
     next_tid: u8,
     i3c_mode: u8,
+    i2c_mode: u8,
 }
 
 impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
@@ -187,12 +189,19 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             pio: I3cHciPio::new(regs, yield_us),
             next_tid: 0,
             i3c_mode: i3c_sdr_mode(i3c_scl_hz),
+            i2c_mode: i2c_mode(400_000),
         }
     }
 
     #[must_use]
     pub fn with_timeout_us(mut self, timeout_us: u32) -> Self {
         self.pio = self.pio.with_timeout_us(timeout_us);
+        self
+    }
+
+    #[must_use]
+    pub fn with_i2c_scl_hz(mut self, i2c_scl_hz: u32) -> Self {
+        self.i2c_mode = i2c_mode(i2c_scl_hz);
         self
     }
 
@@ -210,6 +219,16 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         self.write_dat_entry(
             dat_index,
             DatEntryV1::rejected().with_static_addr(static_addr),
+        )
+    }
+
+    pub fn attach_i2c_device(&mut self, dat_index: u8, static_addr: u8) -> Result<()> {
+        if !valid_i3c_addr(static_addr) {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        self.write_dat_entry(
+            dat_index,
+            DatEntryV1::rejected().with_i2c_device(static_addr),
         )
     }
 
@@ -238,6 +257,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         let tid = self.next_tid();
         let step = prepare_entdaa_step(dat_index, dynamic_addr, tid)?;
         self.write_dat_entry(step.dat_index, step.dat_entry)?;
+        self.regs.reset_dct_index();
         let mut rx = [];
         let result = self.pio.submit_v1_raw(PioTransfer {
             command: step.command,
@@ -272,6 +292,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             let tid = self.next_tid();
             let step = prepare_next_entdaa_step(&address_slots, dat_allocator, None, tid)?;
             self.write_dat_entry(step.dat_index, step.dat_entry)?;
+            self.regs.reset_dct_index();
             let mut rx = [];
             let result = match self.pio.submit_v1_raw(PioTransfer {
                 command: step.command,
@@ -286,9 +307,16 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                 }
             };
 
-            match classify_entdaa_response(result.response)? {
-                DaaResponse::Assigned => {
-                    let dct = self.read_dct_entry(0)?;
+            match classify_entdaa_response(result.response) {
+                Ok(DaaResponse::Assigned) => {
+                    let dct = match self.read_dct_entry(0) {
+                        Ok(dct) => dct,
+                        Err(error) => {
+                            let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
+                            let _ = dat_allocator.free(step.dat_index);
+                            return Err(error);
+                        }
+                    };
                     let device = HciI3cDevice {
                         dat_index: step.dat_index,
                         dynamic_addr: step.dynamic_addr,
@@ -296,13 +324,22 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                         bcr: dct.bcr,
                         dcr: dct.dcr,
                     };
-                    table.push(device)?;
+                    if let Err(error) = table.push(device) {
+                        let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
+                        let _ = dat_allocator.free(step.dat_index);
+                        return Err(error);
+                    }
                     address_slots.mark_used(step.dynamic_addr)?;
                 }
-                DaaResponse::NoMoreDevices => {
+                Ok(DaaResponse::NoMoreDevices) => {
                     self.write_dat_entry(step.dat_index, DatEntryV1::rejected())?;
                     dat_allocator.free(step.dat_index)?;
                     return Ok(table.len());
+                }
+                Err(error) => {
+                    let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
+                    let _ = dat_allocator.free(step.dat_index);
+                    return Err(error);
                 }
             }
         }
@@ -377,6 +414,43 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
     ) -> Result<PioTransferResult> {
         let device = table.by_pid(pid).ok_or(I3cHciError::InvalidArgs)?;
         self.private_read(device.dat_index, out)
+    }
+
+    pub fn i2c_write(&mut self, dat_index: u8, data: &[u8]) -> Result<PioTransferResult> {
+        let entry = self.read_dat_entry(dat_index)?;
+        if (entry.word0 & DAT_0_I2C_DEVICE) == 0 {
+            return Err(I3cHciError::InvalidArgs);
+        }
+
+        let tid = self.next_tid();
+        let mode = self.i2c_mode;
+        let command = HciCommandV1::i2c_write_regular(dat_index, tid, data.len(), mode)?
+            .with_roc()
+            .with_toc();
+        let mut rx = [];
+        self.pio.submit_v1(PioTransfer {
+            command,
+            tx: data,
+            rx: &mut rx,
+        })
+    }
+
+    pub fn i2c_read(&mut self, dat_index: u8, out: &mut [u8]) -> Result<PioTransferResult> {
+        let entry = self.read_dat_entry(dat_index)?;
+        if (entry.word0 & DAT_0_I2C_DEVICE) == 0 {
+            return Err(I3cHciError::InvalidArgs);
+        }
+
+        let tid = self.next_tid();
+        let mode = self.i2c_mode;
+        let command = HciCommandV1::i2c_read(dat_index, tid, out.len(), mode)?
+            .with_roc()
+            .with_toc();
+        self.pio.submit_v1(PioTransfer {
+            command,
+            tx: &[],
+            rx: out,
+        })
     }
 
     pub fn ccc_broadcast_write(&mut self, ccc: u8, data: &[u8]) -> Result<()> {

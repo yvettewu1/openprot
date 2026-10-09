@@ -40,9 +40,12 @@ pub use daa::{
     classify_entdaa_response, prepare_entdaa_step, prepare_next_entdaa_step, valid_i3c_address,
     AddressSlots, DaaResponse, DaaStep,
 };
-pub use dat::{odd_parity7, DatAllocator, DatEntryV1};
+pub use dat::{
+    odd_parity7, DatAllocator, DatEntryV1, DAT_0_I2C_DEVICE, DAT_0_IBI_PAYLOAD, DAT_0_MR_REJECT,
+    DAT_0_SIR_REJECT, DAT_V1_ENTRY_SIZE,
+};
 pub use dct::{read_dct_entry_v1, DctEntryV1, DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS};
-pub use dma::{init_rhs, parse_rhs_control, rhs_info, RhsInfo};
+pub use dma::{init_rhs, parse_rhs_control, rhs_info, DmaRing, DmaRingEntry, RhsInfo};
 pub use error::{I3cHciError, Result};
 pub use irq::{
     dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler, unregister_i3c_hci_irq_handler,

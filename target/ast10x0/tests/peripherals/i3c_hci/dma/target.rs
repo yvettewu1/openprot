@@ -10,14 +10,14 @@
 //! - RHS interrupt status register access
 //!
 //! It intentionally does not submit DMA transfers yet; ring descriptor memory
-//! ownership and cache/NC placement come in the follow-up DMA transfer phase.
+//! ownership and cache/NC placement come with DMA transfer support.
 
 #![no_std]
 #![no_main]
 
 use ast10x0_i3c_hci::{
-    parse_hci_version, parse_rhs_control, rhs_info, I3cHciConfig, I3cHciCore,
-    IoMode,
+    parse_hci_version, parse_rhs_control, rhs_info, DmaRing, DmaRingEntry, I3cHciConfig,
+    I3cHciCore, IoMode,
 };
 use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
@@ -64,6 +64,33 @@ fn run_rhs_logic_tests() -> Result<(), &'static str> {
     expect_true(cfg.bus == BUS, "bad DMA config bus")?;
     expect_true(cfg.io_mode == IoMode::Dma, "bad DMA config mode")?;
     expect_true(!cfg.data_big_endian, "bad DMA config endian")?;
+
+    let mut storage = [
+        DmaRingEntry::empty(),
+        DmaRingEntry::empty(),
+        DmaRingEntry::empty(),
+    ];
+    let mut ring = DmaRing::new(&mut storage).map_err(|_| "DMA ring create failed")?;
+    expect_true(ring.capacity() == 3, "bad DMA ring capacity")?;
+    expect_true(ring.is_empty(), "new DMA ring not empty")?;
+    expect_true(
+        ring.push(DmaRingEntry::from_words([1, 2, 3, 4]))
+            .map_err(|_| "DMA ring push failed")?
+            == 0,
+        "bad first DMA ring producer index",
+    )?;
+    expect_true(
+        ring.push(DmaRingEntry::from_words([5, 6, 7, 8]))
+            .map_err(|_| "DMA ring second push failed")?
+            == 1,
+        "bad second DMA ring producer index",
+    )?;
+    expect_true(ring.len() == 2, "bad DMA ring length")?;
+    let first = ring.pop().ok_or("DMA ring pop failed")?;
+    expect_true(first.words == [1, 2, 3, 4], "bad DMA ring pop order")?;
+    expect_true(ring.consumer_index() == 1, "bad DMA ring consumer index")?;
+    ring.clear();
+    expect_true(ring.is_empty(), "DMA ring clear failed")?;
 
     Ok(())
 }

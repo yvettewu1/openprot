@@ -52,6 +52,13 @@ impl DatEntryV1 {
     }
 
     #[must_use]
+    pub const fn with_i2c_device(mut self, address: u8) -> Self {
+        self = self.with_static_addr(address);
+        self.word0 |= DAT_0_I2C_DEVICE;
+        self
+    }
+
+    #[must_use]
     pub const fn set_flags(mut self, word0: u32, word1: u32) -> Self {
         self.word0 |= word0;
         self.word1 |= word1;

@@ -177,6 +177,18 @@ impl HciCommandV1 {
         Self::regular(dat_index, tid, true, len, mode, None, false, None)
     }
 
+    pub fn i2c_write(dat_index: u8, tid: u8, data: &[u8], mode: u8) -> Result<Self> {
+        Self::regular_or_immediate(dat_index, tid, false, data, mode, None, false, None)
+    }
+
+    pub fn i2c_write_regular(dat_index: u8, tid: u8, data_len: usize, mode: u8) -> Result<Self> {
+        Self::regular(dat_index, tid, false, data_len, mode, None, false, None)
+    }
+
+    pub fn i2c_read(dat_index: u8, tid: u8, len: usize, mode: u8) -> Result<Self> {
+        Self::regular(dat_index, tid, true, len, mode, None, false, None)
+    }
+
     pub fn ccc(
         dat_index: u8,
         tid: u8,

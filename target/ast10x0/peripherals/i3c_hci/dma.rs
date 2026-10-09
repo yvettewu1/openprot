@@ -78,3 +78,106 @@ pub fn init_rhs(regs: &I3cHciRegisters, sections: HciSections, ring_count: u8) -
         sections.ring_headers_offset,
     ))
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DmaRingEntry {
+    pub words: [u32; 4],
+}
+
+impl DmaRingEntry {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { words: [0; 4] }
+    }
+
+    #[must_use]
+    pub const fn from_words(words: [u32; 4]) -> Self {
+        Self { words }
+    }
+}
+
+pub struct DmaRing<'a> {
+    entries: &'a mut [DmaRingEntry],
+    producer: usize,
+    consumer: usize,
+    len: usize,
+}
+
+impl<'a> DmaRing<'a> {
+    pub fn new(entries: &'a mut [DmaRingEntry]) -> Result<Self> {
+        if entries.is_empty() {
+            return Err(I3cHciError::InvalidArgs);
+        }
+
+        Ok(Self {
+            entries,
+            producer: 0,
+            consumer: 0,
+            len: 0,
+        })
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.len == self.entries.len()
+    }
+
+    #[must_use]
+    pub const fn producer_index(&self) -> usize {
+        self.producer
+    }
+
+    #[must_use]
+    pub const fn consumer_index(&self) -> usize {
+        self.consumer
+    }
+
+    pub fn push(&mut self, entry: DmaRingEntry) -> Result<usize> {
+        if self.is_full() {
+            return Err(I3cHciError::NoSpace);
+        }
+
+        let index = self.producer;
+        self.entries[index] = entry;
+        self.producer = (self.producer + 1) % self.entries.len();
+        self.len += 1;
+        Ok(index)
+    }
+
+    pub fn pop(&mut self) -> Option<DmaRingEntry> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let index = self.consumer;
+        let entry = self.entries[index];
+        self.entries[index] = DmaRingEntry::empty();
+        self.consumer = (self.consumer + 1) % self.entries.len();
+        self.len -= 1;
+        Some(entry)
+    }
+
+    pub fn clear(&mut self) {
+        for entry in self.entries.iter_mut() {
+            *entry = DmaRingEntry::empty();
+        }
+        self.producer = 0;
+        self.consumer = 0;
+        self.len = 0;
+    }
+}

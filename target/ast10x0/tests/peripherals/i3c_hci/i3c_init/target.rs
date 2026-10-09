@@ -5,9 +5,10 @@
 #![no_main]
 
 use ast10x0_i3c_hci::{
-    bytes_from_word, constants, discover_sections_from_regs, i3c_sdr_mode, parse_hci_version,
-    select_command_descriptor, word_from_bytes, CommandDescriptor, HciCommandKind, HciCommandV1,
-    HciResponse, I3cHciConfig, I3cHciError, I3cHciRegisters, IoMode,
+    bytes_from_word, constants, discover_sections_from_regs, i2c_mode, i3c_sdr_mode,
+    parse_hci_version, select_command_descriptor, word_from_bytes, CommandDescriptor, DatEntryV1,
+    HciCommandKind, HciCommandV1, HciResponse, I3cHciConfig, I3cHciError, I3cHciRegisters, IoMode,
+    DAT_0_I2C_DEVICE,
 };
 use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
@@ -114,10 +115,12 @@ fn run_core_logic_tests() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn run_phase2_command_logic_tests() -> Result<(), &'static str> {
+fn run_command_logic_tests() -> Result<(), &'static str> {
     expect_true(i3c_sdr_mode(12_500_000) == 0, "bad SDR0 mode")?;
     expect_true(i3c_sdr_mode(8_000_000) == 1, "bad SDR1 boundary")?;
     expect_true(i3c_sdr_mode(2_000_000) == 4, "bad SDR4 boundary")?;
+    expect_true(i2c_mode(400_000) == 0, "bad I2C FM mode")?;
+    expect_true(i2c_mode(1_000_000) == 1, "bad I2C FM+ mode")?;
 
     expect_true(
         word_from_bytes(&[0x11, 0x22, 0x33, 0x44]) == 0x4433_2211,
@@ -142,6 +145,28 @@ fn run_phase2_command_logic_tests() -> Result<(), &'static str> {
     expect_true(read.kind == HciCommandKind::Regular, "private read kind")?;
     expect_true(read.words[0] == 0x2004_0030, "private read word0")?;
     expect_true(read.words[1] == 0x0008_0000, "private read word1")?;
+
+    let i2c_entry = DatEntryV1::rejected().with_i2c_device(0x50);
+    expect_true(
+        (i2c_entry.word0 & DAT_0_I2C_DEVICE) != 0,
+        "I2C DAT flag missing",
+    )?;
+    expect_true(i2c_entry.static_addr() == 0x50, "I2C static addr mismatch")?;
+
+    let i2c_write = HciCommandV1::i2c_write(2, 9, &[0xde, 0xad], i2c_mode(400_000))
+        .map_err(|_| "I2C immediate encode failed")?;
+    expect_true(
+        i2c_write.kind == HciCommandKind::Immediate,
+        "I2C immediate kind",
+    )?;
+    expect_true(i2c_write.words[0] == 0x0102_0049, "I2C immediate word0")?;
+    expect_true(i2c_write.words[1] == 0x0000_adde, "I2C immediate word1")?;
+
+    let i2c_read = HciCommandV1::i2c_read(2, 10, 3, i2c_mode(1_000_000))
+        .map_err(|_| "I2C read encode failed")?;
+    expect_true(i2c_read.kind == HciCommandKind::Regular, "I2C read kind")?;
+    expect_true(i2c_read.words[0] == 0x2402_0050, "I2C read word0")?;
+    expect_true(i2c_read.words[1] == 0x0003_0000, "I2C read word1")?;
 
     let ccc = HciCommandV1::ccc(0, 7, false, 0x06, &[0x5a], 0, None)
         .map_err(|_| "CCC immediate encode failed")?;
@@ -219,8 +244,8 @@ fn run_i3c_hci_init_smoke_test() -> Result<(), &'static str> {
     run_core_logic_tests()?;
     pw_log::info!("I3C HCI core logic checks passed");
 
-    run_phase2_command_logic_tests()?;
-    pw_log::info!("I3C HCI phase 2 command logic checks passed");
+    run_command_logic_tests()?;
+    pw_log::info!("I3C HCI command logic checks passed");
 
     run_hardware_register_smoke_test()?;
     pw_log::info!("I3C HCI hardware register smoke checks passed");

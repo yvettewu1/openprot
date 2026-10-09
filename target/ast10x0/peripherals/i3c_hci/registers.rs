@@ -145,6 +145,15 @@ impl I3cHciRegisters {
         self.regs().hcicapability034().read().bits()
     }
     #[inline]
+    pub fn write_dct_section(&self, value: u32) {
+        let ptr = unsafe { (self.regs as *mut u8).add(0x34).cast::<u32>() };
+        unsafe { core::ptr::write_volatile(ptr, value) };
+    }
+    #[inline]
+    pub fn reset_dct_index(&self) {
+        self.write_dct_section(self.dct_section() & !constants::DCT_TABLE_INDEX_MASK);
+    }
+    #[inline]
     pub fn ring_headers_section(&self) -> u32 {
         self.regs().hcicapability038().read().bits()
     }
