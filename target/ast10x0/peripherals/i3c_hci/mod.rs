@@ -25,8 +25,8 @@ pub mod types;
 
 pub use ccc::*;
 pub use cmd::{
-    i2c_mode, i3c_sdr_mode, HciCommandKind, HciCommandV1, HciResponse, HciTargetCommand,
-    TID_TARGET_IBI, TID_TARGET_RD_DATA,
+    i2c_mode, i2c_v2_rate, i3c_sdr_mode, i3c_sdr_v2_rate, HciCommand, HciCommandKind, HciCommandV1,
+    HciCommandV2, HciResponse, HciTargetCommand, TID_TARGET_IBI, TID_TARGET_RD_DATA,
 };
 pub use constants::*;
 pub use core::{
@@ -54,7 +54,7 @@ pub use master::{
 };
 pub use pio::{
     bytes_from_word, validate_pio_transfer, word_from_bytes, I3cHciPio, IbiStatus, PioTransfer,
-    PioTransferResult, TargetResponse,
+    PioTransferPairResult, PioTransferResult, TargetResponse,
 };
 pub use registers::I3cHciRegisters;
 pub use target::{

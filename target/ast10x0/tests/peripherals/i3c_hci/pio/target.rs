@@ -7,7 +7,7 @@
 use ast10x0_i3c_hci::{
     bytes_from_word, classify_entdaa_response, i2c_mode, i3c_sdr_mode, odd_parity7,
     prepare_entdaa_step, prepare_next_entdaa_step, valid_i3c_address, validate_pio_transfer,
-    word_from_bytes, AddressSlots, DaaResponse, DatAllocator, DatEntryV1, DctEntryV1,
+    word_from_bytes, AddressSlots, DaaResponse, DatAllocator, DatEntryV1, DctEntryV1, HciCommand,
     HciCommandKind, HciCommandV1, HciDeviceTable, HciI3cDevice, HciResponse, I3cHciError,
     PioTransfer,
 };
@@ -290,7 +290,7 @@ fn run_pio_tests() -> Result<(), &'static str> {
 
     let mut rx = [0u8; 8];
     let read_transfer = PioTransfer {
-        command: read,
+        command: HciCommand::V1(read),
         tx: &[],
         rx: &mut rx,
     };
@@ -299,7 +299,7 @@ fn run_pio_tests() -> Result<(), &'static str> {
     let tx = [1u8, 2, 3, 4, 5];
     let mut empty_rx = [];
     let write_transfer = PioTransfer {
-        command: regular_write,
+        command: HciCommand::V1(regular_write),
         tx: &tx,
         rx: &mut empty_rx,
     };
@@ -307,7 +307,7 @@ fn run_pio_tests() -> Result<(), &'static str> {
 
     let mut immediate_rx = [];
     let immediate_transfer = PioTransfer {
-        command: immediate,
+        command: HciCommand::V1(immediate),
         tx: &[],
         rx: &mut immediate_rx,
     };
@@ -316,7 +316,7 @@ fn run_pio_tests() -> Result<(), &'static str> {
     let bad_tx = [0u8; 1];
     let mut bad_rx = [0u8; 8];
     let bad_read_transfer = PioTransfer {
-        command: read,
+        command: HciCommand::V1(read),
         tx: &bad_tx,
         rx: &mut bad_rx,
     };

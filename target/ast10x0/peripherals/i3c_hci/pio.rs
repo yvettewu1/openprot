@@ -7,7 +7,7 @@
 //! queue response expectation, write command descriptor words, then process the
 //! response and trailing RX in polling mode.
 
-use super::cmd::{HciCommandV1, HciResponse, HciTargetCommand};
+use super::cmd::{HciCommand, HciCommandKind, HciResponse, HciTargetCommand};
 use super::error::{I3cHciError, Result};
 use super::irq::{isr_events, IsrEvents};
 use super::registers::I3cHciRegisters;
@@ -44,13 +44,19 @@ pub const STAT_ALL_ERRORS: u32 =
     STAT_TRANSFER_ABORT | STAT_TRANSFER_ERR | STAT_LATENCY_ERRORS | STAT_PROG_ERRORS;
 
 pub struct PioTransfer<'a> {
-    pub command: HciCommandV1,
+    pub command: HciCommand,
     pub tx: &'a [u8],
     pub rx: &'a mut [u8],
 }
 
 pub struct PioTransferResult {
     pub response: HciResponse,
+    pub rx_len: usize,
+}
+
+pub struct PioTransferPairResult {
+    pub first_response: HciResponse,
+    pub second_response: HciResponse,
     pub rx_len: usize,
 }
 
@@ -150,15 +156,15 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         self
     }
 
-    pub fn submit_v1(&mut self, transfer: PioTransfer<'_>) -> Result<PioTransferResult> {
-        let result = self.submit_v1_raw(transfer)?;
+    pub fn submit(&mut self, transfer: PioTransfer<'_>) -> Result<PioTransferResult> {
+        let result = self.submit_raw(transfer)?;
         if !result.response.success() {
             return Err(I3cHciError::Transfer(result.response.status));
         }
         Ok(result)
     }
 
-    pub fn submit_v1_raw(&mut self, transfer: PioTransfer<'_>) -> Result<PioTransferResult> {
+    pub fn submit_raw(&mut self, transfer: PioTransfer<'_>) -> Result<PioTransferResult> {
         validate_pio_transfer(&transfer)?;
         if !transfer.command.expects_response() {
             return Err(I3cHciError::Unsupported);
@@ -166,17 +172,16 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         self.check_errors()?;
         self.write_tx_data(transfer.tx)?;
         self.wait_status(STAT_CMD_QUEUE_READY)?;
-        self.regs
-            .write_pio_command_queue_port(transfer.command.words[0]);
-        self.regs
-            .write_pio_command_queue_port(transfer.command.words[1]);
-        let response = self.wait_response(transfer.command.tid)?;
+        for word in transfer.command.words() {
+            self.regs.write_pio_command_queue_port(*word);
+        }
+        let response = self.wait_response(transfer.command.tid())?;
         let rx_len = self.read_rx_data(transfer.rx, response.data_len)?;
         self.rearm_pio_irqs(STAT_RESP_READY | STAT_RX_THLD | STAT_TX_THLD | STAT_ALL_ERRORS);
         Ok(PioTransferResult { response, rx_len })
     }
 
-    pub fn submit_v1_no_response(&mut self, transfer: PioTransfer<'_>) -> Result<()> {
+    pub fn submit_no_response(&mut self, transfer: PioTransfer<'_>) -> Result<()> {
         validate_pio_transfer(&transfer)?;
         if transfer.command.expects_response() {
             return Err(I3cHciError::InvalidArgs);
@@ -184,12 +189,61 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         self.check_errors()?;
         self.write_tx_data(transfer.tx)?;
         self.wait_status(STAT_CMD_QUEUE_READY)?;
-        self.regs
-            .write_pio_command_queue_port(transfer.command.words[0]);
-        self.regs
-            .write_pio_command_queue_port(transfer.command.words[1]);
+        for word in transfer.command.words() {
+            self.regs.write_pio_command_queue_port(*word);
+        }
         self.rearm_pio_irqs(STAT_CMD_QUEUE_READY | STAT_TX_THLD | STAT_ALL_ERRORS);
         Ok(())
+    }
+
+    pub fn submit_pair_raw(
+        &mut self,
+        first: HciCommand,
+        second: HciCommand,
+        rx: &mut [u8],
+    ) -> Result<PioTransferPairResult> {
+        if !first.expects_response() || !second.expects_response() {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        if !first.read() && first.data_len() != 0 {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        if second.read() || second.data_len() != 0 {
+            return Err(I3cHciError::InvalidArgs);
+        }
+
+        self.check_errors()?;
+        self.wait_status(STAT_CMD_QUEUE_READY)?;
+        for word in first.words() {
+            self.regs.write_pio_command_queue_port(*word);
+        }
+        self.wait_status(STAT_CMD_QUEUE_READY)?;
+        for word in second.words() {
+            self.regs.write_pio_command_queue_port(*word);
+        }
+
+        let first_response = self.wait_response(first.tid())?;
+        let rx_len = self.read_rx_data(rx, first_response.data_len)?;
+        let second_response = self.wait_response(second.tid())?;
+        self.rearm_pio_irqs(STAT_RESP_READY | STAT_RX_THLD | STAT_TX_THLD | STAT_ALL_ERRORS);
+
+        Ok(PioTransferPairResult {
+            first_response,
+            second_response,
+            rx_len,
+        })
+    }
+
+    pub fn submit_v1(&mut self, transfer: PioTransfer<'_>) -> Result<PioTransferResult> {
+        self.submit(transfer)
+    }
+
+    pub fn submit_v1_raw(&mut self, transfer: PioTransfer<'_>) -> Result<PioTransferResult> {
+        self.submit_raw(transfer)
+    }
+
+    pub fn submit_v1_no_response(&mut self, transfer: PioTransfer<'_>) -> Result<()> {
+        self.submit_no_response(transfer)
     }
 
     pub fn target_next_response(&mut self) -> Result<TargetResponse> {
@@ -427,15 +481,15 @@ pub fn bytes_from_word(word: u32, out: &mut [u8]) {
 }
 
 pub fn validate_pio_transfer(transfer: &PioTransfer<'_>) -> Result<()> {
-    if transfer.command.read {
-        if !transfer.tx.is_empty() || transfer.rx.len() < transfer.command.data_len {
+    if transfer.command.read() {
+        if !transfer.tx.is_empty() || transfer.rx.len() < transfer.command.data_len() {
             return Err(I3cHciError::InvalidArgs);
         }
-    } else if transfer.command.kind == super::cmd::HciCommandKind::Immediate {
+    } else if transfer.command.kind() == HciCommandKind::Immediate {
         if !transfer.tx.is_empty() || !transfer.rx.is_empty() {
             return Err(I3cHciError::InvalidArgs);
         }
-    } else if transfer.tx.len() != transfer.command.data_len || !transfer.rx.is_empty() {
+    } else if transfer.tx.len() != transfer.command.data_len() || !transfer.rx.is_empty() {
         return Err(I3cHciError::InvalidArgs);
     }
     Ok(())

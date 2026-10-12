@@ -299,8 +299,7 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.command_descriptor = Some(descriptor);
 
         match descriptor {
-            CommandDescriptor::V1 => Ok(()),
-            CommandDescriptor::V2 => Err(I3cHciError::Unsupported),
+            CommandDescriptor::V1 | CommandDescriptor::V2 => Ok(()),
         }
     }
 

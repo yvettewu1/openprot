@@ -6,11 +6,11 @@
 
 use ast10x0_i3c_hci::{
     bytes_from_word, classify_target_ccc, constants, discover_sections_from_regs,
-    dynamic_address_payload, i2c_mode, i3c_sdr_mode, parse_hci_version, select_command_descriptor,
-    word_from_bytes, CommandDescriptor, DatEntryV1, HciCommandKind, HciCommandV1, HciResponse,
-    HciTargetCcc, I3cHciConfig, I3cHciError, I3cHciRegisters, IoMode, DAT_0_I2C_DEVICE,
-    I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS, I3C_CCC_GETPID, I3C_CCC_GETSTATUS,
-    I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_SETDASA, I3C_CCC_SETNEWDA,
+    dynamic_address_payload, i2c_mode, i3c_sdr_mode, i3c_sdr_v2_rate, parse_hci_version,
+    select_command_descriptor, word_from_bytes, CommandDescriptor, DatEntryV1, HciCommandKind,
+    HciCommandV1, HciCommandV2, HciResponse, HciTargetCcc, I3cHciConfig, I3cHciError,
+    I3cHciRegisters, IoMode, DAT_0_I2C_DEVICE, I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS,
+    I3C_CCC_GETPID, I3C_CCC_GETSTATUS, I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_SETDASA, I3C_CCC_SETNEWDA,
 };
 use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
 use codegen as _;
@@ -206,6 +206,64 @@ fn run_command_logic_tests() -> Result<(), &'static str> {
     expect_true(internal.kind == HciCommandKind::Internal, "internal kind")?;
     expect_true(internal.expects_response(), "internal response expectation")?;
     expect_true(internal.words[0] == 0x1234_5647, "internal word0")?;
+
+    expect_true(i3c_sdr_v2_rate(12_500_000) == 0, "bad V2 SDR0 rate")?;
+    expect_true(i3c_sdr_v2_rate(8_000_000) == 2, "bad V2 SDR2 boundary")?;
+    expect_true(i3c_sdr_v2_rate(2_000_000) == 5, "bad V2 FM/FMP rate")?;
+
+    let v2_read = HciCommandV2::i3c_private_read(4, 6, 8, i3c_sdr_v2_rate(12_500_000))
+        .map_err(|_| "V2 private read encode failed")?;
+    expect_true(
+        v2_read.kind == HciCommandKind::Regular,
+        "V2 private read kind",
+    )?;
+    expect_true(v2_read.words[0] == 0x0000_04b4, "V2 private read word0")?;
+    expect_true(v2_read.words[1] == 0x0000_0008, "V2 private read word1")?;
+
+    let v2_ccc = HciCommandV2::ccc(
+        0,
+        7,
+        false,
+        0x06,
+        &[0x5a],
+        i3c_sdr_v2_rate(12_500_000),
+        None,
+    )
+    .map_err(|_| "V2 CCC immediate encode failed")?;
+    expect_true(
+        v2_ccc.kind == HciCommandKind::Immediate,
+        "V2 CCC immediate kind",
+    )?;
+    expect_true(v2_ccc.words[0] == 0x0200_003c, "V2 CCC immediate word0")?;
+    expect_true(v2_ccc.words[2] == 0x0000_5a06, "V2 CCC immediate word2")?;
+
+    let v2_daa_read = HciCommandV2::daa_read_pid(3, 8).map_err(|_| "V2 DAA read encode failed")?;
+    expect_true(
+        v2_daa_read.kind == HciCommandKind::AddressAssignment,
+        "V2 DAA read kind",
+    )?;
+    expect_true(v2_daa_read.words[0] == 0x4000_001a, "V2 DAA read word0")?;
+    expect_true(v2_daa_read.words[1] == 0x0000_0008, "V2 DAA read word1")?;
+
+    let v2_daa_assign =
+        HciCommandV2::daa_assign_address(4, 0x0a).map_err(|_| "V2 DAA assign encode failed")?;
+    expect_true(
+        v2_daa_assign.kind == HciCommandKind::AddressAssignment,
+        "V2 DAA assign kind",
+    )?;
+    expect_true(v2_daa_assign.words[0] == 0xc000_0a22, "V2 DAA assign word0")?;
+
+    let v2_internal =
+        HciCommandV2::internal(8, 0x6, 0x12345).map_err(|_| "V2 internal encode failed")?;
+    expect_true(
+        v2_internal.kind == HciCommandKind::Internal,
+        "V2 internal kind",
+    )?;
+    expect_true(
+        v2_internal.expects_response(),
+        "V2 internal response expectation",
+    )?;
+    expect_true(v2_internal.words[0] == 0x1234_5647, "V2 internal word0")?;
 
     let response = HciResponse::parse(0x0500_0010);
     expect_true(response.status == 0, "response status")?;
