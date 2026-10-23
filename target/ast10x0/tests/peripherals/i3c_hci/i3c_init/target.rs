@@ -5,38 +5,49 @@
 #![no_main]
 
 use ast10x0_i3c_hci::{
-    bytes_from_word, classify_target_ccc, constants, discover_sections_from_regs,
-    dynamic_address_payload, i2c_mode, i3c_sdr_mode, i3c_sdr_v2_rate, parse_hci_version,
-    select_command_descriptor, word_from_bytes, CommandDescriptor, DatEntryV1, HciCommandKind,
-    HciCommandV1, HciCommandV2, HciResponse, HciTargetCcc, I3cHciConfig, I3cHciError,
-    I3cHciRegisters, IoMode, DAT_0_I2C_DEVICE, I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS,
-    I3C_CCC_GETPID, I3C_CCC_GETSTATUS, I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_SETDASA, I3C_CCC_SETNEWDA,
+    CommandDescriptor, DAT_0_I2C_DEVICE, DatEntryV1, HciCommandKind, HciCommandV1, HciCommandV2,
+    HciResponse, HciTargetCcc, I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS, I3C_CCC_GETPID,
+    I3C_CCC_GETSTATUS, I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_SETDASA, I3C_CCC_SETNEWDA, I3cHciConfig,
+    I3cHciError, I3cHciRegisters, IoMode, bytes_from_word, classify_target_ccc, constants,
+    discover_sections_from_regs, dynamic_address_payload, i2c_mode, i3c_sdr_mode, i3c_sdr_v2_rate,
+    parse_hci_version, select_command_descriptor, word_from_bytes,
 };
-use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
-use codegen as _;
-use entry as _;
-use target_common::{declare_target, TargetInterface};
+use ast10x0_scu_pinctrl::{ScuRegisters, pinctrl};
 
-const UART5_BASE: *const ast1080_pac::uart::RegisterBlock = 0x7e78_4000 as *const _;
+use bare_metal::write_all as console_backend_write_all;
+use core::hint::spin_loop;
 
-#[unsafe(no_mangle)]
-pub fn console_backend_write_all(buf: &[u8]) -> pw_status::Result<()> {
-    let uart = unsafe { &*UART5_BASE };
-    for byte in buf {
-        while !uart.uartlsr().read().thre().bit() {}
-        uart.uartthr().write(|w| unsafe { w.bits(*byte as u32) });
+pub fn spin_sleep(iterations: u32) {
+    for _ in 0..iterations {
+        spin_loop();
     }
-    Ok(())
+}
+fn expect_true(condition: bool, message: &'static str) -> Result<(), &'static str> {
+    if condition { Ok(()) } else { Err(message) }
 }
 
-pub struct Target {}
-
-fn expect_true(condition: bool, message: &'static str) -> Result<(), &'static str> {
-    if condition {
-        Ok(())
-    } else {
-        Err(message)
-    }
+fn log_sections(source: &str, sections: &ast10x0_i3c_hci::HciSections) {
+    bare_metal::info!(
+        "{} DAT offset=0x{:08x} entries={} entry_size={} bytes",
+        source,
+        sections.dat.offset,
+        sections.dat.entries,
+        sections.dat.entry_size
+    );
+    bare_metal::info!(
+        "{} DCT offset=0x{:08x} entries={} entry_size={} bytes",
+        source,
+        sections.dct.offset,
+        sections.dct.entries,
+        sections.dct.entry_size
+    );
+    bare_metal::info!(
+        "{} RHS offset=0x{:08x}",
+        source,
+        sections.ring_headers_offset
+    );
+    bare_metal::info!("{} PIO offset=0x{:08x}", source, sections.pio_offset);
+    bare_metal::info!("{} EXT offset=0x{:08x}", source, sections.ext_caps_offset);
 }
 
 fn run_core_logic_tests() -> Result<(), &'static str> {
@@ -72,6 +83,7 @@ fn run_core_logic_tests() -> Result<(), &'static str> {
     let dct = (3 << constants::DCT_TABLE_SIZE_SHIFT) | 0x400;
     let sections = discover_sections_from_regs(version, dat, dct, 0x600, 0x0d0, 0xf00)
         .map_err(|_| "HCI v1.1 section discovery failed")?;
+    //log_sections("core logic v1.1 (synthetic)", &sections);
     expect_true(sections.dat.offset == 0x120, "bad DAT offset")?;
     expect_true(sections.dat.entries == 5, "bad DAT entries")?;
     expect_true(sections.dat.entry_size == 8, "bad DAT entry size")?;
@@ -87,6 +99,7 @@ fn run_core_logic_tests() -> Result<(), &'static str> {
     let dct_dwords = (16 << constants::DCT_TABLE_SIZE_SHIFT) | 0x400;
     let sections_v10 = discover_sections_from_regs(v10, dat_dwords, dct_dwords, 0, 0x0d0, 0)
         .map_err(|_| "HCI v1.0 section discovery failed")?;
+    //log_sections("core logic v1.0 (synthetic)", &sections_v10);
     expect_true(
         sections_v10.dat.entries == 8,
         "bad v1.0 DAT dword conversion",
@@ -279,17 +292,37 @@ fn run_hardware_register_smoke_test() -> Result<(), &'static str> {
     let regs = unsafe { I3cHciRegisters::new(0) }.ok_or("invalid I3C HCI bus")?;
 
     let raw_version = regs.hci_version();
-    let version = parse_hci_version(raw_version).map_err(|_| "unsupported HCI version")?;
     let caps = regs.hc_capabilities();
     let dat = regs.dat_section();
     let dct = regs.dct_section();
     let rhs = regs.ring_headers_section();
     let pio = regs.pio_section();
     let ext = regs.ext_caps_section();
+    // Print the raw snapshot before decoding so invalid values remain visible.
+    bare_metal::info!(
+        "HCI{} hardware VERSION=0x{:08x} CAPABILITIES=0x{:08x}",
+        regs.bus(),
+        raw_version,
+        caps
+    );
+    bare_metal::info!(
+        "HCI{} hardware raw DAT=0x{:08x} DCT=0x{:08x}",
+        regs.bus(),
+        dat,
+        dct
+    );
+    bare_metal::info!(
+        "HCI{} hardware raw RHS=0x{:08x} PIO=0x{:08x} EXT=0x{:08x}",
+        regs.bus(),
+        rhs,
+        pio,
+        ext
+    );
+    let version = parse_hci_version(raw_version).map_err(|_| "unsupported HCI version")?;
     let sections = discover_sections_from_regs(version, dat, dct, rhs, pio, ext)
         .map_err(|_| "invalid HCI section registers")?;
 
-    pw_log::info!(
+    bare_metal::info!(
         "HCI{} version raw={:08x} major={} minor={} rev={} caps={:08x}",
         regs.bus() as u32,
         raw_version as u32,
@@ -298,64 +331,73 @@ fn run_hardware_register_smoke_test() -> Result<(), &'static str> {
         version.revision as u32,
         caps as u32
     );
-    pw_log::info!(
-        "HCI sections DAT off={:04x} entries={} size={} DCT off={:04x} entries={} size={}",
-        sections.dat.offset as u32,
-        sections.dat.entries as u32,
-        sections.dat.entry_size as u32,
-        sections.dct.offset as u32,
-        sections.dct.entries as u32,
-        sections.dct.entry_size as u32
-    );
-    pw_log::info!(
-        "HCI sections RHS={:04x} PIO={:04x} EXT={:04x} present={:08x} pio_q={:08x}",
-        sections.ring_headers_offset as u32,
-        sections.pio_offset as u32,
-        sections.ext_caps_offset as u32,
-        regs.present_state() as u32,
-        regs.pio_queue_size() as u32
+    log_sections("HCI0 hardware", &sections);
+    bare_metal::info!(
+        "HCI0 hardware PRESENT_STATE=0x{:08x} PIO_QUEUE_SIZE=0x{:08x}",
+        regs.present_state(),
+        regs.pio_queue_size()
     );
 
     Ok(())
 }
 
 fn run_i3c_hci_init_smoke_test() -> Result<(), &'static str> {
-    pw_log::info!("=== AST10x0 I3C HCI init smoke test ===");
+    bare_metal::info!("=== AST10x0 I3C HCI init smoke test ===");
 
     // SAFETY: Test target runs once at boot with exclusive access to SCU.
     let scu = unsafe { ScuRegisters::new_global_unlocked() };
     scu.apply_pinctrl_group(pinctrl::PINCTRL_I3C_HCI0);
-    pw_log::info!("SCU pinctrl applied for I3C HCI0");
+    bare_metal::info!("SCU pinctrl applied for I3C HCI0");
+    let scu400 = scu.regs().scu400().read().bits();
+    bare_metal::info!(
+        "SCU400 [0x74C02400] = 0x{:08x}, I3C0 SCL mux={} SDA mux={}",
+        scu400,
+        scu400 & 0x7,
+        (scu400 >> 4) & 0x7
+    );
+    // stop i3c0-3
+    scu.regs().scu240().write(|w| unsafe { w.bits(0xf0000) });
+    spin_sleep(100_000);
+
+    // reset i3c0-i3c3
+     scu.regs().scu200().write(|w| unsafe { w.bits(0xf0000) });
+      spin_sleep(1000_000);
+     scu.regs().scu204().write(|w| unsafe { w.bits(0xf0000) });
+    spin_sleep(1000_000);
+    // reset i3c dma
+    scu.regs().scu220().write(|w| unsafe { w.bits(0x80000000) });
+    spin_sleep(100_000);
+      scu.regs().scu224().write(|w| unsafe { w.bits(0x80000000) });
+    spin_sleep(100_000);
+    // turn on clock
+    // start i3c0-3
+    scu.regs().scu244().write(|w| unsafe { w.bits(0xf0000) });
+    spin_sleep(100_000);
 
     run_core_logic_tests()?;
-    pw_log::info!("I3C HCI core logic checks passed");
+    bare_metal::info!("I3C HCI core logic checks passed");
 
     run_command_logic_tests()?;
-    pw_log::info!("I3C HCI command logic checks passed");
+    bare_metal::info!("I3C HCI command logic checks passed");
 
     run_hardware_register_smoke_test()?;
-    pw_log::info!("I3C HCI hardware register smoke checks passed");
+    bare_metal::info!("I3C HCI hardware register smoke checks passed");
 
-    pw_log::info!("=== AST10x0 I3C HCI init smoke test complete ===");
+    bare_metal::info!("=== AST10x0 I3C HCI init smoke test complete ===");
     Ok(())
 }
 
-impl TargetInterface for Target {
-    const NAME: &'static str = "AST10x0 Kernel I3C HCI";
+#[unsafe(no_mangle)]
+pub extern "C" fn test_main() -> ! {
+    let sentinel: &[u8] = match run_i3c_hci_init_smoke_test() {
+        Ok(()) => b"TEST_RESULT:PASS\n",
+        Err(error) => {
+            bare_metal::error!("I3C HCI init smoke test failed: {}", error as &str);
+            b"TEST_RESULT:FAIL\n"
+        }
+    };
 
-    fn main() -> ! {
-        let sentinel: &[u8] = match run_i3c_hci_init_smoke_test() {
-            Ok(()) => b"TEST_RESULT:PASS\n",
-            Err(error) => {
-                pw_log::error!("I3C HCI init smoke test failed: {}", error as &str);
-                b"TEST_RESULT:FAIL\n"
-            }
-        };
-
-        let _ = console_backend_write_all(sentinel);
-        #[expect(clippy::empty_loop)]
-        loop {}
-    }
+    console_backend_write_all(sentinel);
+    #[expect(clippy::empty_loop)]
+    loop {}
 }
-
-declare_target!(Target);

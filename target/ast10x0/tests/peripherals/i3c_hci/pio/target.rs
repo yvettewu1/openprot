@@ -5,36 +5,17 @@
 #![no_main]
 
 use ast10x0_i3c_hci::{
+    AddressSlots, DaaResponse, DatAllocator, DatEntryV1, DctEntryV1, HciCommand, HciCommandKind,
+    HciCommandV1, HciDeviceTable, HciI3cDevice, HciResponse, I3cHciError, PioTransfer,
     bytes_from_word, classify_entdaa_response, i2c_mode, i3c_sdr_mode, odd_parity7,
     prepare_entdaa_step, prepare_next_entdaa_step, valid_i3c_address, validate_pio_transfer,
-    word_from_bytes, AddressSlots, DaaResponse, DatAllocator, DatEntryV1, DctEntryV1, HciCommand,
-    HciCommandKind, HciCommandV1, HciDeviceTable, HciI3cDevice, HciResponse, I3cHciError,
-    PioTransfer,
+    word_from_bytes,
 };
-use codegen as _;
-use entry as _;
-use target_common::{declare_target, TargetInterface};
 
-const UART5_BASE: *const ast1080_pac::uart::RegisterBlock = 0x7e78_4000 as *const _;
-
-#[unsafe(no_mangle)]
-pub fn console_backend_write_all(buf: &[u8]) -> pw_status::Result<()> {
-    let uart = unsafe { &*UART5_BASE };
-    for byte in buf {
-        while !uart.uartlsr().read().thre().bit() {}
-        uart.uartthr().write(|w| unsafe { w.bits(*byte as u32) });
-    }
-    Ok(())
-}
-
-pub struct Target {}
+use bare_metal::write_all as console_backend_write_all;
 
 fn expect_true(condition: bool, message: &'static str) -> Result<(), &'static str> {
-    if condition {
-        Ok(())
-    } else {
-        Err(message)
-    }
+    if condition { Ok(()) } else { Err(message) }
 }
 
 fn run_pio_tests() -> Result<(), &'static str> {
@@ -328,22 +309,17 @@ fn run_pio_tests() -> Result<(), &'static str> {
     Ok(())
 }
 
-impl TargetInterface for Target {
-    const NAME: &'static str = "AST10x0 I3C HCI PIO";
+#[unsafe(no_mangle)]
+pub extern "C" fn test_main() -> ! {
+    let sentinel: &[u8] = match run_pio_tests() {
+        Ok(()) => b"TEST_RESULT:PASS\n",
+        Err(error) => {
+            bare_metal::error!("I3C HCI PIO test failed: {}", error as &str);
+            b"TEST_RESULT:FAIL\n"
+        }
+    };
 
-    fn main() -> ! {
-        let sentinel: &[u8] = match run_pio_tests() {
-            Ok(()) => b"TEST_RESULT:PASS\n",
-            Err(error) => {
-                pw_log::error!("I3C HCI PIO test failed: {}", error as &str);
-                b"TEST_RESULT:FAIL\n"
-            }
-        };
-
-        let _ = console_backend_write_all(sentinel);
-        #[expect(clippy::empty_loop)]
-        loop {}
-    }
+    console_backend_write_all(sentinel);
+    #[expect(clippy::empty_loop)]
+    loop {}
 }
-
-declare_target!(Target);

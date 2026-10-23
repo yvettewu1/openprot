@@ -15,17 +15,11 @@
 
 use ast10x0_i3c_hci::pio::STAT_IBI_STATUS_THLD;
 use ast10x0_i3c_hci::{
-    dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler, DatAllocator, HciDeviceTable,
-    HciIbiEvent, HciTargetConfig, I3cHciConfig, I3cHciCore, I3cHciMaster, I3cHciTarget, IoMode,
-    IsrCtx, IsrEvents,
+    DatAllocator, HciDeviceTable, HciIbiEvent, HciTargetConfig, I3cHciConfig, I3cHciCore,
+    I3cHciMaster, I3cHciTarget, IoMode, IsrCtx, IsrEvents, dispatch_i3c_hci_irq, isr_events,
+    register_i3c_hci_irq_handler,
 };
-use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
-
-use codegen as _;
-use entry as _;
-use target_common::{declare_target, TargetInterface};
-
-const UART5_BASE: *const ast1080_pac::uart::RegisterBlock = 0x7e78_4000 as *const _;
+use ast10x0_scu_pinctrl::{ScuRegisters, pinctrl};
 
 const MASTER_BUS: u8 = 0;
 const TARGET_BUS: u8 = 1;
@@ -47,27 +41,10 @@ pub extern "C" fn interrupt_handler_97() {
     dispatch_i3c_hci_irq(TARGET_BUS as usize);
 }
 
-#[unsafe(no_mangle)]
-pub fn console_backend_write_all(buf: &[u8]) -> pw_status::Result<()> {
-    let uart = unsafe { &*UART5_BASE };
-
-    for byte in buf {
-        while !uart.uartlsr().read().thre().bit() {}
-
-        uart.uartthr().write(|w| unsafe { w.bits(*byte as u32) });
-    }
-
-    Ok(())
-}
-
-pub struct Target {}
+use bare_metal::write_all as console_backend_write_all;
 
 fn expect_true(condition: bool, message: &'static str) -> Result<(), &'static str> {
-    if condition {
-        Ok(())
-    } else {
-        Err(message)
-    }
+    if condition { Ok(()) } else { Err(message) }
 }
 fn expect_target_ibi(
     event: HciIbiEvent,
@@ -80,7 +57,7 @@ fn expect_target_ibi(
             status,
             payload_len,
         } => {
-            pw_log::info!(
+            bare_metal::info!(
                 "IBI received: DA={:02x} len={} raw={:08x}",
                 status.target_addr as u32,
                 payload_len as u32,
@@ -122,7 +99,7 @@ fn wait_for_master_ibi_irq(events: &IsrEvents) -> Result<(), &'static str> {
 }
 
 fn run_ibi_test() -> Result<(), &'static str> {
-    pw_log::info!("=== AST1080 I3C HCI IBI self-test ===");
+    bare_metal::info!("=== AST1080 I3C HCI IBI self-test ===");
 
     let scu = unsafe { ScuRegisters::new_global_unlocked() };
     scu.apply_pinctrl_group(pinctrl::PINCTRL_I3C_HCI0);
@@ -186,7 +163,7 @@ fn run_ibi_test() -> Result<(), &'static str> {
         "master/target dynamic address mismatch",
     )?;
 
-    pw_log::info!(
+    bare_metal::info!(
         "target discovered: DAT={} DA={:02x}",
         target_device.dat_index as u32,
         assigned_addr as u32,
@@ -196,7 +173,7 @@ fn run_ibi_test() -> Result<(), &'static str> {
         .enable_ibi(target_device, false)
         .map_err(|_| "master enable IBI failed")?;
 
-    pw_log::info!("master enabled IBI for DA={:02x}", assigned_addr as u32);
+    bare_metal::info!("master enabled IBI for DA={:02x}", assigned_addr as u32);
 
     /*
      * First prove the direct PIO polling datapath.
@@ -205,7 +182,7 @@ fn run_ibi_test() -> Result<(), &'static str> {
         .request_ibi()
         .map_err(|_| "target polling IBI request failed")?;
 
-    pw_log::info!("target requested polling IBI");
+    bare_metal::info!("target requested polling IBI");
 
     let mut ibi_payload = [0u8; 8];
     let event = master
@@ -214,23 +191,14 @@ fn run_ibi_test() -> Result<(), &'static str> {
 
     expect_target_ibi(event, assigned_addr, 0)?;
 
-    pw_log::info!("IBI polling PASS");
+    bare_metal::info!("IBI polling PASS");
 
     /*
      * Then prove the ISR latch path. The board vector can call
-     * dispatch_i3c_hci_irq() directly; this self-test invokes the same
-     * dispatcher in its wait loop so the HCI ISR service and IsrEvents latch
+     * dispatch_i3c_hci_irq() directly; this self-test enables the hardware
+     * interrupt after registering its context so the HCI ISR service and IsrEvents latch
      * are covered without adding another IBI queue.
      */
-    let irq_ctx = unsafe { IsrCtx::new(MASTER_BUS, IoMode::Pio) }
-        .ok_or("master IRQ context create failed")?;
-
-    expect_true(
-        register_i3c_hci_irq_handler(MASTER_BUS as usize, irq_ctx),
-        "master IRQ handler registration failed",
-    )?;
-
-    // register the irq for bus0 before enabling irq event
     let irq_ctx = unsafe { IsrCtx::new(MASTER_BUS, IoMode::Pio) }
         .ok_or("master IRQ context create failed")?;
 
@@ -242,12 +210,16 @@ fn run_ibi_test() -> Result<(), &'static str> {
     let master_irq_events = isr_events(MASTER_BUS as usize).ok_or("master IRQ events missing")?;
 
     master.enable_ibi_irq_events();
+    // The context is registered and the bare-metal vector routes IRQ 96 to bus 0.
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(ast1080_pac::Interrupt::i3c);
+    }
 
     target
         .request_ibi()
         .map_err(|_| "target IRQ IBI request failed")?;
 
-    pw_log::info!("target requested IRQ IBI");
+    bare_metal::info!("target requested IRQ IBI");
 
     wait_for_master_ibi_irq(master_irq_events)?;
 
@@ -257,27 +229,22 @@ fn run_ibi_test() -> Result<(), &'static str> {
 
     expect_target_ibi(event, assigned_addr, 0)?;
 
-    pw_log::info!("IBI IRQ PASS");
+    bare_metal::info!("IBI IRQ PASS");
     Ok(())
 }
 
-impl TargetInterface for Target {
-    const NAME: &'static str = "AST1080 I3C HCI IBI self-test";
+#[unsafe(no_mangle)]
+pub extern "C" fn test_main() -> ! {
+    let sentinel: &[u8] = match run_ibi_test() {
+        Ok(()) => b"TEST_RESULT:PASS\n",
+        Err(error) => {
+            bare_metal::error!("I3C HCI IBI test failed: {}", error as &str);
+            b"TEST_RESULT:FAIL\n"
+        }
+    };
 
-    fn main() -> ! {
-        let sentinel: &[u8] = match run_ibi_test() {
-            Ok(()) => b"TEST_RESULT:PASS\n",
-            Err(error) => {
-                pw_log::error!("I3C HCI IBI test failed: {}", error as &str);
-                b"TEST_RESULT:FAIL\n"
-            }
-        };
+    console_backend_write_all(sentinel);
 
-        let _ = console_backend_write_all(sentinel);
-
-        #[expect(clippy::empty_loop)]
-        loop {}
-    }
+    #[expect(clippy::empty_loop)]
+    loop {}
 }
-
-declare_target!(Target);

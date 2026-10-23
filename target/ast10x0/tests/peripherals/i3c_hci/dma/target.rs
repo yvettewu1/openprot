@@ -16,38 +16,17 @@
 #![no_main]
 
 use ast10x0_i3c_hci::{
-    parse_hci_version, parse_rhs_control, rhs_info, DmaRing, DmaRingEntry, I3cHciConfig,
-    I3cHciCore, IoMode,
+    DmaRing, DmaRingEntry, I3cHciConfig, I3cHciCore, IoMode, parse_hci_version, parse_rhs_control,
+    rhs_info,
 };
-use ast10x0_scu_pinctrl::{pinctrl, ScuRegisters};
-use codegen as _;
-use entry as _;
-use target_common::{declare_target, TargetInterface};
+use ast10x0_scu_pinctrl::{ScuRegisters, pinctrl};
 
-const UART5_BASE: *const ast1080_pac::uart::RegisterBlock = 0x7e78_4000 as *const _;
 const BUS: u8 = 0;
 
-#[unsafe(no_mangle)]
-pub fn console_backend_write_all(buf: &[u8]) -> pw_status::Result<()> {
-    let uart = unsafe { &*UART5_BASE };
-
-    for byte in buf {
-        while !uart.uartlsr().read().thre().bit() {}
-
-        uart.uartthr().write(|w| unsafe { w.bits(*byte as u32) });
-    }
-
-    Ok(())
-}
-
-pub struct Target {}
+use bare_metal::write_all as console_backend_write_all;
 
 fn expect_true(condition: bool, message: &'static str) -> Result<(), &'static str> {
-    if condition {
-        Ok(())
-    } else {
-        Err(message)
-    }
+    if condition { Ok(()) } else { Err(message) }
 }
 
 fn run_rhs_logic_tests() -> Result<(), &'static str> {
@@ -110,7 +89,7 @@ fn run_rhs_hardware_smoke_test() -> Result<(), &'static str> {
     let sections = core.sections();
     let rhs = rhs_info(regs, sections).map_err(|_| "RHS info unavailable")?;
 
-    pw_log::info!(
+    bare_metal::info!(
         "HCI{} DMA RHS off={:04x} preamble={} header={} max={} driver={}",
         regs.bus() as u32,
         rhs.ring_headers_offset as u32,
@@ -120,7 +99,7 @@ fn run_rhs_hardware_smoke_test() -> Result<(), &'static str> {
         rhs.driver_header_count as u32,
     );
 
-    pw_log::info!(
+    bare_metal::info!(
         "HCI DMA version raw={:08x} rhs_status={:08x}",
         regs.hci_version() as u32,
         regs.rhs_intr_status() as u32,
@@ -133,37 +112,32 @@ fn run_rhs_hardware_smoke_test() -> Result<(), &'static str> {
 }
 
 fn run_dma_test() -> Result<(), &'static str> {
-    pw_log::info!("=== AST1080 I3C HCI DMA/RHS smoke test ===");
+    bare_metal::info!("=== AST1080 I3C HCI DMA/RHS smoke test ===");
 
     let scu = unsafe { ScuRegisters::new_global_unlocked() };
     scu.apply_pinctrl_group(pinctrl::PINCTRL_I3C_HCI0);
 
     run_rhs_logic_tests()?;
-    pw_log::info!("RHS logic checks passed");
+    bare_metal::info!("RHS logic checks passed");
 
     run_rhs_hardware_smoke_test()?;
-    pw_log::info!("DMA/RHS hardware smoke test passed");
+    bare_metal::info!("DMA/RHS hardware smoke test passed");
 
     Ok(())
 }
 
-impl TargetInterface for Target {
-    const NAME: &'static str = "AST1080 I3C HCI DMA/RHS smoke test";
+#[unsafe(no_mangle)]
+pub extern "C" fn test_main() -> ! {
+    let sentinel: &[u8] = match run_dma_test() {
+        Ok(()) => b"TEST_RESULT:PASS\n",
+        Err(error) => {
+            bare_metal::error!("I3C HCI DMA/RHS test failed: {}", error as &str);
+            b"TEST_RESULT:FAIL\n"
+        }
+    };
 
-    fn main() -> ! {
-        let sentinel: &[u8] = match run_dma_test() {
-            Ok(()) => b"TEST_RESULT:PASS\n",
-            Err(error) => {
-                pw_log::error!("I3C HCI DMA/RHS test failed: {}", error as &str);
-                b"TEST_RESULT:FAIL\n"
-            }
-        };
+    console_backend_write_all(sentinel);
 
-        let _ = console_backend_write_all(sentinel);
-
-        #[expect(clippy::empty_loop)]
-        loop {}
-    }
+    #[expect(clippy::empty_loop)]
+    loop {}
 }
-
-declare_target!(Target);
