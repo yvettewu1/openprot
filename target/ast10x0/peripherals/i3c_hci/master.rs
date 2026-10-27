@@ -10,18 +10,18 @@ use super::ccc::{
     I3C_CCC_SETNEWDA,
 };
 use super::cmd::{
-    i2c_mode, i2c_v2_rate, i3c_sdr_mode, i3c_sdr_v2_rate, HciCommand, HciCommandV1, HciCommandV2,
+    HciCommand, HciCommandV1, HciCommandV2, i2c_mode, i2c_v2_rate, i3c_sdr_mode, i3c_sdr_v2_rate,
 };
 use super::core::{CommandDescriptor, HciSections};
 use super::daa::{
-    classify_entdaa_response, prepare_entdaa_step, prepare_next_entdaa_step, AddressSlots,
-    DaaResponse,
+    AddressSlots, DaaResponse, classify_entdaa_response, prepare_entdaa_step,
+    prepare_next_entdaa_step,
 };
 use super::dat::{
-    DatAllocator, DatEntryV1, DAT_0_I2C_DEVICE, DAT_0_IBI_PAYLOAD, DAT_0_SIR_REJECT,
-    DAT_V1_ENTRY_SIZE,
+    DAT_0_I2C_DEVICE, DAT_0_IBI_PAYLOAD, DAT_0_SIR_REJECT, DAT_V1_ENTRY_SIZE, DatAllocator,
+    DatEntryV1,
 };
-use super::dct::{read_dct_entry_v1, DctEntryV1};
+use super::dct::{DctEntryV1, read_dct_entry_v1};
 use super::error::{I3cHciError, Result};
 use super::pio::{
     I3cHciPio, IbiStatus, PioTransfer, PioTransferResult, STAT_ALL_ERRORS, STAT_IBI_STATUS_THLD,
@@ -218,6 +218,13 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         self
     }
 
+    /// Forward optional PIO diagnostics without adding a logger dependency.
+    #[must_use]
+    pub fn with_trace(mut self, trace: fn(core::fmt::Arguments<'_>)) -> Self {
+        self.pio = self.pio.with_trace(trace);
+        self
+    }
+
     #[must_use]
     pub fn with_i2c_scl_hz(mut self, i2c_scl_hz: u32) -> Self {
         self.i2c_mode = i2c_mode(i2c_scl_hz);
@@ -302,6 +309,12 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
     ) -> Result<usize> {
         let initial_len = table.len();
         let mut address_slots = AddressSlots::new();
+        let controller_addr = self.regs.controller_device_addr();
+        if controller_addr & super::constants::MASTER_DYNAMIC_ADDR_VALID != 0 {
+            let addr = ((controller_addr & super::constants::MASTER_DYNAMIC_ADDR_MASK)
+                >> super::constants::MASTER_DYNAMIC_ADDR_SHIFT) as u8;
+            address_slots.mark_used(addr)?;
+        }
 
         for device in table.iter() {
             address_slots.mark_used(device.dynamic_addr)?;
@@ -320,6 +333,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
     fn entdaa_once_v1(&mut self, dat_index: u8, dynamic_addr: u8) -> Result<Option<HciI3cDevice>> {
         let tid = self.next_tid();
         let step = prepare_entdaa_step(dat_index, dynamic_addr, tid)?;
+        self.regs.aspeed_prepare_daa(step.dynamic_addr);
         self.write_dat_entry(step.dat_index, step.dat_entry)?;
         self.regs.reset_dct_index();
         let mut rx = [];
@@ -335,6 +349,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                 .map(Some),
             DaaResponse::NoMoreDevices => {
                 self.write_dat_entry(step.dat_index, DatEntryV1::rejected())?;
+                self.pio.recover_after_daa_nack()?;
                 Ok(None)
             }
         }
@@ -373,6 +388,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
 
             let tid = self.next_tid();
             let step = prepare_next_entdaa_step(address_slots, dat_allocator, None, tid)?;
+            self.regs.aspeed_prepare_daa(step.dynamic_addr);
             self.write_dat_entry(step.dat_index, step.dat_entry)?;
             self.regs.reset_dct_index();
             let mut rx = [];
@@ -416,6 +432,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                 Ok(DaaResponse::NoMoreDevices) => {
                     self.write_dat_entry(step.dat_index, DatEntryV1::rejected())?;
                     dat_allocator.free(step.dat_index)?;
+                    self.pio.recover_after_daa_nack()?;
                     return Ok(table.len() - initial_len);
                 }
                 Err(error) => {

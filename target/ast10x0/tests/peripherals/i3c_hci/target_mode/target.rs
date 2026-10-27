@@ -477,6 +477,10 @@ fn run_target_mode_test() -> Result<(), &'static str> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn test_main() -> ! {
+    // SAFETY: Test startup owns SCU and the I3C controllers; no transfers are active.
+    unsafe {
+        bare_metal::i3c_setup::prepare_and_show(&[0, 1]);
+    }
     let sentinel: &[u8] = match run_target_mode_test() {
         Ok(()) => b"TEST_RESULT:PASS\n",
         Err(error) => {

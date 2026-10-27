@@ -15,40 +15,12 @@ use ast10x0_i3c_hci::{
 use ast10x0_scu_pinctrl::{ScuRegisters, pinctrl};
 
 use bare_metal::write_all as console_backend_write_all;
-use core::hint::spin_loop;
 
-pub fn spin_sleep(iterations: u32) {
-    for _ in 0..iterations {
-        spin_loop();
-    }
-}
 fn expect_true(condition: bool, message: &'static str) -> Result<(), &'static str> {
     if condition { Ok(()) } else { Err(message) }
 }
 
-fn log_sections(source: &str, sections: &ast10x0_i3c_hci::HciSections) {
-    bare_metal::info!(
-        "{} DAT offset=0x{:08x} entries={} entry_size={} bytes",
-        source,
-        sections.dat.offset,
-        sections.dat.entries,
-        sections.dat.entry_size
-    );
-    bare_metal::info!(
-        "{} DCT offset=0x{:08x} entries={} entry_size={} bytes",
-        source,
-        sections.dct.offset,
-        sections.dct.entries,
-        sections.dct.entry_size
-    );
-    bare_metal::info!(
-        "{} RHS offset=0x{:08x}",
-        source,
-        sections.ring_headers_offset
-    );
-    bare_metal::info!("{} PIO offset=0x{:08x}", source, sections.pio_offset);
-    bare_metal::info!("{} EXT offset=0x{:08x}", source, sections.ext_caps_offset);
-}
+use bare_metal::i3c_setup::show_sections as log_sections;
 
 fn run_core_logic_tests() -> Result<(), &'static str> {
     let version = parse_hci_version(0x0112).map_err(|_| "HCI v1.1 parse failed")?;
@@ -291,52 +263,10 @@ fn run_hardware_register_smoke_test() -> Result<(), &'static str> {
     // SAFETY: This test is the only code touching HCI bus 0.
     let regs = unsafe { I3cHciRegisters::new(0) }.ok_or("invalid I3C HCI bus")?;
 
-    let raw_version = regs.hci_version();
-    let caps = regs.hc_capabilities();
-    let dat = regs.dat_section();
-    let dct = regs.dct_section();
-    let rhs = regs.ring_headers_section();
-    let pio = regs.pio_section();
-    let ext = regs.ext_caps_section();
-    // Print the raw snapshot before decoding so invalid values remain visible.
-    bare_metal::info!(
-        "HCI{} hardware VERSION=0x{:08x} CAPABILITIES=0x{:08x}",
-        regs.bus(),
-        raw_version,
-        caps
-    );
-    bare_metal::info!(
-        "HCI{} hardware raw DAT=0x{:08x} DCT=0x{:08x}",
-        regs.bus(),
-        dat,
-        dct
-    );
-    bare_metal::info!(
-        "HCI{} hardware raw RHS=0x{:08x} PIO=0x{:08x} EXT=0x{:08x}",
-        regs.bus(),
-        rhs,
-        pio,
-        ext
-    );
-    let version = parse_hci_version(raw_version).map_err(|_| "unsupported HCI version")?;
-    let sections = discover_sections_from_regs(version, dat, dct, rhs, pio, ext)
-        .map_err(|_| "invalid HCI section registers")?;
-
-    bare_metal::info!(
-        "HCI{} version raw={:08x} major={} minor={} rev={} caps={:08x}",
-        regs.bus() as u32,
-        raw_version as u32,
-        version.major as u32,
-        version.minor as u32,
-        version.revision as u32,
-        caps as u32
-    );
-    log_sections("HCI0 hardware", &sections);
-    bare_metal::info!(
-        "HCI0 hardware PRESENT_STATE=0x{:08x} PIO_QUEUE_SIZE=0x{:08x}",
-        regs.present_state(),
-        regs.pio_queue_size()
-    );
+    bare_metal::i3c_setup::show_registers(&regs, "init register smoke test").map_err(|error| {
+        bare_metal::error!("HCI0 register decode failed: {:?}", error);
+        "invalid HCI section registers"
+    })?;
 
     Ok(())
 }
@@ -355,24 +285,6 @@ fn run_i3c_hci_init_smoke_test() -> Result<(), &'static str> {
         scu400 & 0x7,
         (scu400 >> 4) & 0x7
     );
-    // stop i3c0-3
-    scu.regs().scu240().write(|w| unsafe { w.bits(0xf0000) });
-    spin_sleep(100_000);
-
-    // reset i3c0-i3c3
-     scu.regs().scu200().write(|w| unsafe { w.bits(0xf0000) });
-      spin_sleep(1000_000);
-     scu.regs().scu204().write(|w| unsafe { w.bits(0xf0000) });
-    spin_sleep(1000_000);
-    // reset i3c dma
-    scu.regs().scu220().write(|w| unsafe { w.bits(0x80000000) });
-    spin_sleep(100_000);
-      scu.regs().scu224().write(|w| unsafe { w.bits(0x80000000) });
-    spin_sleep(100_000);
-    // turn on clock
-    // start i3c0-3
-    scu.regs().scu244().write(|w| unsafe { w.bits(0xf0000) });
-    spin_sleep(100_000);
 
     run_core_logic_tests()?;
     bare_metal::info!("I3C HCI core logic checks passed");
@@ -389,6 +301,10 @@ fn run_i3c_hci_init_smoke_test() -> Result<(), &'static str> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn test_main() -> ! {
+    // SAFETY: Test startup owns SCU and the I3C controllers; no transfers are active.
+    unsafe {
+        bare_metal::i3c_setup::prepare_and_show(&[0]);
+    }
     let sentinel: &[u8] = match run_i3c_hci_init_smoke_test() {
         Ok(()) => b"TEST_RESULT:PASS\n",
         Err(error) => {

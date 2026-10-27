@@ -136,6 +136,19 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
     }
 
     pub fn init(&mut self) -> Result<()> {
+        self.init_with_primary_addr(None)
+    }
+
+    /// Initialize the primary-controller role before enabling the bus.
+    /// The caller reserves this address and configures board clocks/PHY timing.
+    pub fn init_primary(&mut self, address: u8) -> Result<()> {
+        if !super::daa::valid_i3c_address(address) {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        self.init_with_primary_addr(Some(address))
+    }
+
+    fn init_with_primary_addr(&mut self, primary_addr: Option<u8>) -> Result<()> {
         self.detect_version()?;
         self.discover_sections()?;
         self.soft_reset()?;
@@ -143,6 +156,52 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.setup_endianness()?;
         self.select_cmd_ops()?;
         self.select_io_ops()?;
+        if let Some(address) = primary_addr {
+            // ASPEED Zephyr vendor init and program_master_addr precede BUS_ENABLE.
+            self.regs.aspeed_init(super::types::InitMode::Primary);
+            self.regs.write_controller_device_addr(
+                constants::MASTER_DYNAMIC_ADDR_VALID
+                    | (u32::from(address) << constants::MASTER_DYNAMIC_ADDR_SHIFT),
+            );
+            self.regs
+                .set_hc_control(constants::HC_CONTROL_HOT_JOIN_CTRL);
+        }
+        self.configure_polling_status();
+        self.enable_bus()?;
+        Ok(())
+    }
+
+    /// Make PIO status visible to software without routing interrupts to the CPU.
+    /// The IRQ build may enable signaling later with `enable_irq_signals`.
+    fn configure_polling_status(&self) {
+        self.regs.write_pio_intr_signal_enable(0);
+        if self.selected_io == Some(IoMode::Pio) {
+            // ASPEED Zephyr hci_pio_init: half-FIFO data thresholds,
+            // one command/response, bounded IBI data threshold, no start gate.
+            let size = self.regs.pio_queue_size();
+            let mut rx = (size >> 16) & 0xff;
+            let mut tx = (size >> 24) & 0xff;
+            if self.version.is_some_and(|v| v.major == 1) {
+                rx = rx.saturating_sub(1);
+                tx = tx.saturating_sub(1);
+            }
+            self.regs
+                .write_pio_data_buffer_thld_ctrl(((rx & 7) << 8) | (tx & 7));
+            let ibi = (((size >> 8) & 0xff) / 2).clamp(1, 63);
+            self.regs
+                .write_pio_queue_thld_ctrl((1 << 24) | (ibi << 16) | 0x0101);
+            self.regs.write_pio_intr_status(u32::MAX);
+            self.regs.write_pio_intr_status_enable(u32::MAX);
+        }
+    }
+
+    fn enable_bus(&self) -> Result<()> {
+        // MIPI I3C HCI HC_CONTROL.BUS_ENABLE is bit 31.
+        const BUS_ENABLE: u32 = 1 << 31;
+        self.regs.set_hc_control(BUS_ENABLE);
+        if (self.regs.hc_control() & BUS_ENABLE) == 0 {
+            return Err(I3cHciError::Busy);
+        }
         Ok(())
     }
 
@@ -170,7 +229,7 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
 
         let pio_irqs = super::pio::STAT_RESP_READY | super::pio::STAT_ALL_ERRORS;
 
-        self.regs.write_pio_intr_status_enable(pio_irqs);
+        self.regs.write_pio_intr_status_enable(u32::MAX);
         self.regs.write_pio_intr_signal_enable(pio_irqs);
     }
 

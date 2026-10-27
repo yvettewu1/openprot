@@ -9,7 +9,7 @@
 
 use super::cmd::{HciCommand, HciCommandKind, HciResponse, HciTargetCommand};
 use super::error::{I3cHciError, Result};
-use super::irq::{isr_events, IsrEvents};
+use super::irq::{IsrEvents, isr_events};
 use super::registers::I3cHciRegisters;
 
 pub const STAT_TRANSFER_BLOCKED: u32 = 1 << 25;
@@ -127,6 +127,7 @@ pub struct I3cHciPio<'a, Y: FnMut(u32)> {
     timeout_us: u32,
     irq_events: Option<&'static IsrEvents>,
     pending_irq_status: u32,
+    trace: Option<fn(core::fmt::Arguments<'_>)>,
 }
 
 impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
@@ -138,6 +139,7 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             timeout_us: 10_000,
             irq_events: None,
             pending_irq_status: 0,
+            trace: None,
         }
     }
 
@@ -156,6 +158,14 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         self
     }
 
+    /// Optional synchronous diagnostics. The callback must not access this controller.
+    /// Logging adds latency; no callback is installed by default.
+    #[must_use]
+    pub fn with_trace(mut self, trace: fn(core::fmt::Arguments<'_>)) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     pub fn submit(&mut self, transfer: PioTransfer<'_>) -> Result<PioTransferResult> {
         let result = self.submit_raw(transfer)?;
         if !result.response.success() {
@@ -169,11 +179,43 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         if !transfer.command.expects_response() {
             return Err(I3cHciError::Unsupported);
         }
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "HCI{} submit_raw TID={} TX bytes={} RX capacity={}",
+                self.regs.bus(),
+                transfer.command.tid(),
+                transfer.tx.len(),
+                transfer.rx.len()
+            ));
+            for (index, word) in transfer.command.words().iter().enumerate() {
+                trace(format_args!("CMD[{}]=0x{:08x}", index, word));
+            }
+        }
         self.check_errors()?;
         self.write_tx_data(transfer.tx)?;
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "Waiting for CMD_QUEUE_READY mask=0x{:08x}",
+                STAT_CMD_QUEUE_READY
+            ));
+        }
         self.wait_status(STAT_CMD_QUEUE_READY)?;
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "CMD_QUEUE_READY observed; writing {} command words",
+                transfer.command.words().len()
+            ));
+        }
+        // Keep descriptor writes contiguous; do not print between words.
         for word in transfer.command.words() {
             self.regs.write_pio_command_queue_port(*word);
+        }
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "All command words written; waiting for RESP_READY mask=0x{:08x} TID={}",
+                STAT_RESP_READY,
+                transfer.command.tid()
+            ));
         }
         let response = self.wait_response(transfer.command.tid())?;
         let rx_len = self.read_rx_data(transfer.rx, response.data_len)?;
@@ -364,8 +406,10 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     fn read_rx_data(&mut self, rx: &mut [u8], expected: usize) -> Result<usize> {
         let wanted = core::cmp::min(rx.len(), expected);
         let mut offset = 0;
+        // Called only after the matching completion response. Like Zephyr's
+        // hci_pio_do_trailing_rx, use the response length to drain the tail:
+        // RX_THLD may be clear for a short read (including the final word).
         while offset < wanted {
-            self.wait_status(STAT_RX_THLD)?;
             let word = self.regs.pio_rx_data_port();
             let chunk = core::cmp::min(4, wanted - offset);
             bytes_from_word(word, &mut rx[offset..offset + chunk]);
@@ -402,11 +446,70 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         Ok(copied)
     }
 
+    /// Recover after a consumed end-of-DAA NACK, with no other commands queued.
+    /// ASPEED Zephyr hci_pio_err resets command/data/response queues, then resumes.
+    pub(crate) fn recover_after_daa_nack(&mut self) -> Result<()> {
+        use super::constants;
+        let mask = constants::CMD_QUEUE_RST
+            | constants::RESP_QUEUE_RST
+            | constants::TX_FIFO_RST
+            | constants::RX_FIFO_RST;
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "DAA end recovery: HC_CONTROL=0x{:08x} HC_STATUS=0x{:08x} PIO_STATUS=0x{:08x}",
+                self.regs.hc_control(),
+                self.regs.intr_status(),
+                self.regs.pio_intr_status()
+            ));
+        }
+        self.regs.write_reset_control(mask);
+        let mut remaining = constants::MIPI_I3C_HCI_RESET_TIMEOUT_US;
+        while self.regs.reset_control() & mask != 0 {
+            if remaining == 0 {
+                return Err(I3cHciError::Timeout);
+            }
+            (self.yield_us)(1);
+            remaining -= 1;
+        }
+        self.regs.set_hc_control(constants::HC_CONTROL_RESUME);
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "DAA end recovery: queues reset; RESUME requested; HC_CONTROL=0x{:08x}",
+                self.regs.hc_control()
+            ));
+        }
+        Ok(())
+    }
+
     fn wait_response(&mut self, tid: u8) -> Result<HciResponse> {
         self.wait_status(STAT_RESP_READY)?;
-        let response = HciResponse::parse(self.regs.pio_response_queue_port());
+        let raw = self.regs.pio_response_queue_port();
+        let response = HciResponse::parse(raw);
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "Response raw=0x{:08x} TID={} expected_TID={} status=0x{:02x} data_len={}",
+                raw, response.tid, tid, response.status, response.data_len
+            ));
+        }
         if response.tid != tid {
             return Err(I3cHciError::InvalidArgs);
+        }
+        // A failed command can assert RESP_READY and TRANSFER_ERR together.
+        // Preserve its detailed response for the caller (ENTDAA's final NACK
+        // can mean no more devices), instead of returning only the summary bit.
+        if let Some(events) = self.irq_events {
+            self.pending_irq_status |= events.take_io_status();
+        }
+        self.pending_irq_status &= !STAT_RESP_READY;
+        if !response.success() {
+            self.regs.write_pio_intr_status(STAT_TRANSFER_ERR);
+            self.pending_irq_status &= !STAT_TRANSFER_ERR;
+        }
+        self.check_errors()?;
+        let errors = self.pending_irq_status & STAT_ALL_ERRORS;
+        if errors != 0 {
+            self.pending_irq_status &= !STAT_ALL_ERRORS;
+            return Err(I3cHciError::TransferStatus(errors));
         }
         Ok(response)
     }
@@ -414,9 +517,16 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     fn wait_status(&mut self, mask: u32) -> Result<()> {
         let mut remaining = self.timeout_us;
         loop {
-            self.check_errors()?;
-
             let status = self.regs.pio_intr_status();
+            // Match ASPEED Zephyr's response-before-transfer-error ordering.
+            // A FIFO/programming/abort error still takes precedence.
+            if mask == STAT_RESP_READY
+                && status & STAT_RESP_READY != 0
+                && status & (STAT_ALL_ERRORS & !STAT_TRANSFER_ERR) == 0
+            {
+                return Ok(());
+            }
+            self.check_errors()?;
             if (status & mask) != 0 {
                 return Ok(());
             }
@@ -438,6 +548,32 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             }
 
             if remaining == 0 {
+                if let Some(trace) = self.trace {
+                    // Snapshot before logging or caller cleanup. No FIFO reads.
+                    let queue_thld = self.regs.pio_queue_thld_ctrl();
+                    let status_enable = self.regs.pio_intr_status_enable();
+                    let signal_enable = self.regs.pio_intr_signal_enable();
+                    let control = self.regs.hc_control();
+                    let present = self.regs.present_state();
+                    let queue_size = self.regs.pio_queue_size();
+                    let hc_status = self.regs.intr_status();
+                    trace(format_args!(
+                        "HCI{} TIMEOUT awaiting_mask=0x{:08x} PIO_STATUS=0x{:08x} pending_irq=0x{:08x} budget={}",
+                        self.regs.bus(),
+                        mask,
+                        status,
+                        self.pending_irq_status,
+                        self.timeout_us
+                    ));
+                    trace(format_args!(
+                        "QUEUE_THLD_CTRL=0x{:08x} STATUS_ENABLE=0x{:08x} SIGNAL_ENABLE=0x{:08x}",
+                        queue_thld, status_enable, signal_enable
+                    ));
+                    trace(format_args!(
+                        "HC_CONTROL=0x{:08x} PRESENT=0x{:08x} QUEUE_SIZE=0x{:08x} HC_STATUS=0x{:08x}",
+                        control, present, queue_size, hc_status
+                    ));
+                }
                 return Err(I3cHciError::Timeout);
             }
             (self.yield_us)(1);
@@ -454,6 +590,14 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     fn check_errors(&self) -> Result<()> {
         let status = self.regs.pio_intr_status();
         if (status & STAT_ALL_ERRORS) != 0 {
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "HCI{} PIO error before W1C: status=0x{:08x} errors=0x{:08x}",
+                    self.regs.bus(),
+                    status,
+                    status & STAT_ALL_ERRORS
+                ));
+            }
             self.regs.write_pio_intr_status(status & STAT_ALL_ERRORS);
             return Err(I3cHciError::TransferStatus(status & STAT_ALL_ERRORS));
         }

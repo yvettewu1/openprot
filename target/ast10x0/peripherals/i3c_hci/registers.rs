@@ -184,33 +184,48 @@ impl I3cHciRegisters {
             .write(|w| unsafe { w.bits(value) });
     }
 
+    // PAC HCIPIO offsets follow HCI: command +0x00, response +0x04,
+    // shared TX/RX data +0x08, IBI +0x0c, queue threshold +0x10,
+    // data threshold +0x14, queue size +0x18. FIFO reads have side effects.
     #[inline]
-    pub fn pio_queue_size(&self) -> u32 {
-        self.regs().hcipio000().read().bits()
-    }
-    #[inline]
-    pub fn write_pio_command_queue_port(&self, value: u32) {
-        self.regs().hcipio004().write(|w| unsafe { w.bits(value) });
-    }
-    #[inline]
-    pub fn pio_response_queue_port(&self) -> u32 {
-        self.regs().hcipio008().read().bits()
-    }
-    #[inline]
-    pub fn write_pio_tx_data_port(&self, value: u32) {
-        self.regs().hcipio00c().write(|w| unsafe { w.bits(value) });
-    }
-    #[inline]
-    pub fn pio_rx_data_port(&self) -> u32 {
-        self.regs().hcipio010().read().bits()
-    }
-    #[inline]
-    pub fn pio_ibi_port(&self) -> u32 {
+    pub fn pio_data_buffer_thld_ctrl(&self) -> u32 {
         self.regs().hcipio014().read().bits()
     }
     #[inline]
+    pub fn write_pio_data_buffer_thld_ctrl(&self, value: u32) {
+        self.regs().hcipio014().write(|w| unsafe { w.bits(value) });
+    }
+    #[inline]
+    pub fn pio_queue_size(&self) -> u32 {
+        self.regs().hcipio018().read().bits()
+    }
+    #[inline]
+    pub fn write_pio_command_queue_port(&self, value: u32) {
+        self.regs().hcipio000().write(|w| unsafe { w.bits(value) });
+    }
+    #[inline]
+    pub fn pio_response_queue_port(&self) -> u32 {
+        self.regs().hcipio004().read().bits()
+    }
+    #[inline]
+    pub fn write_pio_tx_data_port(&self, value: u32) {
+        self.regs().hcipio008().write(|w| unsafe { w.bits(value) });
+    }
+    #[inline]
+    pub fn pio_rx_data_port(&self) -> u32 {
+        self.regs().hcipio008().read().bits()
+    }
+    #[inline]
+    pub fn pio_ibi_port(&self) -> u32 {
+        self.regs().hcipio00c().read().bits()
+    }
+    #[inline]
+    pub fn pio_queue_thld_ctrl(&self) -> u32 {
+        self.regs().hcipio010().read().bits()
+    }
+    #[inline]
     pub fn write_pio_queue_thld_ctrl(&self, value: u32) {
-        self.regs().hcipio018().write(|w| unsafe { w.bits(value) });
+        self.regs().hcipio010().write(|w| unsafe { w.bits(value) });
     }
     #[inline]
     pub fn pio_intr_status(&self) -> u32 {
@@ -221,8 +236,16 @@ impl I3cHciRegisters {
         self.regs().hcipio020().write(|w| unsafe { w.bits(value) });
     }
     #[inline]
+    pub fn pio_intr_status_enable(&self) -> u32 {
+        self.regs().hcipio024().read().bits()
+    }
+    #[inline]
     pub fn write_pio_intr_status_enable(&self, value: u32) {
         self.regs().hcipio024().write(|w| unsafe { w.bits(value) });
+    }
+    #[inline]
+    pub fn pio_intr_signal_enable(&self) -> u32 {
+        self.regs().hcipio028().read().bits()
     }
     #[inline]
     pub fn write_pio_intr_signal_enable(&self, value: u32) {
@@ -321,6 +344,31 @@ impl I3cHciRegisters {
     #[inline]
     pub fn aspeed_init(&self, mode: InitMode) {
         self.write_aspeed_ctrl(constants::ASPEED_I3C_CTRL_INIT | mode as u32);
+    }
+    #[inline]
+    pub fn aspeed_prepare_daa(&self, dynamic_addr: u8) {
+        // ASPEED Zephyr vendor_aspeed.c: prep_daa_step selects one address
+        // in the corresponding 32-address DAA bitmap before each ENTDAA.
+        let value = 1u32 << (dynamic_addr & 31);
+        match dynamic_addr / 32 {
+            0 => self
+                .regs()
+                .i3ccontrol010()
+                .write(|w| unsafe { w.bits(value) }),
+            1 => self
+                .regs()
+                .i3ccontrol014()
+                .write(|w| unsafe { w.bits(value) }),
+            2 => self
+                .regs()
+                .i3ccontrol018()
+                .write(|w| unsafe { w.bits(value) }),
+            3 => self
+                .regs()
+                .i3ccontrol01c()
+                .write(|w| unsafe { w.bits(value) }),
+            _ => unreachable!("DAA requires a seven-bit address"),
+        };
     }
     #[inline]
     pub fn aspeed_status(&self) -> u32 {

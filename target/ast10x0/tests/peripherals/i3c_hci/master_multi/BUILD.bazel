@@ -1,6 +1,23 @@
 # Licensed under the Apache-2.0 license
 # SPDX-License-Identifier: Apache-2.0
 
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("//target/ast10x0/tests/peripherals/i3c_hci/bare_metal:defs.bzl", "bare_metal_image")
 
-bare_metal_image(name = "master_multi")
+bool_flag(
+    name = "irq",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "irq_enabled",
+    flag_values = {":irq": "true"},
+)
+
+bare_metal_image(
+    name = "master_multi",
+    crate_features = select({
+        ":irq_enabled": ["irq"],
+        "//conditions:default": [],
+    }),
+)
