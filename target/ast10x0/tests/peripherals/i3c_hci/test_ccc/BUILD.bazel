@@ -15,7 +15,7 @@ config_setting(
 )
 
 bare_metal_image(
-    name = "master_multi",
+    name = "test_ccc",
     crate_features = select({
         ":irq_enabled": ["irq"],
         "//conditions:default": [],

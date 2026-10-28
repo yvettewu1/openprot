@@ -6,9 +6,7 @@
 
 #[cfg(feature = "irq")]
 use ast10x0_i3c_hci::dispatch_i3c_hci_irq;
-use ast10x0_i3c_hci::{
-    DatAllocator, HciDeviceTable, I3C_CCC_GETPID, I3cHciConfig, I3cHciCore, I3cHciMaster,
-};
+use ast10x0_i3c_hci::{DatAllocator, HciDeviceTable, I3cHciConfig, I3cHciCore, I3cHciMaster};
 
 use cortex_m::peripheral::NVIC;
 
@@ -19,6 +17,49 @@ const MAX_I3C_DEVICES: usize = 8;
 // Accept one external AST2700 target; still enumerate up to MAX_I3C_DEVICES.
 const EXPECTED_MIN_DEVICES: usize = 1;
 const ADDRESS_INDEXED_DAT: bool = true;
+// Preserve the application's private-write data inside the MCTP message.
+const PRIVATE_WRITE_DATA: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+// Test EIDs are independent of the I3C dynamic addresses. Null destination
+// addresses the directly attached endpoint for this receive-queue test.
+const MCTP_DEST_EID: u8 = 0x00;
+const MCTP_SOURCE_EID: u8 = 0x08;
+// Vendor-defined PCI message, IC=0; ASPEED vendor ID, most significant byte first.
+// These identify the test payload, not an implemented ASPEED command protocol.
+const MCTP_MESSAGE_TYPE: u8 = 0x7e;
+const MCTP_VENDOR_ID: u16 = 0x1a03;
+const MCTP_HEADER_LEN: usize = 7; // Transport (4), message type (1), vendor ID (2).
+const MCTP_WRITE_LEN: usize = MCTP_HEADER_LEN + PRIVATE_WRITE_DATA.len() + 1;
+
+fn prepare_mctp_packet(dynamic_addr: u8) -> [u8; MCTP_WRITE_LEN] {
+    let mut packet = [0u8; MCTP_WRITE_LEN];
+    packet[..MCTP_HEADER_LEN].copy_from_slice(&[
+        0x01, // Transport header version 1.
+        MCTP_DEST_EID,
+        MCTP_SOURCE_EID,
+        0xc8, // SOM=1, EOM=1, sequence=0, tag owner=1, tag=0.
+        MCTP_MESSAGE_TYPE,
+        (MCTP_VENDOR_ID >> 8) as u8,
+        MCTP_VENDOR_ID as u8,
+    ]);
+    let pec_index = packet.len() - 1;
+    packet[MCTP_HEADER_LEN..pec_index].copy_from_slice(&PRIVATE_WRITE_DATA);
+    // DSP0233 PEC: CRC-8 polynomial 0x07, initial value 0, over the
+    // destination address with W=0 followed by the MCTP header and message.
+    // The address byte participates in PEC but is not part of the payload.
+    let mut pec = 0u8;
+    for byte in core::iter::once(dynamic_addr << 1).chain(packet[..pec_index].iter().copied()) {
+        pec ^= byte;
+        for _ in 0..8 {
+            pec = if pec & 0x80 != 0 {
+                (pec << 1) ^ 0x07
+            } else {
+                pec << 1
+            };
+        }
+    }
+    packet[pec_index] = pec;
+    packet
+}
 
 #[cfg(feature = "irq")]
 #[unsafe(no_mangle)]
@@ -32,8 +73,8 @@ fn expect_true(condition: bool, message: &'static str) -> Result<(), &'static st
     if condition { Ok(()) } else { Err(message) }
 }
 
-fn run_master_multi_test() -> Result<(), &'static str> {
-    bare_metal::info!("=== AST10x0 I3C HCI multi-device master test ===");
+fn run_mctp_write_test() -> Result<(), &'static str> {
+    bare_metal::info!("=== AST10x0 I3C HCI MCTP private-write test ===");
 
     // SAFETY: Test target runs once at boot with exclusive access to SCU.
 
@@ -90,7 +131,7 @@ fn run_master_multi_test() -> Result<(), &'static str> {
     let mut master = master;
 
     bare_metal::info!(
-        "AST2700 target config supplied: PID=0x07ec06010000 DCR=0xcc (informational)"
+        "AST2700 target config supplied: PID=0x07ec06014000 DCR=0xcc (informational)"
     );
     bare_metal::info!(
         "ENTDAA start: bus={} SCL={} timeout_budget={} DAT slots={} address_indexed={} descriptor={:?}",
@@ -138,6 +179,7 @@ fn run_master_multi_test() -> Result<(), &'static str> {
         "too few I3C devices discovered",
     )?;
 
+    let mut writes = 0;
     for device in table.iter() {
         bare_metal::info!(
             "I3C device da={:02x} dat={} pid={:04x}_{:08x} bcr={:02x} dcr={:02x}",
@@ -149,28 +191,44 @@ fn run_master_multi_test() -> Result<(), &'static str> {
             device.dcr as u32
         );
 
-        let mut pid = [0u8; 6];
-        let result = master
-            .ccc_direct_read_addr(&table, device.dynamic_addr, I3C_CCC_GETPID, None, &mut pid)
-            .map_err(|_| "GETPID by dynamic address failed")?;
-        expect_true(result.rx_len == pid.len(), "GETPID short read")?;
-
-        // Completion is checked above. In IRQ mode the PIO driver consumes
-        // latched events itself, so do not drain/assert that event latch here.
-
+        if device.dcr != 0xcc {
+            bare_metal::info!("Skipping non-MCTP target da=0x{:02x}", device.dynamic_addr);
+            continue;
+        }
+        let packet = prepare_mctp_packet(device.dynamic_addr);
+        bare_metal::info!("Application payload bytes={:02x?}", PRIVATE_WRITE_DATA);
         bare_metal::info!(
-            "GETPID da={:02x} bytes={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            device.dynamic_addr as u32,
-            pid[0] as u32,
-            pid[1] as u32,
-            pid[2] as u32,
-            pid[3] as u32,
-            pid[4] as u32,
-            pid[5] as u32
+            "Open the AST2700 4-target MCTP device and wait for RX before this write; IBI is not needed"
+        );
+        bare_metal::info!("================================");
+        // Retain the existing manual receiver-setup delay (not calibrated).
+        bare_metal::i3c_setup::spin_sleep(0x8000_0000);
+        bare_metal::info!(
+            "MCTP WRITE da=0x{:02x} len={} bytes={:02x?}",
+            device.dynamic_addr,
+            packet.len(),
+            packet
+        );
+        let write_result = master
+            .private_write_addr(&table, device.dynamic_addr, &packet)
+            .map_err(|error| {
+                bare_metal::error!(
+                    "MCTP WRITE da=0x{:02x} failed: {:?}",
+                    device.dynamic_addr,
+                    error
+                );
+                "MCTP private write failed"
+            })?;
+        writes += 1;
+        bare_metal::info!(
+            "MCTP WRITE BUS PASS da=0x{:02x} response=0x{:08x}; verify bytes on AST2700",
+            device.dynamic_addr,
+            write_result.response.raw
         );
     }
+    expect_true(writes > 0, "no MCTP target found for write test")?;
 
-    bare_metal::info!("=== AST10x0 I3C HCI multi-device master test complete ===");
+    bare_metal::info!("=== AST10x0 I3C HCI MCTP private-write test complete ===");
     Ok(())
 }
 
@@ -180,10 +238,10 @@ pub extern "C" fn test_main() -> ! {
     unsafe {
         bare_metal::i3c_setup::prepare_and_show(&[0], false);
     }
-    let sentinel: &[u8] = match run_master_multi_test() {
+    let sentinel: &[u8] = match run_mctp_write_test() {
         Ok(()) => b"TEST_RESULT:PASS\n",
         Err(error) => {
-            bare_metal::error!("I3C HCI master multi-device test failed: {}", error as &str);
+            bare_metal::error!("I3C HCI MCTP private-write test failed: {}", error as &str);
             b"TEST_RESULT:FAIL\n"
         }
     };

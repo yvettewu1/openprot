@@ -1,0 +1,28 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@pigweed//pw_build:binary_tools.bzl", "pw_elf_to_bin")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("//target/ast10x0:defs.bzl", "TARGET_COMPATIBLE_WITH")
+
+# Build-time objcopy helper only; no Pigweed code is linked into this image.
+pw_elf_to_bin(
+    name = "hello",
+    bin_out = "hello.bin",
+    elf_input = ":hello.elf",
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+)
+
+rust_binary(
+    name = "hello.elf",
+    srcs = ["target.rs"],
+    crate_name = "ast1080_hello",
+    edition = "2024",
+    compile_data = ["hello.ld"],
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=s",
+        "-Clink-arg=-T$(location :hello.ld)",
+    ],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+)

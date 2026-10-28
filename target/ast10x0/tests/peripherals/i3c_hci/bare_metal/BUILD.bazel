@@ -1,0 +1,23 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//target/ast10x0:defs.bzl", "TARGET_COMPATIBLE_WITH")
+
+package(default_visibility = ["//target/ast10x0/tests/peripherals/i3c_hci:__subpackages__"])
+exports_files(["runtime.ld", "defs.bzl"])
+
+rust_library(
+    name = "runtime",
+    srcs = ["i3c_setup.rs", "runtime.rs"],
+    crate_root = "runtime.rs",
+    crate_name = "bare_metal",
+    edition = "2024",
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    deps = [
+        "//target/ast10x0/peripherals:i3c_hci",
+        "//target/ast10x0/peripherals:scu_pinctrl",
+        "@ast1080_pac",
+        "@rust_crates//:cortex-m",
+    ],
+)
