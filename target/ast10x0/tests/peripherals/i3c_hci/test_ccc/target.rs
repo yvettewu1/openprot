@@ -6,7 +6,10 @@
 
 #[cfg(feature = "irq")]
 use ast10x0_i3c_hci::dispatch_i3c_hci_irq;
-use ast10x0_i3c_hci::{ccc::*, dynamic_address_payload, valid_i3c_address, DatAllocator, HciDeviceTable, HciI3cDevice, I3cHciConfig, I3cHciCore, I3cHciMaster};
+use ast10x0_i3c_hci::{
+    DatAllocator, HciDeviceTable, HciI3cDevice, I3cHciConfig, I3cHciCore, I3cHciMaster, ccc::*,
+    dynamic_address_payload, valid_i3c_address,
+};
 
 use cortex_m::peripheral::NVIC;
 
@@ -26,50 +29,82 @@ const BCR_IBI_CAPABLE: u8 = 1 << 1;
 const BCR_MAX_DATA_SPEED: u8 = 1;
 
 fn read_ccc<Y: FnMut(u32), const N: usize>(
-    master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevice,
-    name: &'static str, command: u8,
+    master: &mut I3cHciMaster<'_, Y>,
+    device: HciI3cDevice,
+    name: &'static str,
+    command: u8,
 ) -> Result<[u8; N], &'static str> {
     let mut data = [0u8; N];
-    let result = master.ccc_direct_read(device.dat_index, command, None, &mut data)
+    let result = master
+        .ccc_direct_read(device.dat_index, command, None, &mut data)
         .map_err(|error| {
             bare_metal::error!("CCC {} da=0x{:02x}: {:?}", name, device.dynamic_addr, error);
             "CCC read failed"
         })?;
-    bare_metal::info!("CCC {} da=0x{:02x} len={} response=0x{:08x} bytes={:02x?}",
-        name, device.dynamic_addr, result.rx_len, result.response.raw, data);
-    expect_true(result.rx_len == N && result.response.data_len == N, "CCC read length mismatch")?;
+    bare_metal::info!(
+        "CCC {} da=0x{:02x} len={} response=0x{:08x} bytes={:02x?}",
+        name,
+        device.dynamic_addr,
+        result.rx_len,
+        result.response.raw,
+        data
+    );
+    expect_true(
+        result.rx_len == N && result.response.data_len == N,
+        "CCC read length mismatch",
+    )?;
     Ok(data)
 }
 
 fn write_ccc<Y: FnMut(u32)>(
-    master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevice,
-    name: &'static str, command: u8, data: &[u8],
+    master: &mut I3cHciMaster<'_, Y>,
+    device: HciI3cDevice,
+    name: &'static str,
+    command: u8,
+    data: &[u8],
 ) -> Result<(), &'static str> {
-    master.ccc_direct_write(device.dat_index, command, data).map_err(|error| {
-        bare_metal::error!("CCC {} da=0x{:02x}: {:?}", name, device.dynamic_addr, error);
-        "CCC direct write failed"
-    })?;
-    bare_metal::info!("CCC {} direct BUS PASS da=0x{:02x}", name, device.dynamic_addr);
+    master
+        .ccc_direct_write(device.dat_index, command, data)
+        .map_err(|error| {
+            bare_metal::error!("CCC {} da=0x{:02x}: {:?}", name, device.dynamic_addr, error);
+            "CCC direct write failed"
+        })?;
+    bare_metal::info!(
+        "CCC {} direct BUS PASS da=0x{:02x}",
+        name,
+        device.dynamic_addr
+    );
     Ok(())
 }
 
 fn broadcast_ccc<Y: FnMut(u32)>(
-    master: &mut I3cHciMaster<'_, Y>, name: &'static str, command: u8, data: &[u8],
+    master: &mut I3cHciMaster<'_, Y>,
+    name: &'static str,
+    command: u8,
+    data: &[u8],
 ) -> Result<(), &'static str> {
     master.ccc_broadcast_write(command, data).map_err(|error| {
         bare_metal::error!("CCC {} broadcast: {:?}", name, error);
         "CCC broadcast failed"
     })?;
-    // Broadcast descriptors do not necessarily produce a response entry.
-    bare_metal::info!("CCC {} broadcast SENT; target effect needs readback", name);
+    // The driver now requests and checks the broadcast completion response.
+    bare_metal::info!(
+        "CCC {} broadcast BUS PASS; target effect needs readback",
+        name
+    );
     Ok(())
 }
 
-fn check_identity<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevice)
-    -> Result<(), &'static str> {
+fn check_identity<Y: FnMut(u32)>(
+    master: &mut I3cHciMaster<'_, Y>,
+    device: HciI3cDevice,
+) -> Result<(), &'static str> {
     let pid: [u8; 6] = read_ccc(master, device, "GETPID", I3C_CCC_GETPID)?;
     let expected = device.pid.to_be_bytes();
-    expect_true(pid.as_slice() == &expected[2..], "GETPID differs from ENTDAA PID")?;
+    expect_true(
+        pid.as_slice() == &expected[2..],
+        "GETPID differs from ENTDAA PID",
+    )?;
     let bcr: [u8; 1] = read_ccc(master, device, "GETBCR", I3C_CCC_GETBCR)?;
     expect_true(bcr[0] == device.bcr, "GETBCR differs from ENTDAA BCR")?;
     let dcr: [u8; 1] = read_ccc(master, device, "GETDCR", I3C_CCC_GETDCR)?;
@@ -78,8 +113,10 @@ fn check_identity<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3
     Ok(())
 }
 
-fn read_mrl<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevice)
-    -> Result<([u8; 3], usize), &'static str> {
+fn read_mrl<Y: FnMut(u32)>(
+    master: &mut I3cHciMaster<'_, Y>,
+    device: HciI3cDevice,
+) -> Result<([u8; 3], usize), &'static str> {
     if device.bcr & BCR_IBI_PAYLOAD != 0 {
         Ok((read_ccc(master, device, "GETMRL", I3C_CCC_GETMRL)?, 3))
     } else {
@@ -88,8 +125,10 @@ fn read_mrl<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevic
     }
 }
 
-fn test_lengths<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevice)
-    -> Result<(), &'static str> {
+fn test_lengths<Y: FnMut(u32)>(
+    master: &mut I3cHciMaster<'_, Y>,
+    device: HciI3cDevice,
+) -> Result<(), &'static str> {
     let mwl: [u8; 2] = read_ccc(master, device, "GETMWL", I3C_CCC_GETMWL)?;
     let (mrl, mrl_len) = read_mrl(master, device)?;
     // Exercise the setters without changing the working Linux target's limits.
@@ -97,32 +136,57 @@ fn test_lengths<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3cD
     write_ccc(master, device, "SETMWL", I3C_CCC_SETMWL_DIRECT, &mwl)?;
     let after: [u8; 2] = read_ccc(master, device, "GETMWL", I3C_CCC_GETMWL)?;
     expect_true(after == mwl, "SETMWL readback mismatch")?;
-    write_ccc(master, device, "SETMRL", I3C_CCC_SETMRL_DIRECT, &mrl[..mrl_len])?;
-    expect_true(read_mrl(master, device)?.0 == mrl, "SETMRL readback mismatch")?;
-    bare_metal::info!("CCC direct length round-trip PASS da=0x{:02x}", device.dynamic_addr);
+    write_ccc(
+        master,
+        device,
+        "SETMRL",
+        I3C_CCC_SETMRL_DIRECT,
+        &mrl[..mrl_len],
+    )?;
+    expect_true(
+        read_mrl(master, device)?.0 == mrl,
+        "SETMRL readback mismatch",
+    )?;
+    bare_metal::info!(
+        "CCC direct length round-trip PASS da=0x{:02x}",
+        device.dynamic_addr
+    );
     Ok(())
 }
 
-fn test_mxds<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevice)
-    -> Result<(), &'static str> {
+fn test_mxds<Y: FnMut(u32)>(
+    master: &mut I3cHciMaster<'_, Y>,
+    device: HciI3cDevice,
+) -> Result<(), &'static str> {
     if device.bcr & BCR_MAX_DATA_SPEED == 0 {
         bare_metal::info!("CCC GETMXDS SKIP: BCR does not advertise speed limits");
         return Ok(());
     }
     let mut data = [0u8; 5];
-    let result = master.getmxds(device.dat_index, &mut data).map_err(|error| {
-        bare_metal::error!("CCC GETMXDS: {:?}", error);
-        "GETMXDS failed"
-    })?;
-    expect_true((result.rx_len == 2 || result.rx_len == 5)
-        && result.response.data_len == result.rx_len, "GETMXDS invalid response length")?;
+    let result = master
+        .getmxds(device.dat_index, &mut data)
+        .map_err(|error| {
+            bare_metal::error!("CCC GETMXDS: {:?}", error);
+            "GETMXDS failed"
+        })?;
+    expect_true(
+        (result.rx_len == 2 || result.rx_len == 5) && result.response.data_len == result.rx_len,
+        "GETMXDS invalid response length",
+    )?;
     bare_metal::info!("CCC GETMXDS PASS bytes={:02x?}", &data[..result.rx_len]);
     Ok(())
 }
 
-fn test_activity<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevice)
-    -> Result<(), &'static str> {
-    for command in [I3C_CCC_ENTAS0, I3C_CCC_ENTAS1, I3C_CCC_ENTAS2, I3C_CCC_ENTAS3] {
+fn test_activity<Y: FnMut(u32)>(
+    master: &mut I3cHciMaster<'_, Y>,
+    device: HciI3cDevice,
+) -> Result<(), &'static str> {
+    for command in [
+        I3C_CCC_ENTAS0,
+        I3C_CCC_ENTAS1,
+        I3C_CCC_ENTAS2,
+        I3C_CCC_ENTAS3,
+    ] {
         bare_metal::info!("CCC ENTAS{} direct", command - I3C_CCC_ENTAS0);
         write_ccc(master, device, "ENTAS", command | 0x80, &[])?;
         // Return to AS0 before the next test; AS1-3 are activity hints.
@@ -132,18 +196,34 @@ fn test_activity<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3c
     Ok(())
 }
 
-fn test_new_address<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: HciI3cDevice,
-    spare: u8) -> Result<(), &'static str> {
+fn test_new_address<Y: FnMut(u32)>(
+    master: &mut I3cHciMaster<'_, Y>,
+    device: HciI3cDevice,
+    spare: u8,
+) -> Result<(), &'static str> {
     let payload = dynamic_address_payload(spare).map_err(|_| "invalid spare address")?;
     write_ccc(master, device, "SETNEWDA", I3C_CCC_SETNEWDA, &[payload])?;
     // DAT index is a descriptor slot; update its address before the next command.
-    master.attach_i3c_device(device.dat_index, spare).map_err(|_| "SETNEWDA DAT update failed")?;
-    let moved = HciI3cDevice { dynamic_addr: spare, ..device };
+    master
+        .attach_i3c_device(device.dat_index, spare)
+        .map_err(|_| "SETNEWDA DAT update failed")?;
+    let moved = HciI3cDevice {
+        dynamic_addr: spare,
+        ..device
+    };
     let verification = check_identity(master, moved);
     // Restore the original address even if the identity comparison failed.
-    let restore = dynamic_address_payload(device.dynamic_addr).map_err(|_| "invalid original address")?;
-    write_ccc(master, moved, "SETNEWDA restore", I3C_CCC_SETNEWDA, &[restore])?;
-    master.attach_i3c_device(device.dat_index, device.dynamic_addr)
+    let restore =
+        dynamic_address_payload(device.dynamic_addr).map_err(|_| "invalid original address")?;
+    write_ccc(
+        master,
+        moved,
+        "SETNEWDA restore",
+        I3C_CCC_SETNEWDA,
+        &[restore],
+    )?;
+    master
+        .attach_i3c_device(device.dat_index, device.dynamic_addr)
         .map_err(|_| "SETNEWDA DAT restore failed")?;
     verification?;
     check_identity(master, device)?;
@@ -151,14 +231,23 @@ fn test_new_address<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>, device: Hci
     Ok(())
 }
 
-fn discover<Y: FnMut(u32)>(master: &mut I3cHciMaster<'_, Y>,
-    table: &mut HciDeviceTable<MAX_I3C_DEVICES>, allocator: &mut DatAllocator)
-    -> Result<(), &'static str> {
+fn discover<Y: FnMut(u32)>(
+    master: &mut I3cHciMaster<'_, Y>,
+    table: &mut HciDeviceTable<MAX_I3C_DEVICES>,
+    allocator: &mut DatAllocator,
+) -> Result<(), &'static str> {
     let count = master.entdaa_all(table, allocator).map_err(|error| {
-        bare_metal::error!("CCC ENTDAA failed: {:?}; partial devices={}", error, table.len());
+        bare_metal::error!(
+            "CCC ENTDAA failed: {:?}; partial devices={}",
+            error,
+            table.len()
+        );
         "ENTDAA failed"
     })?;
-    expect_true(count >= EXPECTED_MIN_DEVICES, "too few I3C devices discovered")?;
+    expect_true(
+        count >= EXPECTED_MIN_DEVICES,
+        "too few I3C devices discovered",
+    )?;
     bare_metal::info!("CCC ENTDAA PASS devices={}", count);
     Ok(())
 }
@@ -173,6 +262,54 @@ use bare_metal::write_all as console_backend_write_all;
 
 fn expect_true(condition: bool, message: &'static str) -> Result<(), &'static str> {
     if condition { Ok(()) } else { Err(message) }
+}
+
+// Read-only diagnostic after a completed GETPID returns the wrong bytes.
+// Each prior response has been consumed before creating another master facade.
+// Rate selection chooses a descriptor mode; it does not program PHY counters.
+fn diagnose_identity_reads<Y: FnMut(u32)>(core: &I3cHciCore<Y>, device: HciI3cDevice) {
+    bare_metal::info!("CCC DIAG: descriptor rate sweep; actual SCL depends on PHY counters");
+    let expected_pid = device.pid.to_be_bytes();
+    for rate in [12_500_000u32, 8_000_000, 6_000_000, 4_000_000, 2_000_000] {
+        bare_metal::info!(
+            "CCC DIAG rate_setting={} expected PID={:02x?} BCR=0x{:02x} DCR=0x{:02x}",
+            rate,
+            &expected_pid[2..],
+            device.bcr,
+            device.dcr
+        );
+        let probe = I3cHciMaster::new(core.regs(), core.sections(), rate, |_us| {})
+            .with_timeout_us(DAA_TIMEOUT_US)
+            .with_trace(|args| bare_metal::log("PIO", args));
+        #[cfg(feature = "irq")]
+        let probe = probe.with_irq_events(I3C_BUS as usize);
+        let mut probe = probe;
+        // Stop on a transport/length error rather than sending more commands
+        // into a possibly halted controller. Data mismatches are logged below.
+        let Ok(pid) = read_ccc::<_, 6>(&mut probe, device, "GETPID diagnostic", I3C_CCC_GETPID)
+        else {
+            bare_metal::error!("CCC DIAG stopped: GETPID transfer/length error");
+            return;
+        };
+        let Ok(bcr) = read_ccc::<_, 1>(&mut probe, device, "GETBCR diagnostic", I3C_CCC_GETBCR)
+        else {
+            bare_metal::error!("CCC DIAG stopped: GETBCR transfer/length error");
+            return;
+        };
+        let Ok(dcr) = read_ccc::<_, 1>(&mut probe, device, "GETDCR diagnostic", I3C_CCC_GETDCR)
+        else {
+            bare_metal::error!("CCC DIAG stopped: GETDCR transfer/length error");
+            return;
+        };
+        bare_metal::info!(
+            "CCC DIAG rate_setting={} PID_match={} BCR_match={} DCR_match={}",
+            rate,
+            pid.as_slice() == &expected_pid[2..],
+            bcr[0] == device.bcr,
+            dcr[0] == device.dcr
+        );
+    }
+    bare_metal::info!("CCC DIAG complete; original suite failure is preserved");
 }
 
 fn run_ccc_test() -> Result<(), &'static str> {
@@ -233,12 +370,31 @@ fn run_ccc_test() -> Result<(), &'static str> {
     let mut master = master;
 
     // Reset addresses so the suite can be rerun without rebooting AST2700.
-    broadcast_ccc(&mut master, "RSTDAA", I3C_CCC_RSTDAA_BROADCAST, &[])?;
-    discover(&mut master, &mut table, &mut dat_allocator)?;
+    let _ = bare_metal::i3c_setup::show_registers(core.regs(), "before startup RSTDAA");
+    broadcast_ccc(&mut master, "RSTDAA", I3C_CCC_RSTDAA_BROADCAST, &[]).map_err(|error| {
+        let _ = bare_metal::i3c_setup::show_registers(core.regs(), "startup RSTDAA failure");
+        error
+    })?;
+    let _ = bare_metal::i3c_setup::show_registers(core.regs(), "after completed startup RSTDAA");
+    discover(&mut master, &mut table, &mut dat_allocator).map_err(|error| {
+        let _ = bare_metal::i3c_setup::show_registers(core.regs(), "startup ENTDAA failure");
+        error
+    })?;
     for device in table.iter() {
-        bare_metal::info!("CCC target DA=0x{:02x} PID=0x{:012x} BCR=0x{:02x} DCR=0x{:02x}",
-            device.dynamic_addr, device.pid, device.bcr, device.dcr);
-        check_identity(&mut master, device)?;
+        bare_metal::info!(
+            "CCC target DA=0x{:02x} PID=0x{:012x} BCR=0x{:02x} DCR=0x{:02x}",
+            device.dynamic_addr,
+            device.pid,
+            device.bcr,
+            device.dcr
+        );
+        if let Err(error) = check_identity(&mut master, device) {
+            if error == "GETPID differs from ENTDAA PID" {
+                diagnose_identity_reads(&core, device);
+            }
+            let _ = bare_metal::i3c_setup::show_registers(core.regs(), "CCC identity failure");
+            return Err(error);
+        }
         let _: [u8; 2] = read_ccc(&mut master, device, "GETSTATUS", I3C_CCC_GETSTATUS)?;
         test_lengths(&mut master, device)?;
         test_mxds(&mut master, device)?;
@@ -246,15 +402,42 @@ fn run_ccc_test() -> Result<(), &'static str> {
         if device.bcr & BCR_IBI_CAPABLE != 0 {
             // Keep the host DAT rejecting unsolicited IBIs: this tests CCC
             // delivery only. No target userspace transmitter should be running.
-            write_ccc(&mut master, device, "ENEC(SIR)", I3C_CCC_ENEC_DIRECT, &[I3C_CCC_EVENT_SIR])?;
-            write_ccc(&mut master, device, "DISEC(SIR)", I3C_CCC_DISEC_DIRECT, &[I3C_CCC_EVENT_SIR])?;
+            write_ccc(
+                &mut master,
+                device,
+                "ENEC(SIR)",
+                I3C_CCC_ENEC_DIRECT,
+                &[I3C_CCC_EVENT_SIR],
+            )?;
+            write_ccc(
+                &mut master,
+                device,
+                "DISEC(SIR)",
+                I3C_CCC_DISEC_DIRECT,
+                &[I3C_CCC_EVENT_SIR],
+            )?;
         } else {
             bare_metal::info!("CCC direct ENEC/DISEC(SIR) SKIP: target has no IBI capability");
         }
     }
-    broadcast_ccc(&mut master, "ENEC(SIR)", I3C_CCC_ENEC_BROADCAST, &[I3C_CCC_EVENT_SIR])?;
-    broadcast_ccc(&mut master, "DISEC(SIR)", I3C_CCC_DISEC_BROADCAST, &[I3C_CCC_EVENT_SIR])?;
-    for command in [I3C_CCC_ENTAS0, I3C_CCC_ENTAS1, I3C_CCC_ENTAS2, I3C_CCC_ENTAS3] {
+    broadcast_ccc(
+        &mut master,
+        "ENEC(SIR)",
+        I3C_CCC_ENEC_BROADCAST,
+        &[I3C_CCC_EVENT_SIR],
+    )?;
+    broadcast_ccc(
+        &mut master,
+        "DISEC(SIR)",
+        I3C_CCC_DISEC_BROADCAST,
+        &[I3C_CCC_EVENT_SIR],
+    )?;
+    for command in [
+        I3C_CCC_ENTAS0,
+        I3C_CCC_ENTAS1,
+        I3C_CCC_ENTAS2,
+        I3C_CCC_ENTAS3,
+    ] {
         bare_metal::info!("CCC ENTAS{} broadcast", command - I3C_CCC_ENTAS0);
         broadcast_ccc(&mut master, "ENTAS", command, &[])?;
         broadcast_ccc(&mut master, "ENTAS0 restore", I3C_CCC_ENTAS0, &[])?;
@@ -269,14 +452,25 @@ fn run_ccc_test() -> Result<(), &'static str> {
         broadcast_ccc(&mut master, "SETMWL", I3C_CCC_SETMWL_BROADCAST, &mwl)?;
         let after: [u8; 2] = read_ccc(&mut master, device, "GETMWL", I3C_CCC_GETMWL)?;
         expect_true(after == mwl, "broadcast SETMWL readback mismatch")?;
-        broadcast_ccc(&mut master, "SETMRL", I3C_CCC_SETMRL_BROADCAST, &mrl[..mrl_len])?;
-        expect_true(read_mrl(&mut master, device)?.0 == mrl, "broadcast SETMRL readback mismatch")?;
+        broadcast_ccc(
+            &mut master,
+            "SETMRL",
+            I3C_CCC_SETMRL_BROADCAST,
+            &mrl[..mrl_len],
+        )?;
+        expect_true(
+            read_mrl(&mut master, device)?.0 == mrl,
+            "broadcast SETMRL readback mismatch",
+        )?;
         bare_metal::info!("CCC broadcast length round-trip PASS");
     } else {
-        bare_metal::info!("CCC broadcast SETMWL/SETMRL SKIP: preserve distinct multi-target limits");
+        bare_metal::info!(
+            "CCC broadcast SETMWL/SETMRL SKIP: preserve distinct multi-target limits"
+        );
     }
-    let spare = (0x09u8..0x78).find(|address| valid_i3c_address(*address)
-        && table.by_dynamic_addr(*address).is_none()).ok_or("no spare address for SETNEWDA")?;
+    let spare = (0x09u8..0x78)
+        .find(|address| valid_i3c_address(*address) && table.by_dynamic_addr(*address).is_none())
+        .ok_or("no spare address for SETNEWDA")?;
     for device in table.iter() {
         test_new_address(&mut master, device, spare)?;
     }
@@ -286,22 +480,40 @@ fn run_ccc_test() -> Result<(), &'static str> {
     let mut fresh_allocator = DatAllocator::new(dat_entries, ADDRESS_INDEXED_DAT);
     broadcast_ccc(&mut master, "RSTDAA final", I3C_CCC_RSTDAA_BROADCAST, &[])?;
     discover(&mut master, &mut rediscovered, &mut fresh_allocator)?;
-    expect_true(rediscovered.len() == table.len(), "rediscovery device count mismatch")?;
+    expect_true(
+        rediscovered.len() == table.len(),
+        "rediscovery device count mismatch",
+    )?;
     for original in table.iter() {
-        let device = rediscovered.by_pid(original.pid).ok_or("PID missing after RSTDAA")?;
-        expect_true(device.bcr == original.bcr && device.dcr == original.dcr,
-            "identity changed after RSTDAA")?;
+        let device = rediscovered
+            .by_pid(original.pid)
+            .ok_or("PID missing after RSTDAA")?;
+        expect_true(
+            device.bcr == original.bcr && device.dcr == original.dcr,
+            "identity changed after RSTDAA",
+        )?;
         check_identity(&mut master, device)?;
     }
     bare_metal::info!("CCC RSTDAA/ENTDAA rediscovery PASS");
 
     if TEST_LEGACY_DIRECT_RSTDAA {
-        expect_true(rediscovered.len() == 1, "direct RSTDAA test requires one target")?;
+        expect_true(
+            rediscovered.len() == 1,
+            "direct RSTDAA test requires one target",
+        )?;
         let device = rediscovered.iter().next().ok_or("missing target")?;
-        write_ccc(&mut master, device, "legacy RSTDAA", I3C_CCC_RSTDAA_DIRECT, &[])?;
+        write_ccc(
+            &mut master,
+            device,
+            "legacy RSTDAA",
+            I3C_CCC_RSTDAA_DIRECT,
+            &[],
+        )?;
         fresh_allocator = DatAllocator::new(dat_entries, ADDRESS_INDEXED_DAT);
         discover(&mut master, &mut rediscovered, &mut fresh_allocator)?;
-        let after = rediscovered.by_pid(device.pid).ok_or("PID missing after direct RSTDAA")?;
+        let after = rediscovered
+            .by_pid(device.pid)
+            .ok_or("PID missing after direct RSTDAA")?;
         check_identity(&mut master, after)?;
     } else {
         bare_metal::info!("CCC direct RSTDAA SKIP: legacy command disabled by configuration");
@@ -309,14 +521,24 @@ fn run_ccc_test() -> Result<(), &'static str> {
     if let Some(static_addr) = TARGET_STATIC_ADDR {
         expect_true(rediscovered.len() == 1, "SETDASA test requires one target")?;
         let device = rediscovered.iter().next().ok_or("missing target")?;
-        expect_true(valid_i3c_address(static_addr) && static_addr != 0x08,
-            "invalid or conflicting static address")?;
-        broadcast_ccc(&mut master, "RSTDAA before SETDASA", I3C_CCC_RSTDAA_BROADCAST, &[])?;
-        master.attach_static_i3c_device(device.dat_index, static_addr)
+        expect_true(
+            valid_i3c_address(static_addr) && static_addr != 0x08,
+            "invalid or conflicting static address",
+        )?;
+        broadcast_ccc(
+            &mut master,
+            "RSTDAA before SETDASA",
+            I3C_CCC_RSTDAA_BROADCAST,
+            &[],
+        )?;
+        master
+            .attach_static_i3c_device(device.dat_index, static_addr)
             .map_err(|_| "SETDASA static DAT setup failed")?;
-        let payload = dynamic_address_payload(device.dynamic_addr).map_err(|_| "invalid dynamic address")?;
+        let payload =
+            dynamic_address_payload(device.dynamic_addr).map_err(|_| "invalid dynamic address")?;
         write_ccc(&mut master, device, "SETDASA", I3C_CCC_SETDASA, &[payload])?;
-        master.attach_i3c_device(device.dat_index, device.dynamic_addr)
+        master
+            .attach_i3c_device(device.dat_index, device.dynamic_addr)
             .map_err(|_| "SETDASA dynamic DAT update failed")?;
         check_identity(&mut master, device)?;
         bare_metal::info!("CCC SETDASA PASS");

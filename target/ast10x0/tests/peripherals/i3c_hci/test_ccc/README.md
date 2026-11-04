@@ -26,7 +26,7 @@ command or format in every MIPI I3C revision.
 | Broadcast SETMWL, SETMRL | Same readback with one target; skip with multiple targets to preserve distinct limits |
 | GETMXDS | When BCR advertises speed limitations; accept legacy 2- or 5-byte response |
 | Direct ENEC/DISEC | SIR event bit for IBI-capable targets; bus completion only, not functional IBI delivery |
-| Broadcast ENEC/DISEC | SIR event bit; command submission only, not functional IBI delivery |
+| Broadcast ENEC/DISEC | SIR event bit; checked controller completion, not functional IBI delivery |
 | ENTAS0-3 broadcast and direct | Send each activity hint, return to AS0, check GETSTATUS responsiveness; not low-power/timing verification |
 | SETNEWDA | Choose an unused dynamic address, update DAT, check identity, restore address and check identity again |
 | Direct RSTDAA | Opt-in legacy command via `TEST_LEGACY_DIRECT_RSTDAA`; requires one target, then ENTDAA and identity verification |
@@ -44,7 +44,8 @@ The suite stops at the first transfer or data mismatch and prints
 wrong PID now fails. `TEST_RESULT:PASS` means enabled checks passed; review
 explicit SKIP messages for incomplete coverage.
 
-Broadcast logs say SENT because broadcast descriptors may not return a response.
+Broadcasts request ROC and wait for a checked response before logging BUS PASS.
+Startup logs include register snapshots around RSTDAA and on discovery failure.
 Address and length operations use readback where available. The controller
 continues rejecting unsolicited IBIs through DAT while event CCCs are tested.
 Tests do not cover MR/HJ event behavior, modern GETSTATUS/GETMXDS defining-byte
@@ -53,3 +54,12 @@ The timeout callback remains uncalibrated. If a transport failure interrupts
 address restoration, rerun from reset; do not assume cleanup completed.
 
 No build or board execution was performed when introducing this suite.
+
+## GETPID mismatch diagnostics
+
+If a completed GETPID has the correct length but a different PID from ENTDAA,
+the suite reads PID/BCR/DCR at descriptor rate settings 12.5, 8, 6, 4 and 2 MHz.
+The sweep logs bytes and identity comparisons and preserves the original FAIL.
+It stops on a transfer/length error. These settings select hardware SDR modes;
+they do not configure PHY counters or establish measured SCL frequency.
+No AST2700 application or kernel change is needed for these hardware CCC reads.

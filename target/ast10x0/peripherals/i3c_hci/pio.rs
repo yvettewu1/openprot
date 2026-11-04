@@ -345,10 +345,96 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         self.target_queue_command(command, data)
     }
 
-    pub fn next_ibi_status(&mut self, payload: &mut [u8]) -> Result<IbiStatus> {
-        self.wait_status(STAT_IBI_STATUS_THLD)?;
+    /// Receive one complete IBI, returning the final descriptor and total bytes.
+    /// A descriptor's data_len describes only its segment, not the whole IBI.
+    /// Oversized/error transactions are drained through LAST_STATUS before failing.
+    pub fn next_ibi(&mut self, payload: &mut [u8]) -> Result<(IbiStatus, usize)> {
+        let mut total = 0usize;
+        let mut source = None;
+        let mut failure = None;
+        // Bound even a stream of zero-length, non-final descriptors.
+        let mut segments_left = self.timeout_us.max(1);
+        loop {
+            if segments_left == 0 {
+                return Err(I3cHciError::Timeout);
+            }
+            segments_left -= 1;
+            let status = self.read_ibi_status()?;
+            let identity = (status.target_addr, status.read);
+            if source.is_some_and(|previous| previous != identity) {
+                failure = Some(I3cHciError::TransferStatus(status.raw));
+            }
+            source = Some(identity);
+            let offset = core::cmp::min(total, payload.len());
+            let read = self.read_ibi_data(&mut payload[offset..], status.data_len);
+            if let Err(error) = read {
+                if error != I3cHciError::NoSpace {
+                    return Err(error);
+                }
+                failure.get_or_insert(error);
+            }
+            total = total.saturating_add(status.data_len);
+            if status.error {
+                failure = Some(I3cHciError::TransferStatus(status.raw));
+            }
+            // Hot-join and controller-role requests have no target-read payload
+            // sequence. Match Zephyr's separate handling of these notifications.
+            if status.last || !status.read {
+                return match failure {
+                    Some(error) => {
+                        if let Some(trace) = self.trace {
+                            // Log only after the failed transaction is drained;
+                            // successful pending-read notifications stay prompt.
+                            let shown = core::cmp::min(total, core::cmp::min(payload.len(), 8));
+                            trace(format_args!(
+                                "IBI failed: final=0x{:08x} addr=0x{:02x} last={} error={} segment_len={} total={} first={:02x?}",
+                                status.raw,
+                                status.target_addr,
+                                status.last,
+                                status.error,
+                                status.data_len,
+                                total,
+                                &payload[..shown]
+                            ));
+                        }
+                        Err(error)
+                    }
+                    None => Ok((status, total)),
+                };
+            }
+        }
+    }
 
-        let status = IbiStatus::parse(self.regs.pio_ibi_port());
+    fn read_ibi_status(&mut self) -> Result<IbiStatus> {
+        self.wait_status(STAT_IBI_STATUS_THLD)?;
+        let raw = self.regs.pio_ibi_port();
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "IBI raw status = 0x{:08x}", raw
+            ));
+        }
+
+        let status = IbiStatus::parse(raw);
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+               "IBI len={} addr=0x{:02x} last={} error={}", 
+               status.data_len, 
+               status.target_addr, 
+               status.last, 
+               status.error
+            ));
+        }
+        // Do not reuse a latched readiness notification after popping its entry.
+        if let Some(events) = self.irq_events {
+            self.pending_irq_status |= events.take_io_status();
+        }
+        self.pending_irq_status &= !STAT_IBI_STATUS_THLD;
+        Ok(status)
+    }
+
+    /// Low-level single-segment API. Use next_ibi for completed notifications.
+    pub fn next_ibi_status(&mut self, payload: &mut [u8]) -> Result<IbiStatus> {
+        let status = self.read_ibi_status()?;
         let read = self.read_ibi_data(payload, status.data_len);
 
         if status.error {
@@ -413,6 +499,15 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             let word = self.regs.pio_rx_data_port();
             let chunk = core::cmp::min(4, wanted - offset);
             bytes_from_word(word, &mut rx[offset..offset + chunk]);
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "RX offset={} bytes={} raw=0x{:08x} PIO_STATUS=0x{:08x}",
+                    offset,
+                    chunk,
+                    word,
+                    self.regs.pio_intr_status()
+                ));
+            }
             offset += chunk;
         }
         Ok(offset)
@@ -423,11 +518,41 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
 
         let mut copied = 0usize;
         let mut remaining = count;
-
+        let mut iteration = 0x1000000u32;
+        if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "read_ibi_data()...."
+                ));
+            }
+        // ASPEED G7 STATUS_THLD tracks status entries, not payload words.
+        // Once a descriptor is popped, drain exactly its advertised length,
+        // including the padded final word, as in Zephyr's ASPEED PIO path.
         while remaining != 0 {
-            self.wait_status(STAT_IBI_STATUS_THLD)?;
-
+            self.check_errors()?;
+            //let intr = self.regs.pio_intr_status();
+            while self.regs.pio_intr_status() & STAT_IBI_STATUS_THLD == 0 {
+                 if iteration == 0 {
+                    break;
+                }
+                iteration -= 1;
+                core::hint::spin_loop();
+            }
+           
             let word = self.regs.pio_ibi_port();
+            if self.regs.pio_intr_status() & STAT_IBI_STATUS_THLD == 0 {
+                if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "status doesn't change , timeout........"
+                ));
+            }
+            }
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "IBI remaining={}, IBI FIFO raw word={:#010x}", 
+                    remaining, word
+                ));
+            }
+
             let chunk = core::cmp::min(4, remaining);
 
             if copied < copy_len {
@@ -438,6 +563,8 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
 
             remaining -= chunk;
         }
+
+        self.check_errors()?;
 
         if count > buf.len() {
             return Err(I3cHciError::NoSpace);

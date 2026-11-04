@@ -375,10 +375,19 @@ impl I3cHciRegisters {
         self.regs().i3ccontrol004().read().bits()
     }
     #[inline]
+    pub fn aspeed_ibi_terminate_control(&self) -> u32 {
+        self.regs().i3ccontrol008().read().bits()
+    }
+    #[inline]
     pub fn aspeed_ibi_terminate(&self, max_len: u16) {
-        self.regs().i3ccontrol008().write(|w| unsafe {
-            w.bits(constants::ASPEED_I3C_IBI_TERMINATE_EN | u32::from(max_len))
-        });
+        // This limit is shared by all targets. Match ASPEED Linux/Zephyr:
+        // enabling another subscriber must not shorten an existing limit.
+        let previous =
+            self.aspeed_ibi_terminate_control() & constants::ASPEED_I3C_IBI_TERMINATE_LEN_MASK;
+        let max_len = core::cmp::max(previous, u32::from(max_len));
+        self.regs()
+            .i3ccontrol008()
+            .write(|w| unsafe { w.bits(constants::ASPEED_I3C_IBI_TERMINATE_EN | max_len) });
     }
     #[inline]
     pub fn aspeed_set_slave_char_ctrl(&self, bcr: u8, dcr: u8, static_addr: Option<u8>) {

@@ -163,8 +163,13 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
                 constants::MASTER_DYNAMIC_ADDR_VALID
                     | (u32::from(address) << constants::MASTER_DYNAMIC_ADDR_SHIFT),
             );
-            self.regs
-                .set_hc_control(constants::HC_CONTROL_HOT_JOIN_CTRL);
+            // Normal MIPI I3C transfers include the broadcast-address
+            // preamble. Zephyr and Linux enable IBA for a primary controller;
+            // leaving the reset default is appropriate only for other contexts
+            // such as JESD403, which this initialization path does not select.
+            self.regs.set_hc_control(
+                constants::HC_CONTROL_HOT_JOIN_CTRL | constants::HC_CONTROL_IBA_INCLUDE,
+            );
         }
         self.configure_polling_status();
         self.enable_bus()?;
@@ -177,7 +182,8 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.regs.write_pio_intr_signal_enable(0);
         if self.selected_io == Some(IoMode::Pio) {
             // ASPEED Zephyr hci_pio_init: half-FIFO data thresholds,
-            // one command/response, bounded IBI data threshold, no start gate.
+            // one command/response, no start gate. G7 needs both IBI
+            // thresholds at one so short MDB notifications become visible.
             let size = self.regs.pio_queue_size();
             let mut rx = (size >> 16) & 0xff;
             let mut tx = (size >> 24) & 0xff;
@@ -187,9 +193,8 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
             }
             self.regs
                 .write_pio_data_buffer_thld_ctrl(((rx & 7) << 8) | (tx & 7));
-            let ibi = (((size >> 8) & 0xff) / 2).clamp(1, 63);
             self.regs
-                .write_pio_queue_thld_ctrl((1 << 24) | (ibi << 16) | 0x0101);
+                .write_pio_queue_thld_ctrl((1 << 24) | (1 << 16) | 0x0101);
             self.regs.write_pio_intr_status(u32::MAX);
             self.regs.write_pio_intr_status_enable(u32::MAX);
         }

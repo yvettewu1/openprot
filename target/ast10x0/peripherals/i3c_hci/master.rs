@@ -10,7 +10,8 @@ use super::ccc::{
     I3C_CCC_SETNEWDA,
 };
 use super::cmd::{
-    HciCommand, HciCommandV1, HciCommandV2, i2c_mode, i2c_v2_rate, i3c_sdr_mode, i3c_sdr_v2_rate,
+    HciCommand, HciCommandKind, HciCommandV1, HciCommandV2, i2c_mode, i2c_v2_rate, i3c_sdr_mode,
+    i3c_sdr_v2_rate,
 };
 use super::core::{CommandDescriptor, HciSections};
 use super::daa::{
@@ -631,24 +632,26 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
 
     pub fn ccc_broadcast_write(&mut self, ccc: u8, data: &[u8]) -> Result<()> {
         let tid = self.next_tid();
-        let command = self.ccc_command(0, tid, false, ccc, data, None)?.with_toc();
-        let mut rx = [];
-        if command.expects_response() {
-            self.pio
-                .submit(PioTransfer {
-                    command,
-                    tx: data,
-                    rx: &mut rx,
-                })
-                .map(|_| ())
+        // Match Zephyr do_ccc: broadcast CCCs also request a completion
+        // response. Returning after enqueue alone hides reset/CCC failures.
+        let command = self
+            .ccc_command(0, tid, false, ccc, data, None)?
+            .with_roc()
+            .with_toc();
+        // Immediate payload is already in the descriptor, not the TX FIFO.
+        let tx = if command.kind() == HciCommandKind::Immediate {
+            &[][..]
         } else {
-            let tx = if data.len() <= 4 { &[] } else { data };
-            self.pio.submit_no_response(PioTransfer {
+            data
+        };
+        let mut rx = [];
+        self.pio
+            .submit(PioTransfer {
                 command,
                 tx,
                 rx: &mut rx,
             })
-        }
+            .map(|_| ())
     }
 
     pub fn rstdaa_broadcast(&mut self) -> Result<()> {
@@ -783,6 +786,22 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         self.ccc_direct_read(device.dat_index, ccc, defining_byte, out)
     }
 
+    /// Enable IBI with an explicit maximum notification payload length.
+    /// The ASPEED hardware limit is shared across targets and only grows.
+    /// A zero length enables notifications without payload bytes.
+    pub fn enable_ibi_with_max_payload(
+        &mut self,
+        device: HciI3cDevice,
+        max_len: u16,
+    ) -> Result<PioTransferResult> {
+        // Validate the DAT slot before changing the shared hardware limit.
+        self.read_dat_entry(device.dat_index)?;
+        if max_len != 0 {
+            self.regs.aspeed_ibi_terminate(max_len);
+        }
+        self.enable_ibi(device, max_len != 0)
+    }
+
     pub fn enable_ibi(&mut self, device: HciI3cDevice, payload: bool) -> Result<PioTransferResult> {
         let mut entry = self.read_dat_entry(device.dat_index)?;
         entry = entry.clear_flags(DAT_0_SIR_REJECT, 0);
@@ -870,12 +889,14 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         table: &HciDeviceTable<N>,
         payload: &mut [u8],
     ) -> Result<HciIbiEvent> {
-        let status = self.pio.next_ibi_status(payload)?;
-        let payload_len = status.data_len;
+        let (status, payload_len) = self.pio.next_ibi(payload)?;
 
-        let event = if status.target_addr == I3C_HOT_JOIN_ADDR {
+        let event = if status.target_addr == I3C_HOT_JOIN_ADDR && !status.read {
             HciIbiEvent::HotJoin { status }
-        } else if let Some(device) = table.by_dynamic_addr(status.target_addr) {
+        } else if let Some(device) = table
+            .by_dynamic_addr(status.target_addr)
+            .filter(|_| status.read)
+        {
             HciIbiEvent::TargetInterrupt {
                 device,
                 status,

@@ -133,7 +133,6 @@ pub fn show_registers(
     let sections =
         discover_sections_from_regs(parse_hci_version(version)?, dat, dct, rhs, pio, ext)?;
     show_sections("hardware", &sections);
-    show_table(regs, "DAT", sections.dat, 8);
     show_table(regs, "DCT", sections.dct, 16);
     Ok(())
 }
