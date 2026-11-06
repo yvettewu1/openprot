@@ -42,7 +42,7 @@ pub use dat::{
     DAT_0_SIR_REJECT, DAT_V1_ENTRY_SIZE,
 };
 pub use dct::{read_dct_entry_v1, DctEntryV1, DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS};
-pub use dma::{init_rhs, parse_rhs_control, rhs_info, DmaRing, DmaRingEntry, RhsInfo};
+pub use dma::{init_rhs, parse_rhs_control, rhs_info, DmaRing, DmaRingEntry, RhsInfo, Ring, DmaIbiEvent};
 pub use error::{I3cHciError, Result};
 pub use irq::{
     dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler, unregister_i3c_hci_irq_handler,
