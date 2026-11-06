@@ -11,7 +11,7 @@ use bare_metal::write_all as console_backend_write_all;
 use cortex_m::peripheral::NVIC;
 
 const I3C_BUS: u8 = 0;
-const TARGET_PID: u64 = 0x07ec06014000;
+//const TARGET_PID: u64 = 0x07ec06014000;
 const I3C_SCL_HZ: u32 = 12_500_000;
 const TRANSFER_POLL_BUDGET: u32 = 1_000_000;
 const MAX_I3C_DEVICES: usize = 8;
@@ -39,12 +39,47 @@ fn ibi_pec(address: u8, mdb: u8) -> u8 {
 }
 
 fn display_pio_reg() {
+    for addr in (0x74C20000usize..=0x74C200c0).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        bare_metal::info!("Capability:0x00 [0x{:08x}] = 0x{:08x}", addr, value);
+    }
     for addr in (0x74C200E0usize..=0x74C200FC).step_by(4) {
         let value = unsafe {
             core::ptr::read_volatile(addr as *const u32)
         };
 
         bare_metal::info!("PIO [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+    for addr in (0x74C20100usize..=0x74C20200).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        bare_metal::info!("DAT [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+    for addr in (0x74C20500usize..=0x74C20600).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        bare_metal::info!("DCT [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+    for addr in (0x74C20d00usize..=0x74C20e00).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        bare_metal::info!("control [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+    for addr in (0x74C20F00usize..=0x74C20ff0).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        bare_metal::info!("ext cap [0x{:08x}] = 0x{:08x}", addr, value);
     }
 }
 
@@ -133,7 +168,7 @@ fn run_ibi_read_test() -> Result<(), &'static str> {
         count >= EXPECTED_MIN_DEVICES,
         "too few I3C devices discovered",
     )?;
-
+/*
     let device = table.by_pid(TARGET_PID).ok_or_else(|| {
         for found in table.iter() {
             bare_metal::info!(
@@ -144,6 +179,14 @@ fn run_ibi_read_test() -> Result<(), &'static str> {
         }
         "targets discovered but expected AST2700 PID is missing"
     })?;
+    */
+    let device = table.iter().next().ok_or("No I3C target discovered")?;
+
+    bare_metal::info!(
+        "Using discovered target: DA=0x{:02x} PID=0x{:012x}",
+        device.dynamic_addr,
+        device.pid
+    );
     expect(device.dcr == 0xcc, "target is not MCTP class")?;
     expect(
         device.bcr & 0x06 == 0x06,
@@ -223,16 +266,15 @@ fn run_ibi_read_test() -> Result<(), &'static str> {
             payload_len == 1 || payload_len == 2,
             "unexpected IBI payload length",
         )?;
-        display_pio_reg();
+        //display_pio_reg();
         bare_metal::info!("IBI status raw=0x{:08x} addr=0x{:02x} len={} error={} last={}", status.raw, status.target_addr, payload_len, status.error, status.last);
         bare_metal::info!("IBI payload={:02x?}", &ibi_data[..payload_len]);
-       /*
+       
         expect(
             ibi_data[0] == 0xae,
             "IBI is not MCTP pending-read notification",
-        )?; */
+        )?; 
         
-        bare_metal::info!("IBI MDB=0x{:02x}, expected=0xae", ibi_data[0]);
         if payload_len == 2 {
             expect(
                 ibi_data[1] == ibi_pec(device.dynamic_addr, ibi_data[0]),

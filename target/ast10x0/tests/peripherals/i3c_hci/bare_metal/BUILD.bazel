@@ -9,7 +9,7 @@ exports_files(["runtime.ld", "defs.bzl"])
 
 rust_library(
     name = "runtime",
-    srcs = ["i3c_setup.rs", "runtime.rs"],
+    srcs = ["i3c_setup.rs", "runtime.rs" , "i3c_mctp_setup.rs"],
     crate_root = "runtime.rs",
     crate_name = "bare_metal",
     edition = "2024",

@@ -5,6 +5,7 @@
 #![no_std]
 
 pub mod i3c_setup;
+pub mod i3c_mctp_setup;
 
 use core::arch::global_asm;
 use core::fmt::{self, Write};

@@ -40,7 +40,7 @@ pub const INTR_HC_SEQ_CANCEL: u32 = 1 << 11;
 pub const INTR_HC_INTERNAL_ERR: u32 = 1 << 10;
 
 pub const ASPEED_I3C_CTRL_STOP_QUEUE_PT: u32 = 1 << 31;
-pub const ASPEED_I3C_CTRL_INIT: u32 = 1 << 4;
+pub const ASPEED_I3C_CTRL_INIT: u32 = 1 << 4 | 1 << 14;
 pub const ASPEED_I3C_CTRL_INIT_MODE_MASK: u32 = 0x3;
 
 pub const ASPEED_I3C_STS_SLV_DYNAMIC_ADDRESS_VALID: u32 = 1 << 23;

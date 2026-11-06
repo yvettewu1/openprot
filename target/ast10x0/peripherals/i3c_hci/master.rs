@@ -908,7 +908,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                 payload_len,
             }
         };
-
+        // HL:: todo: dont use this
         self.rearm_ibi_irq_events();
         Ok(event)
     }

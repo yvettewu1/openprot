@@ -518,7 +518,7 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
 
         let mut copied = 0usize;
         let mut remaining = count;
-        let mut iteration = 0x1000000u32;
+  
         if let Some(trace) = self.trace {
                 trace(format_args!(
                     "read_ibi_data()...."
@@ -529,23 +529,8 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         // including the padded final word, as in Zephyr's ASPEED PIO path.
         while remaining != 0 {
             self.check_errors()?;
-            //let intr = self.regs.pio_intr_status();
-            while self.regs.pio_intr_status() & STAT_IBI_STATUS_THLD == 0 {
-                 if iteration == 0 {
-                    break;
-                }
-                iteration -= 1;
-                core::hint::spin_loop();
-            }
-           
-            let word = self.regs.pio_ibi_port();
-            if self.regs.pio_intr_status() & STAT_IBI_STATUS_THLD == 0 {
-                if let Some(trace) = self.trace {
-                trace(format_args!(
-                    "status doesn't change , timeout........"
-                ));
-            }
-            }
+            
+            let word = self.regs.pio_ibi_port();            
             if let Some(trace) = self.trace {
                 trace(format_args!(
                     "IBI remaining={}, IBI FIFO raw word={:#010x}", 

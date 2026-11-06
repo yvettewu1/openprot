@@ -15,7 +15,7 @@ config_setting(
 )
 
 bare_metal_image(
-    name = "mctp_write",
+    name = "mctp_pio_write",
     crate_features = select({
         ":irq_enabled": ["irq"],
         "//conditions:default": [],

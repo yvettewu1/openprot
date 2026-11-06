@@ -6,9 +6,8 @@ load("@pigweed//pw_build:binary_tools.bzl", "pw_elf_to_bin")
 load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("//target/ast10x0:defs.bzl", "TARGET_COMPATIBLE_WITH")
 
-def bare_metal_image(name, crate_features = []):
+def bare_metal_image(name, crate_features = [], linker = "//target/ast10x0/tests/peripherals/i3c_hci/bare_metal:runtime.ld"):
     """Build a test with standalone startup; Pigweed only supplies objcopy tooling."""
-    linker = "//target/ast10x0/tests/peripherals/i3c_hci/bare_metal:runtime.ld"
     rust_binary(
         name = name + ".elf",
         srcs = ["target.rs"],
