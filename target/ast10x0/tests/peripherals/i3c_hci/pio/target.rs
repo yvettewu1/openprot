@@ -6,9 +6,9 @@
 
 use ast10x0_i3c_hci::{
     AddressSlots, DaaResponse, DatAllocator, DatEntryV1, DctEntryV1, HciCommand, HciCommandKind,
-    HciCommandV1, HciDeviceTable, HciI3cDevice, HciResponse, I3cHciError, PioTransfer,
+    HciCommandV1, HciDeviceTable, HciI3cDevice, HciResponse, HciTransfer, I3cHciError,
     bytes_from_word, classify_entdaa_response, i2c_mode, i3c_sdr_mode, odd_parity7,
-    prepare_entdaa_step, prepare_next_entdaa_step, valid_i3c_address, validate_pio_transfer,
+    prepare_entdaa_step, prepare_next_entdaa_step, valid_i3c_address, validate_transfer,
     word_from_bytes,
 };
 
@@ -270,39 +270,39 @@ fn run_pio_tests() -> Result<(), &'static str> {
     expect_true(!response_error.success(), "response error success")?;
 
     let mut rx = [0u8; 8];
-    let read_transfer = PioTransfer {
+    let read_transfer = HciTransfer {
         command: HciCommand::V1(read),
         tx: &[],
         rx: &mut rx,
     };
-    validate_pio_transfer(&read_transfer).map_err(|_| "valid read transfer rejected")?;
+    validate_transfer(&read_transfer).map_err(|_| "valid read transfer rejected")?;
 
     let tx = [1u8, 2, 3, 4, 5];
     let mut empty_rx = [];
-    let write_transfer = PioTransfer {
+    let write_transfer = HciTransfer {
         command: HciCommand::V1(regular_write),
         tx: &tx,
         rx: &mut empty_rx,
     };
-    validate_pio_transfer(&write_transfer).map_err(|_| "valid write transfer rejected")?;
+    validate_transfer(&write_transfer).map_err(|_| "valid write transfer rejected")?;
 
     let mut immediate_rx = [];
-    let immediate_transfer = PioTransfer {
+    let immediate_transfer = HciTransfer {
         command: HciCommand::V1(immediate),
         tx: &[],
         rx: &mut immediate_rx,
     };
-    validate_pio_transfer(&immediate_transfer).map_err(|_| "valid immediate transfer rejected")?;
+    validate_transfer(&immediate_transfer).map_err(|_| "valid immediate transfer rejected")?;
 
     let bad_tx = [0u8; 1];
     let mut bad_rx = [0u8; 8];
-    let bad_read_transfer = PioTransfer {
+    let bad_read_transfer = HciTransfer {
         command: HciCommand::V1(read),
         tx: &bad_tx,
         rx: &mut bad_rx,
     };
     expect_true(
-        validate_pio_transfer(&bad_read_transfer) == Err(I3cHciError::InvalidArgs),
+        validate_transfer(&bad_read_transfer) == Err(I3cHciError::InvalidArgs),
         "bad read transfer accepted",
     )?;
 

@@ -14,6 +14,24 @@ mod error;
 #[path = "../../../../peripherals/i3c_hci/pio.rs"]
 mod pio;
 
+// Minimal master interface for this standalone IBI FIFO model. The production
+// transfer definitions and validation live in master.rs; validation coverage
+// uses those definitions in pio/target.rs. Fail if this fixture is used to submit.
+mod master {
+    pub struct HciTransfer<'a> {
+        pub command: super::cmd::HciCommand,
+        pub tx: &'a [u8],
+        pub rx: &'a mut [u8],
+    }
+    pub struct HciTransferResult {
+        pub response: super::cmd::HciResponse,
+        pub rx_len: usize,
+    }
+    pub fn validate_transfer(_: &HciTransfer<'_>) -> super::error::Result<()> {
+        panic!("this IBI-only fixture does not support command submission")
+    }
+}
+
 mod irq {
     pub struct IsrEvents;
     impl IsrEvents {

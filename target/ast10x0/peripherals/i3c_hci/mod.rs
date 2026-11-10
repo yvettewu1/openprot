@@ -25,39 +25,41 @@ pub mod types;
 
 pub use ccc::*;
 pub use cmd::{
-    i2c_mode, i2c_v2_rate, i3c_sdr_mode, i3c_sdr_v2_rate, HciCommand, HciCommandKind, HciCommandV1,
-    HciCommandV2, HciResponse, HciTargetCommand, TID_TARGET_IBI, TID_TARGET_RD_DATA,
+    HciCommand, HciCommandKind, HciCommandV1, HciCommandV2, HciResponse, HciTargetCommand,
+    TID_TARGET_IBI, TID_TARGET_RD_DATA, i2c_mode, i2c_v2_rate, i3c_sdr_mode, i3c_sdr_v2_rate,
 };
 pub use constants::*;
 pub use core::{
-    discover_sections_from_regs, parse_hci_version, select_command_descriptor, CommandDescriptor,
-    HciSections, HciVersion, I3cHciConfig, I3cHciCore, IoMode, TableSection,
+    CommandDescriptor, HciSections, HciVersion, I3cHciConfig, I3cHciCore, IoMode, TableSection,
+    discover_sections_from_regs, parse_hci_version, select_command_descriptor,
 };
 pub use daa::{
-    classify_entdaa_response, prepare_entdaa_step, prepare_next_entdaa_step, valid_i3c_address,
-    AddressSlots, DaaResponse, DaaStep,
+    AddressSlots, DaaResponse, DaaStep, classify_entdaa_response, prepare_entdaa_step,
+    prepare_next_entdaa_step, valid_i3c_address,
 };
 pub use dat::{
-    odd_parity7, DatAllocator, DatEntryV1, DAT_0_I2C_DEVICE, DAT_0_IBI_PAYLOAD, DAT_0_MR_REJECT,
-    DAT_0_SIR_REJECT, DAT_V1_ENTRY_SIZE,
+    DAT_0_I2C_DEVICE, DAT_0_IBI_PAYLOAD, DAT_0_MR_REJECT, DAT_0_SIR_REJECT, DAT_V1_ENTRY_SIZE,
+    DatAllocator, DatEntryV1, odd_parity7,
 };
-pub use dct::{read_dct_entry_v1, DctEntryV1, DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS};
-pub use dma::{init_rhs, parse_rhs_control, rhs_info, DmaRing, DmaRingEntry, RhsInfo, Ring, DmaIbiEvent};
+pub use dct::{DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS, DctEntryV1, read_dct_entry_v1};
+pub use dma::{
+    DmaIbiEvent, DmaRing, DmaRingEntry, RhsInfo, Ring, init_rhs, parse_rhs_control, rhs_info,
+};
 pub use error::{I3cHciError, Result};
 pub use irq::{
-    dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler, unregister_i3c_hci_irq_handler,
-    IsrCtx, IsrEvents,
+    IsrCtx, IsrEvents, dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler,
+    unregister_i3c_hci_irq_handler,
 };
 pub use master::{
-    dynamic_address_payload, HciDeviceTable, HciDeviceTableIter, HciI3cDevice, HciIbiEvent,
-    I3cHciMaster, I3C_BROADCAST_ADDR, I3C_HOT_JOIN_ADDR,
+    HciDeviceTable, HciDeviceTableIter, HciI3cDevice, HciIbiEvent, HciTransfer, HciTransferResult,
+    I3C_BROADCAST_ADDR, I3C_HOT_JOIN_ADDR, I3cHciMaster, dynamic_address_payload,
+    validate_transfer,
 };
 pub use pio::{
-    bytes_from_word, validate_pio_transfer, word_from_bytes, I3cHciPio, IbiStatus, PioTransfer,
-    PioTransferPairResult, PioTransferResult, TargetResponse,
+    I3cHciPio, IbiStatus, PioTransferPairResult, TargetResponse, bytes_from_word, word_from_bytes,
 };
 pub use registers::I3cHciRegisters;
 pub use target::{
-    classify_target_ccc, HciTargetCcc, HciTargetConfig, HciTargetEvent, I3cHciTarget,
+    HciTargetCcc, HciTargetConfig, HciTargetEvent, I3cHciTarget, classify_target_ccc,
 };
 pub use types::{InitMode, TargetRole};

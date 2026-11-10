@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! MIPI I3C HCI DMA ring support including IBI reception.
-use core::arch::asm;
-use super::core::{HciSections, I3cHciCore};
-use super::{HciCommandV1, HciResponse};
 use super::constants::{HC_CONTROL_BUS_ENABLE, HC_CONTROL_PIO_MODE, HC_CONTROL_RESUME};
-use core::ptr::{addr_of_mut, read_volatile, write_volatile};
+use super::core::{HciSections, I3cHciCore};
 use super::error::{I3cHciError, Result};
+use super::master::{HciTransfer, HciTransferResult, validate_transfer};
 use super::registers::I3cHciRegisters;
+use super::{HciCommandV1, HciResponse};
+use core::arch::asm;
+use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 pub const RHS_CONTROL_MAX_HEADER_COUNT_SHIFT: u32 = 0;
 pub const RHS_CONTROL_MAX_HEADER_COUNT_MASK: u32 = 0x0f << RHS_CONTROL_MAX_HEADER_COUNT_SHIFT;
@@ -19,16 +20,6 @@ pub const RHS_CONTROL_HEADER_SIZE_SHIFT: u32 = 16;
 pub const RHS_CONTROL_HEADER_SIZE_MASK: u32 = 0xff << RHS_CONTROL_HEADER_SIZE_SHIFT;
 pub const RHS_CONTROL_PREAMBLE_SIZE_SHIFT: u32 = 24;
 pub const RHS_CONTROL_PREAMBLE_SIZE_MASK: u32 = 0xff << RHS_CONTROL_PREAMBLE_SIZE_SHIFT;
-
-pub const RHS_INTR_RING0: u32 = 1 << 0;
-pub const RHS_INTR_ALL_RINGS: u32 = 0xff;
-
-const RH_CHUNK_CONTROL: usize = 0x08;
-
-const RH_IBI_STATUS_RING_BASE_LO: usize = 0x40;
-const RH_IBI_STATUS_RING_BASE_HI: usize = 0x44;
-const RH_IBI_DATA_RING_BASE_LO: usize = 0x48;
-const RH_IBI_DATA_RING_BASE_HI: usize = 0x4c;
 
 const IBI_STATUS_RING_ENTRIES: usize = 32;
 const IBI_STATUS_MAX_STRIDE: usize = 256;
@@ -206,19 +197,6 @@ const MAX_STRIDE: usize = 256;
 // directly. Confirm this mapping for the actual AST1040 revision before running.
 const DMA_BUS_OFFSET: u32 = 0;
 
-const CR_SETUP: usize = 0x00;
-const IBI_SETUP: usize = 0x04;
-const INTR_STATUS: usize = 0x10;
-const INTR_STATUS_ENABLE: usize = 0x14;
-const INTR_SIGNAL_ENABLE: usize = 0x18;
-const RING_STATUS: usize = 0x20;
-const RING_CONTROL: usize = 0x24;
-const OP1: usize = 0x28;
-const OP2: usize = 0x2c;
-const CMD_BASE_LO: usize = 0x30;
-const CMD_BASE_HI: usize = 0x34;
-const RESP_BASE_LO: usize = 0x38;
-const RESP_BASE_HI: usize = 0x3c;
 const ENABLE_RUN: u32 = 3;
 const ABORT: u32 = 4;
 const RUNNING: u32 = 2;
@@ -238,13 +216,15 @@ struct DmaMemory {
 #[unsafe(link_section = ".dma_nc")]
 static mut DMA_MEMORY: DmaMemory = DmaMemory {
     commands: [0; ENTRIES * MAX_STRIDE / 4],
-    responses: [0; ENTRIES * MAX_STRIDE / 4], tx: [0; 64], rx: [0; 64],
+    responses: [0; ENTRIES * MAX_STRIDE / 4],
+    tx: [0; 64],
+    rx: [0; 64],
     ibi_status: [0; IBI_STATUS_RING_ENTRIES * IBI_STATUS_MAX_STRIDE / 4],
     ibi_data: [0; IBI_CHUNK_SIZE * IBI_CHUNK_POOL_SIZE],
 };
 
 pub struct Ring {
-    base: usize,
+    regs: I3cHciRegisters,
     memory: *mut DmaMemory,
     command_stride: usize,
     response_stride: usize,
@@ -262,55 +242,125 @@ pub struct DmaIbiEvent {
 }
 
 impl Ring {
-    pub fn with_trace(
-        mut self,
-        trace: fn(core::fmt::Arguments<'_>),
-    ) -> Self {
+    pub fn with_trace(mut self, trace: fn(core::fmt::Arguments<'_>)) -> Self {
         self.trace = Some(trace);
         self
+    }
+    fn dump_wdma_debug(&self, stage: &str) {
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "{}: WDMA_DBG={:08x} RDMA_DBG={:08x}",
+                stage,
+                self.regs.aspeed_wdma_debug_low(),
+                self.regs.aspeed_rdma_debug_low(),
+            ));
+
+            trace(format_args!(
+                "{}: OP1={:08x} OP2={:08x} INTR={:08x}",
+                stage,
+                self.regs.dma_ring_operation1(),
+                self.regs.dma_ring_operation2(),
+                self.regs.dma_ring_intr_status(),
+            ));
+
+            trace(format_args!(
+                "{}: CMD_BASE={:08x} RESP_BASE={:08x}",
+                stage,
+                self.regs.dma_ring_cmd_base_lo(),
+                self.regs.dma_ring_resp_base_lo(),
+            ));
+        }
     }
     fn dump_dma_state(&self, stage: &str) {
         if let Some(trace) = self.trace {
             trace(format_args!(
                 "{}: RING_STATUS={:08x} INTR={:08x} OP1={:08x} OP2={:08x}",
                 stage,
-                self.read(RING_STATUS),
-                self.read(INTR_STATUS),
-                self.read(OP1),
-                self.read(OP2),
+                self.regs.dma_ring_status(),
+                self.regs.dma_ring_intr_status(),
+                self.regs.dma_ring_operation1(),
+                self.regs.dma_ring_operation2(),
             ));
         }
     }
-    fn read(&self, offset: usize) -> u32 {
-        // SAFETY: init validates the discovered ring header inside HCI0 MMIO.
-        unsafe { read_volatile((self.base + offset) as *const u32) }
-    }
-    fn write(&self, offset: usize, value: u32) {
-        unsafe { write_volatile((self.base + offset) as *mut u32, value) }
+    pub fn dump_ibi_state(&self) {
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "DMA: RING_STATUS={:08x} RING_CONTROL={:08x} CR_SETUP={:08x} IBI_SETUP={:08x}",
+                self.regs.dma_ring_status(),
+                self.regs.dma_ring_control(),
+                self.regs.dma_ring_cr_setup(),
+                self.regs.dma_ring_ibi_setup(),
+            ));
+
+            trace(format_args!(
+                "DMA: INTR={:08x} INTR_EN={:08x} OP1={:08x} OP2={:08x} CHUNK={:08x}",
+                self.regs.dma_ring_intr_status(),
+                self.regs.dma_ring_intr_status_enable(),
+                self.regs.dma_ring_operation1(),
+                self.regs.dma_ring_operation2(),
+                self.regs.dma_ring_chunk_control(),
+            ));
+
+            trace(format_args!(
+                "DMA: IBI_STATUS_BASE={:08x}:{:08x} IBI_DATA_BASE={:08x}:{:08x}",
+                self.regs.dma_ring_ibi_status_base_hi(),
+                self.regs.dma_ring_ibi_status_base_lo(),
+                self.regs.dma_ring_ibi_data_base_hi(),
+                self.regs.dma_ring_ibi_data_base_lo(),
+            ));
+        }
     }
     fn snapshot(&self) {
         if let Some(trace) = self.trace {
             trace(format_args!(
                 "DMA ring status={:08x} intr={:08x} op1={:08x} op2={:08x}",
-                self.read(RING_STATUS),
-                self.read(INTR_STATUS),
-                self.read(OP1),
-                self.read(OP2)
+                self.regs.dma_ring_status(),
+                self.regs.dma_ring_intr_status(),
+                self.regs.dma_ring_operation1(),
+                self.regs.dma_ring_operation2()
             ));
         }
     }
-    fn wait(&self, offset: usize, mask: u32, expected: u32) -> DmaResult<()> {
+    fn wait(&self, read: fn(&I3cHciRegisters) -> u32, mask: u32, expected: u32) -> DmaResult<()> {
         for _ in 0..POLL_BUDGET {
-            if self.read(offset) & mask == expected { return Ok(()); }
+            if read(&self.regs) & mask == expected {
+                return Ok(());
+            }
             core::hint::spin_loop();
         }
         self.snapshot();
         Err("DMA ring control timeout")
     }
-
-    pub fn init(
-        core: &I3cHciCore<impl FnMut(u32)>,
-    ) -> DmaResult<Self> {
+    fn wait_aspeed_dma_idle(&self) -> DmaResult<()> {
+        for (name, read) in [
+            (
+                "WDMA",
+                I3cHciRegisters::aspeed_wdma_debug_low as fn(&I3cHciRegisters) -> u32,
+            ),
+            (
+                "RDMA",
+                I3cHciRegisters::aspeed_rdma_debug_low as fn(&I3cHciRegisters) -> u32,
+            ),
+        ] {
+            let mut idle = false;
+            for _ in 0..POLL_BUDGET {
+                if read(&self.regs) & 2 == 0 {
+                    idle = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if !idle {
+                if let Some(trace) = self.trace {
+                    trace(format_args!("ASPEED {} engine busy timeout", name));
+                }
+                return Err("ASPEED DMA engine busy timeout");
+            }
+        }
+        Ok(())
+    }
+    pub fn init(core: &I3cHciCore<impl FnMut(u32)>) -> DmaResult<Self> {
         Self::init_internal(core, None)
     }
 
@@ -322,50 +372,88 @@ impl Ring {
     }
 
     fn init_internal<F>(
-        core: &I3cHciCore<F>, 
+        core: &I3cHciCore<F>,
         trace: Option<fn(core::fmt::Arguments<'_>)>,
     ) -> DmaResult<Self>
     where
-    F: FnMut(u32),
+        F: FnMut(u32),
     {
         let regs = core.regs();
+        if regs.bus() != 0 {
+            return Err("DMA ring currently supports HCI0 only");
+        }
         let sections = core.sections();
-        let hci_base = ast1080_pac::I3c::ptr() as usize;
         let rhs = sections.ring_headers_offset as usize;
-        if rhs == 0 || rhs > 0xff8 { return Err("invalid RHS section"); }
+        if rhs != 0x800 {
+            return Err("RHS section does not match AST1080 PAC layout");
+        }
         // No transfers or IBIs may be pending at this PIO-to-DMA transition.
         regs.clear_hc_control(HC_CONTROL_BUS_ENABLE);
         init_rhs(regs, sections, 1).map_err(|_| "RHS setup failed")?;
-        let offset = unsafe { read_volatile((hci_base + rhs + 4) as *const u32) } as usize;
-        if offset == 0 || offset & 3 != 0 || offset > 0xfa0 {
-            return Err("invalid ring-0 register offset");
+        let offset = regs.rhs_ring0_offset() as usize;
+        if offset != 0x830 {
+            return Err("ring-0 offset does not match AST1080 PAC layout");
         }
-        let mut ring = Self { base: hci_base + offset, memory: addr_of_mut!(DMA_MEMORY),
-            command_stride: 0, response_stride: 0, next: 0,
-            ibi_stride: 0, ibi_deq: 0, ibi_chunk_ptr: 0, trace, };
-        if ring.read(RING_STATUS) & 3 != 0 { return Err("ring already active"); }
-        let setup = ring.read(CR_SETUP);
-        ring.command_stride = ((setup >> 24) & 0xff) as usize;
-        ring.response_stride = ((setup >> 16) & 0xff) as usize;
-        if ring.command_stride < 20 || ring.command_stride > MAX_STRIDE || ring.command_stride % 4 != 0
-            || ring.response_stride < 4 || ring.response_stride > MAX_STRIDE || ring.response_stride % 4 != 0 {
+        let mut ring = Self {
+            // SAFETY: this facade is used synchronously with the core/master
+            // under their existing unique, serialized controller ownership.
+            regs: unsafe { I3cHciRegisters::new(regs.bus()) }.ok_or("invalid DMA bus")?,
+            memory: addr_of_mut!(DMA_MEMORY),
+            command_stride: 0,
+            response_stride: 0,
+            next: 0,
+            ibi_stride: 0,
+            ibi_deq: 0,
+            ibi_chunk_ptr: 0,
+            trace,
+        };
+        if ring.regs.dma_ring_status() & 3 != 0 {
+            return Err("ring already active");
+        }
+        let (command_stride, response_stride) = ring.regs.dma_descriptor_sizes();
+        ring.command_stride = command_stride as usize;
+        ring.response_stride = response_stride as usize;
+        if ring.command_stride < 20
+            || ring.command_stride > MAX_STRIDE
+            || ring.command_stride % 4 != 0
+            || ring.response_stride < 4
+            || ring.response_stride > MAX_STRIDE
+            || ring.response_stride % 4 != 0
+        {
             return Err("unsupported DMA descriptor sizes");
         }
         // NOLOAD SRAM is not zeroed by the shared startup. Explicitly initialize
         // it before the DMA engine owns any descriptor or buffer.
-        unsafe { core::ptr::write_bytes(ring.memory, 0, 1); }
-        let cmd_addr = dma_address(unsafe { addr_of_mut!((*ring.memory).commands).cast() }, ENTRIES * MAX_STRIDE)?;
-        let resp_addr = dma_address(unsafe { addr_of_mut!((*ring.memory).responses).cast() }, ENTRIES * MAX_STRIDE)?;
-        ring.write(CMD_BASE_LO, cmd_addr);
-        ring.write(CMD_BASE_HI, 0);
-        ring.write(RESP_BASE_LO, resp_addr);
-        ring.write(RESP_BASE_HI, 0);
-        ring.write(CR_SETUP, ENTRIES as u32);
+        unsafe {
+            core::ptr::write_bytes(ring.memory, 0, 1);
+        }
+        // Poison all response storage, including padding, so a misplaced DMA
+        // write is distinguishable from untouched SRAM in the failure dump.
+        let responses = unsafe { addr_of_mut!((*ring.memory).responses).cast::<u32>() };
+        for i in 0..ENTRIES * MAX_STRIDE / 4 {
+            unsafe {
+                write_volatile(responses.add(i), 0xffff_ffff);
+            }
+        }
+        let cmd_addr = dma_address(
+            unsafe { addr_of_mut!((*ring.memory).commands).cast() },
+            ENTRIES * MAX_STRIDE,
+        )?;
+        let resp_addr = dma_address(
+            unsafe { addr_of_mut!((*ring.memory).responses).cast() },
+            ENTRIES * MAX_STRIDE,
+        )?;
+        ring.regs.write_dma_ring_cmd_base_lo(cmd_addr);
+        ring.regs.write_dma_ring_cmd_base_hi(0);
+        ring.regs.write_dma_ring_resp_base_lo(resp_addr);
+        ring.regs.write_dma_ring_resp_base_hi(0);
+        ring.regs.write_dma_ring_cr_setup(ENTRIES as u32);
         // Configure the independent IBI status and data DMA rings.
-        let ibi_hw_setup = ring.read(IBI_SETUP);
-        ring.ibi_stride = ((ibi_hw_setup >> 24) & 0xff) as usize;
-        if ring.ibi_stride < 4 || ring.ibi_stride > IBI_STATUS_MAX_STRIDE
-            || ring.ibi_stride % 4 != 0 {
+        ring.ibi_stride = ring.regs.dma_ibi_status_stride() as usize;
+        if ring.ibi_stride < 4
+            || ring.ibi_stride > IBI_STATUS_MAX_STRIDE
+            || ring.ibi_stride % 4 != 0
+        {
             return Err("invalid IBI status descriptor stride");
         }
         let status_addr = dma_address(
@@ -376,80 +464,216 @@ impl Ring {
             unsafe { addr_of_mut!((*ring.memory).ibi_data).cast() },
             IBI_CHUNK_SIZE * IBI_CHUNK_POOL_SIZE,
         )?;
-        ring.write(RH_IBI_STATUS_RING_BASE_LO, status_addr);
-        ring.write(RH_IBI_STATUS_RING_BASE_HI, 0);
-        ring.write(RH_IBI_DATA_RING_BASE_LO, data_addr);
-        ring.write(RH_IBI_DATA_RING_BASE_HI, 0);
+        ring.regs.write_dma_ring_ibi_status_base_lo(status_addr);
+        ring.regs.write_dma_ring_ibi_status_base_hi(0);
+        ring.regs.write_dma_ring_ibi_data_base_lo(data_addr);
+        ring.regs.write_dma_ring_ibi_data_base_hi(0);
         // ASPEED uses 4-byte chunks: log2(4) - 2 = 0.
-        ring.write(IBI_SETUP,
-            ((IBI_STATUS_RING_ENTRIES as u32) << 16) | IBI_CHUNK_POOL_SIZE as u32);
+        ring.regs.write_dma_ring_ibi_setup(
+            ((IBI_STATUS_RING_ENTRIES as u32) << 16) | IBI_CHUNK_POOL_SIZE as u32,
+        );
 
         if let Some(trace) = ring.trace {
             trace(format_args!(
                 "IBI DMA status={:08x} data={:08x} stride={}",
-                status_addr,
-                data_addr,
-                ring.ibi_stride
+                status_addr, data_addr, ring.ibi_stride
             ));
         }
-        ring.write(INTR_SIGNAL_ENABLE, 0);
-        ring.write(INTR_STATUS_ENABLE, u32::MAX);
-        ring.write(INTR_STATUS, u32::MAX);
-        ring.write(OP1, 0);
-        if ring.read(OP2) & 0xff != 0 { return Err("hardware dequeue pointer is not reset"); }
+        ring.regs.write_dma_ring_intr_signal_enable(0);
+        ring.regs.write_dma_ring_intr_status_enable(u32::MAX);
+        ring.regs.write_dma_ring_intr_status(u32::MAX);
+        ring.regs.write_dma_ring_operation1(0);
+        if ring.regs.dma_ring_operation2() & 0xff != 0 {
+            return Err("hardware dequeue pointer is not reset");
+        }
         unsafe {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
         regs.clear_hc_control(HC_CONTROL_PIO_MODE);
         regs.set_hc_control(HC_CONTROL_BUS_ENABLE | HC_CONTROL_RESUME);
-        ring.write(RING_CONTROL, ENABLE_RUN);
-        ring.wait(RING_STATUS, 3, 3)?;
+        ring.regs.write_dma_ring_control(ENABLE_RUN);
+        ring.wait(I3cHciRegisters::dma_ring_status, 3, 3)?;
         if let Some(trace) = ring.trace {
             trace(format_args!(
                 "DMA ring0 offset={:04x} cmd_stride={} resp_stride={} cmd={:08x} resp={:08x}",
-                offset,
-                ring.command_stride,
-                ring.response_stride,
-                cmd_addr,
-                resp_addr
+                offset, ring.command_stride, ring.response_stride, cmd_addr, resp_addr
             ));
         }
         Ok(ring)
     }
-    pub fn transfer(&mut self, command: HciCommandV1, tid: u8, read: bool,  xfer_data: &[u8] ) -> DmaResult<HciResponse> {
+    /// Submit without interpreting response status: DAA's final NACK is expected.
+    pub(crate) fn submit_raw(&mut self, transfer: HciTransfer<'_>) -> Result<HciTransferResult> {
+        validate_transfer(&transfer)?;
+        let super::cmd::HciCommand::V1(command) = transfer.command else {
+            return Err(I3cHciError::Unsupported);
+        };
+        if !command.expects_response() {
+            return Err(I3cHciError::Unsupported);
+        }
+        // DAA uses the response length as an assignment count, not RX bytes.
+        let read = command.read && command.kind != super::cmd::HciCommandKind::AddressAssignment;
+        let len = if read {
+            command.data_len
+        } else {
+            transfer.tx.len()
+        };
+        if len > 64 || (read && !transfer.tx.is_empty()) || (!read && !transfer.rx.is_empty()) {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        let placeholder = [0u8; 64];
+        let data = if read {
+            &placeholder[..len]
+        } else {
+            transfer.tx
+        };
+        let response = self
+            .transfer_raw(command, command.tid, read, data)
+            .map_err(|message| {
+                if let Some(trace) = self.trace {
+                    trace(format_args!("DMA submit failed: {}", message));
+                }
+                if message == "DMA transfer completion timeout"
+                    || message == "DMA response visibility timeout"
+                {
+                    I3cHciError::Timeout
+                } else {
+                    I3cHciError::TransferStatus(self.regs.dma_ring_intr_status())
+                }
+            })?;
+        let rx_len = if read && response.success() {
+            response.data_len
+        } else {
+            0
+        };
+        if rx_len > transfer.rx.len() {
+            return Err(I3cHciError::NoSpace);
+        }
+        for (i, byte) in transfer.rx[..rx_len].iter_mut().enumerate() {
+            *byte = unsafe { read_volatile(addr_of_mut!((*self.memory).rx).cast::<u8>().add(i)) };
+        }
+        Ok(HciTransferResult { response, rx_len })
+    }
+
+    pub fn transfer(
+        &mut self,
+        command: HciCommandV1,
+        tid: u8,
+        read: bool,
+        xfer_data: &[u8],
+    ) -> DmaResult<HciResponse> {
+        let result = self.transfer_raw(command, tid, read, xfer_data)?;
+        if !result.success() {
+            return Err("DMA response reports transfer failure");
+        }
+        if read {
+            if result.data_len != xfer_data.len() {
+                return Err("DMA read length mismatch");
+            }
+            for (i, expected) in xfer_data.iter().enumerate() {
+                let actual =
+                    unsafe { read_volatile(addr_of_mut!((*self.memory).rx).cast::<u8>().add(i)) };
+                if actual != *expected {
+                    return Err("DMA read payload mismatch");
+                }
+            }
+        } else if result.data_len != 0 {
+            return Err("DMA write reports untransferred bytes");
+        }
+        Ok(result)
+    }
+    fn prepare_dma_command_words(
+        command: HciCommandV1,
+        read: bool,
+        data: &[u8],
+        address: u32,
+    ) -> [u32; 5] {
+        const ATTR_MASK: u32 = 0x7;
+        const ATTR_IMMEDIATE: u32 = 0x1;
+        const CP: u32 = 1 << 15;
+        const RNW: u32 = 1 << 29;
+        const DBP: u32 = 1 << 25;
+        const DTT_SHIFT: u32 = 23;
+
+        let len = data.len();
+
+        // Convert only Regular CCC writes with up to 4 bytes.
+        // Exclude CCCs with a defining byte.
+        let immediate_ccc = !read
+            && len <= 4
+            && (command.words[0] & CP) != 0
+            && (command.words[0] & RNW) == 0
+            && (command.words[0] & DBP) == 0
+            && (command.words[0] & ATTR_MASK) == 0;
+
+        if immediate_ccc {
+            let mut immediate_data = 0u32;
+
+            for (i, &byte) in data.iter().enumerate() {
+                immediate_data |= (byte as u32) << (i * 8);
+            }
+
+            let word0 =
+                (command.words[0] & !ATTR_MASK) | ATTR_IMMEDIATE | ((len as u32) << DTT_SHIFT);
+
+            return [word0, immediate_data, 1 << 30, 0, 0];
+        }
+
+        // Existing Regular DMA descriptor.
+        [
+            command.words[0],
+            command.words[1],
+            (1 << 30) | len as u32,
+            if len == 0 { 0 } else { address },
+            0,
+        ]
+    }
+
+    fn transfer_raw(
+        &mut self,
+        command: HciCommandV1,
+        tid: u8,
+        read: bool,
+        xfer_data: &[u8],
+    ) -> DmaResult<HciResponse> {
         let len = xfer_data.len();
-        if len > 64 { return Err("DMA transfer exceeds 64-byte buffer"); }
+        if len > 64 {
+            return Err("DMA transfer exceeds 64-byte buffer");
+        }
         let slot = self.next;
-        if self.read(OP2) & 0xff != slot as u32 { return Err("DMA ring has outstanding work"); }
+        if self.regs.dma_ring_operation2() & 0xff != slot as u32 {
+            return Err("DMA ring has outstanding work");
+        }
         let buffer = unsafe {
-            if read { addr_of_mut!((*self.memory).rx).cast::<u8>() }
-            else { addr_of_mut!((*self.memory).tx).cast::<u8>() }
+            if read {
+                addr_of_mut!((*self.memory).rx).cast::<u8>()
+            } else {
+                addr_of_mut!((*self.memory).tx).cast::<u8>()
+            }
         };
         for i in 0..64 {
-            let value = if read { 0xa5 } else { xfer_data.get(i).copied().unwrap_or(0) };
-            unsafe { write_volatile(buffer.add(i), value); }
+            let value = if read {
+                0xa5
+            } else {
+                xfer_data.get(i).copied().unwrap_or(0)
+            };
+            unsafe {
+                write_volatile(buffer.add(i), value);
+            }
         }
-       let address = dma_address(buffer, 64)?;
+        let address = dma_address(buffer, 64)?;
 
         // Print the actual DMA buffer contents.
         if !read {
             if let Some(trace) = self.trace {
                 trace(format_args!(
                     "DMA TX SRAM address={:08x} len={}",
-                    address,
-                    len
+                    address, len
                 ));
 
                 for i in 0..len {
-                    let value = unsafe {
-                        read_volatile(buffer.add(i))
-                    };
+                    let value = unsafe { read_volatile(buffer.add(i)) };
 
-                    trace(format_args!(
-                        "DMA TX[{}]={:02x}",
-                        i,
-                        value
-                    ));
+                    trace(format_args!("DMA TX[{}]={:02x}", i, value));
                 }
             }
         }
@@ -484,102 +708,215 @@ impl Ring {
         // Word 2: Data Buffer Descriptor (length + IOC)
         // Word 3: DMA address low
         // Word 4: DMA address high
+        /*
         let words = [
             command.words[0],
             command.words[1],
             (1 << 30) | len as u32,
-            address,
+            if len == 0 { 0 } else { address },
             0,
-        ];
+        ]; */
+        self.dump_wdma_debug("BEFORE DMA SUBMIT");
+        let words = Self::prepare_dma_command_words(command, read, xfer_data, address);
 
         // Write the complete descriptor.
         for i in 0..self.command_stride / 4 {
             unsafe {
-                write_volatile(
-                    descriptor.add(i),
-                    words.get(i).copied().unwrap_or(0),
-                );
+                write_volatile(descriptor.add(i), words.get(i).copied().unwrap_or(0));
             }
         }
 
         // Read back the actual descriptor from SRAM.
         if let Some(trace) = self.trace {
             for i in 0..5 {
-                let value = unsafe {
-                    read_volatile(descriptor.add(i))
-                };
+                let value = unsafe { read_volatile(descriptor.add(i)) };
 
-                trace(format_args!(
-                    "DMA DESC[{}]={:08x}",
-                    i,
-                    value
-                ));
+                trace(format_args!("DMA DESC[{}]={:08x}", i, value));
             }
         }
 
-        unsafe { write_volatile(response, 0xffff_ffff); }
-        self.write(INTR_STATUS, DMA_ERRORS | (1 << 0));
+        unsafe {
+            write_volatile(response, 0xffff_ffff);
+        }
+        self.regs.write_dma_ring_intr_status(DMA_ERRORS | (1 << 11));
         unsafe {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
         self.dump_dma_state("BEFORE SUBMIT");
         let next = (slot + 1) % ENTRIES;
-        let op = self.read(OP1);
-        self.write(OP1, (op & !0xff) | next as u32);
+        let op = self.regs.dma_ring_operation1();
+        self.regs
+            .write_dma_ring_operation1((op & !0xff) | next as u32);
         self.dump_dma_state("AFTER SUBMIT");
-
-        let mut completed = false;
+        self.dump_wdma_debug("AFTER DMA SUBMIT");
+        const TRANSFER_COMPLETION: u32 = 1 << 11;
+        const TRANSFER_ERROR: u32 = 1 << 9;
+        const TRANSFER_ABORT: u32 = 1 << 5;
+        let mut completion_status = None;
         for _ in 0..POLL_BUDGET {
-            if self.read(INTR_STATUS) & DMA_ERRORS != 0 {
-                self.snapshot();
-                return Err("DMA transfer error or abort");
+            let status = self.regs.dma_ring_intr_status();
+            // Like Linux's IRQ path, require a completion/error event before
+            // consuming the response. A terminal DAA NACK is still returned
+            // as a raw response for the DAA classifier.
+            if status & (TRANSFER_COMPLETION | TRANSFER_ERROR) != 0
+                && self.regs.dma_ring_operation2() & 0xff == next as u32
+            {
+                completion_status = Some(status);
+                break;
             }
-            if self.read(OP2) & 0xff == next as u32 { completed = true; break; }
+            if status & TRANSFER_ABORT != 0 {
+                self.snapshot();
+                self.regs
+                    .write_dma_ring_intr_status(status & (TRANSFER_COMPLETION | DMA_ERRORS));
+                return Err("DMA transfer aborted");
+            }
             core::hint::spin_loop();
         }
-        if !completed { self.snapshot(); return Err("DMA transfer completion timeout"); }
+        let Some(intr) = completion_status else {
+            self.dump_wdma_debug("RESPONSE TIMEOUT");
+            self.snapshot();
+            return Err("DMA transfer completion timeout");
+        };
+
+        // Linux acknowledges RH_INTR_STATUS before hci_dma_xfer_done().
+        // This polling path handles command events only: preserve IBI_READY,
+        // IBI_RING_FULL and ring-operation events for their own consumers.
+        // Keep the snapshot for error handling after the W1C acknowledgement.
+        let ack = intr & (TRANSFER_COMPLETION | DMA_ERRORS);
+        self.regs.write_dma_ring_intr_status(ack);
         unsafe {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
-        let result = HciResponse::parse(unsafe { read_volatile(response) });
-        self.dump_dma_state("AFTER RESPONSE");
-        
-        self.write(OP1, (self.read(OP1) & !0xff00) | ((next as u32) << 8));
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "DMA completion ACK: captured={:08x} ack={:08x} remaining={:08x}",
+                intr,
+                ack,
+                self.regs.dma_ring_intr_status()
+            ));
+        }
+        self.dump_wdma_debug("AFTER COMPLETION ACK");
+
+        // Retain the existing ASPEED DMA-idle check before reading SRAM.
+        // Use the saved status: error bits have already been acknowledged.
+        if intr & TRANSFER_ERROR != 0 {
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "DMA TRANSFER_ERR detected: captured INTR={:08x}",
+                    intr
+                ));
+            }
+        }
+        self.wait_aspeed_dma_idle()?;
+
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        // CR_DEQ advancement alone does not prove that the response is
+        // visible in SRAM. Poll the poisoned slot with a bounded budget. This
+        // diagnoses delayed writeback without accepting an unwritten response.
+        // A barrier orders CPU accesses; it does not complete a DMA write.
+        let mut raw_response = 0xffff_ffff;
+        let mut response_polls = 0;
+        for poll in 0..POLL_BUDGET {
+            unsafe {
+                asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            raw_response = unsafe { read_volatile(response) };
+            if raw_response != 0xffff_ffff {
+                response_polls = poll;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if raw_response == 0xffff_ffff {
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "DMA response timeout: slot={} expected_tid={} address={:08x} stride={}",
+                    slot, tid, response as usize, self.response_stride
+                ));
+                trace(format_args!(
+                    "DMA RESP_BASE={:08x}:{:08x} CR_SETUP={:08x} WDMA_DBG={:08x} RDMA_DBG={:08x}",
+                    self.regs.dma_ring_resp_base_hi(),
+                    self.regs.dma_ring_resp_base_lo(),
+                    self.regs.dma_ring_cr_setup(),
+                    self.regs.aspeed_wdma_debug_low(),
+                    self.regs.aspeed_rdma_debug_low()
+                ));
+                // Include nearby padding to expose writes at an unexpected
+                // stride. Never consume a response from a different address.
+                let base = unsafe { addr_of_mut!((*self.memory).responses).cast::<u32>() };
+                for i in 0..16 {
+                    let ptr = unsafe { base.add(i) };
+                    trace(format_args!(
+                        "DMA RESP word[{}] addr={:08x} value={:08x}",
+                        i,
+                        ptr as usize,
+                        unsafe { read_volatile(ptr) }
+                    ));
+                }
+            }
+            self.snapshot();
+            return Err("DMA response visibility timeout");
+        }
+        if response_polls != 0 {
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "DMA response visible after {} extra polls",
+                    response_polls
+                ));
+            }
+        }
+
+        // Parse valid response.
+        let result = HciResponse::parse(raw_response);
+
+        // Update response dequeue pointer.
+        self.regs.write_dma_ring_operation1(
+            (self.regs.dma_ring_operation1() & !0xff00) | ((next as u32) << 8),
+        );
+
         self.next = next;
         if let Some(trace) = self.trace {
             trace(format_args!(
-                "DMA {} response={:08x} tid={} status={} length={}",
-                if read { "READ" } else { "WRITE" },
+                "DMA {:?} {} response={:08x} tid={} status={} length={}",
+                command.kind,
+                if command.read { "READ" } else { "WRITE" },
                 result.raw,
                 result.tid,
                 result.status,
                 result.data_len
             ));
         }
-        if result.tid != tid { return Err("DMA response TID mismatch"); }
-        if !result.success() { return Err("DMA response reports transfer failure"); }
+        if result.tid != tid {
+            return Err("DMA response TID mismatch");
+        }
         if read {
-            if result.data_len != len { return Err("DMA read length mismatch"); }
-            for i in 0..len {
-                if unsafe { read_volatile(buffer.add(i)) } != xfer_data[i] {
-                    return Err("DMA read payload mismatch");
-                }
+            if result.success() && result.data_len > len {
+                return Err("DMA read exceeds requested buffer");
             }
             for i in len..64 {
-                if unsafe { read_volatile(buffer.add(i)) } != 0xa5 { return Err("DMA RX buffer guard overwritten"); }
+                if unsafe { read_volatile(buffer.add(i)) } != 0xa5 {
+                    return Err("DMA RX buffer guard overwritten");
+                }
             }
-        } else if result.data_len != 0 { return Err("DMA write reports untransferred bytes"); }
+        }
         Ok(result)
     }
     /// Poll and consume one complete IBI. Returns None if no complete IBI is ready.
     /// The caller supplies storage; all ring management remains inside this driver.
     pub fn poll_ibi(&mut self, output: &mut [u8]) -> DmaResult<Option<DmaIbiEvent>> {
-        if self.read(INTR_STATUS) & INTR_IBI_RING_FULL != 0 {
+        if self.regs.dma_ring_intr_status() & INTR_IBI_RING_FULL != 0 {
             return Err("IBI status ring full");
         }
-        let enq = ((self.read(OP2) >> 16) & 0xff) as usize;
-        if enq >= IBI_STATUS_RING_ENTRIES { return Err("invalid IBI enqueue pointer"); }
-        if enq == self.ibi_deq { return Ok(None); }
+        let enq = ((self.regs.dma_ring_operation2() >> 16) & 0xff) as usize;
+        if enq >= IBI_STATUS_RING_ENTRIES {
+            return Err("invalid IBI enqueue pointer");
+        }
+        if enq == self.ibi_deq {
+            return Ok(None);
+        }
         unsafe {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
@@ -591,15 +928,42 @@ impl Ring {
         let mut bad = false;
         let mut complete = false;
         while idx != enq {
-            let ptr = unsafe { addr_of_mut!((*self.memory).ibi_status).cast::<u8>()
-                .add(idx * self.ibi_stride).cast::<u32>() };
+            let ptr = unsafe {
+                addr_of_mut!((*self.memory).ibi_status)
+                    .cast::<u8>()
+                    .add(idx * self.ibi_stride)
+                    .cast::<u32>()
+            };
             let status = unsafe { read_volatile(ptr) };
+
+            if let Some(trace) = self.trace {
+                trace(format_args!("IBI DMA status[{}]={:08x}", idx, status));
+            }
+
             let a = ((status >> 9) & 0x7f) as u8;
             let chunks = ((status >> 16) & 0xff) as usize;
             let last = status & (1 << 24) != 0;
-            if status & (1 << 30) != 0 { bad = true; }
-            if let Some(prev) = addr { if prev != a { bad = true; } }
-            else { addr = Some(a); }
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "IBI decoded: addr={:02x} rnw={} last={} error={} chunks={} tail={}",
+                    a,
+                    status & (1 << 8) != 0,
+                    last,
+                    status & (1 << 30) != 0,
+                    chunks,
+                    status & 0xff,
+                ));
+            }
+            if status & (1 << 30) != 0 {
+                bad = true;
+            }
+            if let Some(prev) = addr {
+                if prev != a {
+                    bad = true;
+                }
+            } else {
+                addr = Some(a);
+            }
             if chunks > IBI_CHUNK_POOL_SIZE || total_chunks + chunks > IBI_CHUNK_POOL_SIZE {
                 return Err("invalid IBI chunk count");
             }
@@ -609,43 +973,111 @@ impl Ring {
                 if chunks > 0 && (tail == 0 || tail > IBI_CHUNK_SIZE) {
                     return Err("invalid final IBI chunk length");
                 }
-                size += if chunks == 0 { 0 } else { (chunks - 1) * IBI_CHUNK_SIZE + tail };
+                size += if chunks == 0 {
+                    0
+                } else {
+                    (chunks - 1) * IBI_CHUNK_SIZE + tail
+                };
                 complete = true;
             } else {
                 size += chunks * IBI_CHUNK_SIZE;
             }
             idx = (idx + 1) % IBI_STATUS_RING_ENTRIES;
-            if complete { break; }
+            if complete {
+                break;
+            }
         }
-        if !complete { return Ok(None); }
-        if size > output.len() { return Err("IBI output buffer too small"); }
+        if !complete {
+            return Ok(None);
+        }
+        if size > output.len() {
+            return Err("IBI output buffer too small");
+        }
         let ptr = unsafe { addr_of_mut!((*self.memory).ibi_data).cast::<u8>() };
         for (i, byte) in output[..size].iter_mut().enumerate() {
-            let off = (self.ibi_chunk_ptr * IBI_CHUNK_SIZE + i)
-                % (IBI_CHUNK_POOL_SIZE * IBI_CHUNK_SIZE);
+            let off =
+                (self.ibi_chunk_ptr * IBI_CHUNK_SIZE + i) % (IBI_CHUNK_POOL_SIZE * IBI_CHUNK_SIZE);
             *byte = unsafe { read_volatile(ptr.add(off)) };
         }
         // Reclaim descriptors and data chunks, preserving command ring pointers.
         self.ibi_deq = idx;
-        self.write(OP1, (self.read(OP1) & !(0xff << 16)) | ((idx as u32) << 16));
+        self.regs.write_dma_ring_operation1(
+            (self.regs.dma_ring_operation1() & !(0xff << 16)) | ((idx as u32) << 16),
+        );
         self.ibi_chunk_ptr = (self.ibi_chunk_ptr + total_chunks) % IBI_CHUNK_POOL_SIZE;
         if total_chunks != 0 {
-            let available = self.read(RH_CHUNK_CONTROL);
-            self.write(RH_CHUNK_CONTROL, available + total_chunks as u32);
+            let available = self.regs.dma_ring_chunk_control();
+            self.regs
+                .write_dma_ring_chunk_control(available + total_chunks as u32);
         }
-        self.write(INTR_STATUS, INTR_IBI_READY);
-        if bad { return Err("IBI controller reported an error or address mismatch"); }
-        Ok(Some(DmaIbiEvent { target_addr: addr.unwrap_or(0), payload_len: size }))
+        self.regs.write_dma_ring_intr_status(INTR_IBI_READY);
+        if bad {
+            return Err("IBI controller reported an error or address mismatch");
+        }
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "IBI DMA received addr={:02x} len={} data={:02x?}",
+                addr.unwrap_or(0),
+                size,
+                &output[..size]
+            ));
+        }
+        Ok(Some(DmaIbiEvent {
+            target_addr: addr.unwrap_or(0),
+            payload_len: size,
+        }))
+    }
+
+    /// Called only after consuming the final DAA NACK, with no queued work.
+    pub(crate) fn recover_after_daa_nack(&mut self, regs: &I3cHciRegisters) -> Result<()> {
+        use super::constants;
+        // Leave ENABLE set so command/response pointer positions are retained.
+        self.regs
+            .write_dma_ring_control(self.regs.dma_ring_control() & !2);
+        self.wait(I3cHciRegisters::dma_ring_status, RUNNING, 0)
+            .map_err(|_| I3cHciError::Timeout)?;
+        // ASPEED DMA reuses the PIO FIFOs. Wait for both DMA engines before
+        // resetting them, as in Linux aspeed_pio_fifo_reset().
+        self.wait_aspeed_dma_idle()
+            .map_err(|_| I3cHciError::Timeout)?;
+        let mask = constants::CMD_QUEUE_RST
+            | constants::RESP_QUEUE_RST
+            | constants::TX_FIFO_RST
+            | constants::RX_FIFO_RST;
+        regs.write_reset_control(mask);
+        let mut reset = false;
+        for _ in 0..POLL_BUDGET {
+            if regs.reset_control() & mask == 0 {
+                reset = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !reset {
+            return Err(I3cHciError::Timeout);
+        }
+        self.regs.write_dma_ring_intr_status(DMA_ERRORS);
+        regs.set_hc_control(HC_CONTROL_RESUME);
+        self.regs.write_dma_ring_control(ENABLE_RUN);
+        self.wait(I3cHciRegisters::dma_ring_status, 3, 3)
+            .map_err(|_| I3cHciError::Timeout)?;
+        self.dump_dma_state("DMA DAA end recovery");
+        Ok(())
     }
 
     pub fn stop(&self) -> DmaResult<()> {
-        self.write(RING_CONTROL, self.read(RING_CONTROL) & !2);
-        if self.wait(RING_STATUS, RUNNING, 0).is_err() {
-            self.write(RING_CONTROL, self.read(RING_CONTROL) | ABORT);
-            self.wait(RING_STATUS, RUNNING, 0)?;
+        self.regs
+            .write_dma_ring_control(self.regs.dma_ring_control() & !2);
+        if self
+            .wait(I3cHciRegisters::dma_ring_status, RUNNING, 0)
+            .is_err()
+        {
+            self.regs
+                .write_dma_ring_control(self.regs.dma_ring_control() | ABORT);
+            self.wait(I3cHciRegisters::dma_ring_status, RUNNING, 0)?;
         }
-        self.write(RING_CONTROL, 0);
-        self.wait(RING_STATUS, 3, 0)
+        self.regs.write_dma_ring_control(0);
+        self.wait(I3cHciRegisters::dma_ring_status, 3, 0)
     }
 }
 
@@ -654,5 +1086,7 @@ fn dma_address(ptr: *const u8, len: usize) -> DmaResult<u32> {
     if start < 0x000a0000 || start.checked_add(len).is_none_or(|end| end > 0x000c0000) {
         return Err("DMA allocation is outside non-cacheable SRAM");
     }
-    (start as u32).checked_add(DMA_BUS_OFFSET).ok_or("DMA address overflow")
+    (start as u32)
+        .checked_add(DMA_BUS_OFFSET)
+        .ok_or("DMA address overflow")
 }

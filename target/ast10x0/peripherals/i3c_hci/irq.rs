@@ -21,7 +21,6 @@ use super::constants::{
     MAX_BUSES, MIPI_I3C_HCI_CORE_IRQS,
 };
 use super::core::IoMode;
-use super::dma::RHS_INTR_ALL_RINGS;
 use super::pio::STAT_ALL_ERRORS;
 use super::registers::I3cHciRegisters;
 
@@ -270,14 +269,16 @@ fn handle_core_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
 }
 
 fn handle_rhs_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
-    let status = regs.rhs_intr_status();
+    let status = regs.dma_ring_intr_status();
 
     if status == 0 {
         return;
     }
 
     events.io_status.fetch_or(status, Ordering::AcqRel);
-    regs.write_rhs_intr_status(status & RHS_INTR_ALL_RINGS);
+    // Ring 0 reports event bits (5, 6, 9..12), not a bitmap of ring IDs.
+    // Acknowledge exactly the observed W1C events after latching them.
+    regs.write_dma_ring_intr_status(status);
 }
 fn handle_pio_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
     let status = regs.pio_intr_status();
@@ -289,7 +290,7 @@ fn handle_pio_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
     /*
      * Do NOT drain response/RX/TX FIFOs here.
      *
-     * The caller's PioTransfer may contain borrowed buffers, so the OpenPRoT
+     * The caller's HciTransfer may contain borrowed buffers, so the OpenPRoT
      * architecture intentionally defers FIFO work to normal driver context.
      */
     events.io_status.fetch_or(status, Ordering::AcqRel);

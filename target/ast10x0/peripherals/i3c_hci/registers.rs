@@ -322,15 +322,205 @@ impl I3cHciRegisters {
     pub fn write_rhs_control(&self, value: u32) {
         self.regs().hcirhs000().write(|w| unsafe { w.bits(value) });
     }
+    /// Hardware RH0_OFFSET, checked against the fixed PAC layout by DMA init.
     #[inline]
-    pub fn rhs_intr_status(&self) -> u32 {
+    pub fn rhs_ring0_offset(&self) -> u32 {
+        self.regs().hcirhs004().read().bits()
+    }
+
+    pub fn dma_descriptor_sizes(&self) -> (u8, u8) {
+        let setup = self.regs().hcirhs030().read();
+        (
+            setup.regxferstructsize().bits(),
+            setup.regrespstructsize().bits(),
+        )
+    }
+
+    pub fn dma_ibi_status_stride(&self) -> u8 {
+        self.regs()
+            .hcirhs034()
+            .read()
+            .regibistatusstructsize()
+            .bits()
+    }
+
+    pub fn aspeed_wdma_debug_low(&self) -> u32 {
+        self.regs().i3ccontrol084().read().regringwdmadbglo().bits()
+    }
+
+    pub fn aspeed_rdma_debug_low(&self) -> u32 {
+        self.regs().i3ccontrol094().read().regringrdmadbglo().bits()
+    }
+
+    #[inline]
+    pub fn dma_ring_cr_setup(&self) -> u32 {
         self.regs().hcirhs030().read().bits()
     }
+
     #[inline]
-    pub fn write_rhs_intr_status(&self, value: u32) {
+    pub fn write_dma_ring_cr_setup(&self, value: u32) {
         self.regs().hcirhs030().write(|w| unsafe { w.bits(value) });
     }
 
+    #[inline]
+    pub fn dma_ring_ibi_setup(&self) -> u32 {
+        self.regs().hcirhs034().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_ibi_setup(&self, value: u32) {
+        self.regs().hcirhs034().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_chunk_control(&self) -> u32 {
+        self.regs().hcirhs038().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_chunk_control(&self, value: u32) {
+        self.regs().hcirhs038().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_intr_status(&self) -> u32 {
+        self.regs().hcirhs040().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_intr_status(&self, value: u32) {
+        self.regs().hcirhs040().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_intr_status_enable(&self) -> u32 {
+        self.regs().hcirhs044().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_intr_status_enable(&self, value: u32) {
+        self.regs().hcirhs044().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_intr_signal_enable(&self) -> u32 {
+        self.regs().hcirhs048().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_intr_signal_enable(&self, value: u32) {
+        self.regs().hcirhs048().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_status(&self) -> u32 {
+        self.regs().hcirhs050().read().bits()
+    }
+
+    #[inline]
+    pub fn dma_ring_control(&self) -> u32 {
+        self.regs().hcirhs054().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_control(&self, value: u32) {
+        self.regs().hcirhs054().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_operation1(&self) -> u32 {
+        self.regs().hcirhs058().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_operation1(&self, value: u32) {
+        self.regs().hcirhs058().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_operation2(&self) -> u32 {
+        self.regs().hcirhs05c().read().bits()
+    }
+
+    #[inline]
+    pub fn dma_ring_cmd_base_lo(&self) -> u32 {
+        self.regs().hcirhs060().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_cmd_base_lo(&self, value: u32) {
+        self.regs().hcirhs060().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_cmd_base_hi(&self) -> u32 {
+        self.regs().hcirhs064().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_cmd_base_hi(&self, value: u32) {
+        self.regs().hcirhs064().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_resp_base_lo(&self) -> u32 {
+        self.regs().hcirhs068().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_resp_base_lo(&self, value: u32) {
+        self.regs().hcirhs068().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_resp_base_hi(&self) -> u32 {
+        self.regs().hcirhs06c().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_resp_base_hi(&self, value: u32) {
+        self.regs().hcirhs06c().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_ibi_status_base_lo(&self) -> u32 {
+        self.regs().hcirhs070().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_ibi_status_base_lo(&self, value: u32) {
+        self.regs().hcirhs070().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_ibi_status_base_hi(&self) -> u32 {
+        self.regs().hcirhs074().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_ibi_status_base_hi(&self, value: u32) {
+        self.regs().hcirhs074().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_ibi_data_base_lo(&self) -> u32 {
+        self.regs().hcirhs078().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_ibi_data_base_lo(&self, value: u32) {
+        self.regs().hcirhs078().write(|w| unsafe { w.bits(value) });
+    }
+
+    #[inline]
+    pub fn dma_ring_ibi_data_base_hi(&self) -> u32 {
+        self.regs().hcirhs07c().read().bits()
+    }
+
+    #[inline]
+    pub fn write_dma_ring_ibi_data_base_hi(&self, value: u32) {
+        self.regs().hcirhs07c().write(|w| unsafe { w.bits(value) });
+    }
     #[inline]
     pub fn aspeed_ctrl(&self) -> u32 {
         self.regs().i3ccontrol000().read().bits()
