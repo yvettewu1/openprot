@@ -69,22 +69,79 @@ fn run() -> Result<()> {
         device.dat_index
     );
 
+    bare_metal::info!("Preparing DAT for DMA IBI");
+    master
+        .prepare_ibi_dma(device, 2)
+        .map_err(|_| "DMA IBI DAT setup failed")?;
+        
     // Initialize DMA ring.
     let mut ring = Ring::init_with_trace(&core, |args| {
         bare_metal::info!("{}", args);
     })?;
+
+    // Send direct ENEC(SIR) using DMA immediate command.
+    const ENEC_TID: u8 = 3;
+    const ENEC_DIRECT: u8 = 0x80;
+    const EVENT_SIR: u8 = 0x01;
+
+    bare_metal::info!(
+        "DMA ENEC: DA=0x{:02x} DAT={} CCC=0x80 payload=0x01",
+        device.dynamic_addr,
+        device.dat_index
+    );
+    bare_metal::i3c_setup::spin_sleep(0x5000_0000);
+    bare_metal::info!(
+        "================ wait 5 seconds before sending enec =========" );
+
+    let enec = HciCommandV1::ccc(
+        device.dat_index,
+        ENEC_TID,
+        false,
+        ENEC_DIRECT,
+        &[EVENT_SIR],
+        0,
+        None,
+    )
+    .map_err(|_| "DMA ENEC command encoding failed")?
+    .with_roc()
+    .with_toc();
+
+    bare_metal::info!(
+        "ENEC descriptor CMD0={:08x} CMD1={:08x}",
+        enec.words[0],
+        enec.words[1]
+    );
+
+    let response = ring.transfer_immediate(enec, ENEC_TID)?;
+
+    bare_metal::info!(
+        "DMA ENEC completed: response={:08x} status={}",
+        response.raw,
+        response.status
+    );
+    bare_metal::i3c_setup::spin_sleep(0x1000_0000);
+    bare_metal::info!(
+        "================ wait 1 seconds before sending 2nd enec =========" );
+    let response2 = ring.transfer_immediate(enec, ENEC_TID)?;
+
+    bare_metal::info!(
+        "DMA ENEC completed: response={:08x} status={}",
+        response2.raw,
+        response2.status
+    );
+
     let packet = bare_metal::i3c_mctp_setup::prepare_mctp_packet(device.dynamic_addr);
-
-    bare_metal::info!("========== wait for target to setup mctp read ======================");
-    // Retain the existing manual receiver-setup delay (not calibrated).
-    bare_metal::i3c_setup::spin_sleep(0x8000_0000);
-
-    // private write
-    let write = HciCommandV1::i3c_private_write_regular(device.dat_index, 4, packet.len(), 0)
-        .map_err(|_| "DMA write command encoding failed")?.with_roc().with_toc();
-    ring.transfer(write, 4, false, &packet)?;
-    bare_metal::info!("DMA WRITE CONTROLLER PASS; verify target received {:02x?}", packet);
-/*
+    for i in 0..3 {
+        bare_metal::info!("========== wait for target to setup mctp read {} ======================", i);
+        // Retain the existing manual receiver-setup delay (not calibrated).
+        bare_metal::i3c_setup::spin_sleep(0x3000_0000);   
+        // private write
+        let write = HciCommandV1::i3c_private_write_regular(device.dat_index, 4, packet.len(), 0)
+            .map_err(|_| "DMA write command encoding failed")?.with_roc().with_toc();
+        ring.transfer(write, 4, false, &packet)?;
+        bare_metal::info!("DMA WRITE CONTROLLER PASS; verify target received {:02x?}", packet);
+    }
+    /*
     bare_metal::info!("========== wait for target to setup mctp write ======================");
     // Retain the existing manual receiver-setup delay (not calibrated).
     bare_metal::i3c_setup::spin_sleep(0x8000_0000);

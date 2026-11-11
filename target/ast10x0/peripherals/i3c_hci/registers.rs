@@ -324,11 +324,11 @@ impl I3cHciRegisters {
     }
     #[inline]
     pub fn rhs_intr_status(&self) -> u32 {
-        self.regs().hcirhs030().read().bits()
+        self.regs().hcirhs040().read().bits()
     }
     #[inline]
     pub fn write_rhs_intr_status(&self, value: u32) {
-        self.regs().hcirhs030().write(|w| unsafe { w.bits(value) });
+        self.regs().hcirhs040().write(|w| unsafe { w.bits(value) });
     }
 
     #[inline]

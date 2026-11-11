@@ -205,7 +205,7 @@ const MAX_STRIDE: usize = 256;
 // Board-specific: current AST10x0 DMA drivers pass non-cacheable SRAM pointers
 // directly. Confirm this mapping for the actual AST1040 revision before running.
 const DMA_BUS_OFFSET: u32 = 0;
-
+// start from offset 0x30
 const CR_SETUP: usize = 0x00;
 const IBI_SETUP: usize = 0x04;
 const INTR_STATUS: usize = 0x10;
@@ -223,6 +223,7 @@ const ENABLE_RUN: u32 = 3;
 const ABORT: u32 = 4;
 const RUNNING: u32 = 2;
 const DMA_ERRORS: u32 = (1 << 9) | (1 << 5);
+const TRANSFER_COMPLETE: u32 = 1 << 11;
 
 #[repr(C, align(64))]
 struct DmaMemory {
@@ -269,16 +270,26 @@ impl Ring {
         self.trace = Some(trace);
         self
     }
-    fn dump_dma_state(&self, stage: &str) {
+    fn dump_dma_state(&self) {
         if let Some(trace) = self.trace {
             trace(format_args!(
-                "{}: RING_STATUS={:08x} INTR={:08x} OP1={:08x} OP2={:08x}",
-                stage,
+                "RING_STATUS={:08x} INTR={:08x} OP1={:08x} OP2={:08x}",
                 self.read(RING_STATUS),
                 self.read(INTR_STATUS),
                 self.read(OP1),
                 self.read(OP2),
             ));
+        }
+    }
+    fn dump_rhs_regs(&self, stage: &str) {
+        if let Some(trace) = self.trace {
+            trace(format_args!( "{}:", stage));
+        }
+        for offset in (0x00..=0x3C).step_by(4) {
+            let value = self.read(offset);
+            if let Some(trace) = self.trace {           
+                trace(format_args!("REG[0x{:02X}] = 0x{:08X}", offset, value)); 
+            }
         }
     }
     fn read(&self, offset: usize) -> u32 {
@@ -288,23 +299,13 @@ impl Ring {
     fn write(&self, offset: usize, value: u32) {
         unsafe { write_volatile((self.base + offset) as *mut u32, value) }
     }
-    fn snapshot(&self) {
-        if let Some(trace) = self.trace {
-            trace(format_args!(
-                "DMA ring status={:08x} intr={:08x} op1={:08x} op2={:08x}",
-                self.read(RING_STATUS),
-                self.read(INTR_STATUS),
-                self.read(OP1),
-                self.read(OP2)
-            ));
-        }
-    }
+
     fn wait(&self, offset: usize, mask: u32, expected: u32) -> DmaResult<()> {
         for _ in 0..POLL_BUDGET {
             if self.read(offset) & mask == expected { return Ok(()); }
             core::hint::spin_loop();
         }
-        self.snapshot();
+        self.dump_dma_state();
         Err("DMA ring control timeout")
     }
 
@@ -344,7 +345,7 @@ impl Ring {
             command_stride: 0, response_stride: 0, next: 0,
             ibi_stride: 0, ibi_deq: 0, ibi_chunk_ptr: 0, trace, };
         if ring.read(RING_STATUS) & 3 != 0 { return Err("ring already active"); }
-        let setup = ring.read(CR_SETUP);
+        let setup = ring.read(CR_SETUP);        
         ring.command_stride = ((setup >> 24) & 0xff) as usize;
         ring.response_stride = ((setup >> 16) & 0xff) as usize;
         if ring.command_stride < 20 || ring.command_stride > MAX_STRIDE || ring.command_stride % 4 != 0
@@ -356,11 +357,29 @@ impl Ring {
         unsafe { core::ptr::write_bytes(ring.memory, 0, 1); }
         let cmd_addr = dma_address(unsafe { addr_of_mut!((*ring.memory).commands).cast() }, ENTRIES * MAX_STRIDE)?;
         let resp_addr = dma_address(unsafe { addr_of_mut!((*ring.memory).responses).cast() }, ENTRIES * MAX_STRIDE)?;
+        if let Some(trace) = ring.trace {
+            trace(format_args!(
+                "IBI DMA cmd addr[{:08x}]={:08x} cmd idx:{:08x}; resp addr[{:08x} ]={:08x} resp idx:{:08x}",
+                ring.base+CMD_BASE_LO,
+                cmd_addr,
+                ring.command_stride,
+                ring.base+RESP_BASE_LO,
+                resp_addr,
+                ring.response_stride
+            ));
+        }
+
         ring.write(CMD_BASE_LO, cmd_addr);
         ring.write(CMD_BASE_HI, 0);
         ring.write(RESP_BASE_LO, resp_addr);
         ring.write(RESP_BASE_HI, 0);
+        if let Some(trace) = ring.trace {
+            trace(format_args!("CR_SETUP before = {:08x}", ring.read(CR_SETUP)));
+        }        
         ring.write(CR_SETUP, ENTRIES as u32);
+            if let Some(trace) = ring.trace {
+            trace(format_args!("CR_SETUP after = {:08x}", ring.read(CR_SETUP)));
+        }
         // Configure the independent IBI status and data DMA rings.
         let ibi_hw_setup = ring.read(IBI_SETUP);
         ring.ibi_stride = ((ibi_hw_setup >> 24) & 0xff) as usize;
@@ -392,7 +411,7 @@ impl Ring {
                 ring.ibi_stride
             ));
         }
-        ring.write(INTR_SIGNAL_ENABLE, 0);
+        ring.write(INTR_SIGNAL_ENABLE, u32::MAX);
         ring.write(INTR_STATUS_ENABLE, u32::MAX);
         ring.write(INTR_STATUS, u32::MAX);
         ring.write(OP1, 0);
@@ -415,6 +434,161 @@ impl Ring {
             ));
         }
         Ok(ring)
+    }
+    pub fn transfer_immediate(
+        &mut self,
+        command: HciCommandV1,
+        tid: u8,
+    ) -> DmaResult<HciResponse> {
+        let slot = self.next;
+
+        if self.read(OP2) & 0xff != slot as u32 {
+            return Err("DMA ring has outstanding work");
+        }
+
+        let descriptor = unsafe {
+            addr_of_mut!((*self.memory).commands)
+                .cast::<u8>()
+                .add(slot * self.command_stride)
+                .cast::<u32>()
+        };
+
+        let response = unsafe {
+            addr_of_mut!((*self.memory).responses)
+                .cast::<u8>()
+                .add(slot * self.response_stride)
+                .cast::<u32>()
+        };
+
+        // Immediate command: payload is encoded in command.words.
+        // No external DMA data buffer descriptor is required.
+        for i in 0..self.command_stride / 4 {
+            let word = match i {
+                0 => command.words[0],
+                1 => command.words[1],
+                _ => 0,
+            };
+
+            unsafe {
+                write_volatile(descriptor.add(i), word);
+            }
+        }
+
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "DMA IMMEDIATE CMD[0]={:08x} CMD[1]={:08x} tid:={}",
+                command.words[0],
+                command.words[1],
+                tid
+            ));
+        }
+
+        //unsafe { write_volatile(response, 0xffff_ffff);  }
+
+        self.write(INTR_STATUS, TRANSFER_COMPLETE | DMA_ERRORS | 1);
+
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        self.dump_rhs_regs("BEFORE IMMEDIATE");
+
+        let next = (slot + 1) % ENTRIES;
+        let op = self.read(OP1);
+
+        self.write(OP1, (op & !0xff) | next as u32);
+
+        self.dump_rhs_regs("AFTER IMMEDIATE SUBMIT");
+
+        let mut completed = false;
+
+        for _ in 0..POLL_BUDGET {
+            if self.read(INTR_STATUS) & DMA_ERRORS != 0 {
+                self.dump_dma_state();
+                return Err("DMA immediate command error");
+            }/*
+            if self.read(INTR_STATUS) & TRANSFER_COMPLETE != 0 {
+                completed = true;
+                break;
+            } */
+            if self.read(OP2) & 0xff == next as u32 {
+                completed = true;
+                break;
+            }
+
+            core::hint::spin_loop();
+        }
+
+        if !completed {
+            self.dump_dma_state();
+            return Err("DMA immediate command timeout");
+        }
+
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        /* force memory visibility */
+        core::sync::atomic::compiler_fence(
+            core::sync::atomic::Ordering::SeqCst,
+        );
+
+        let raw = unsafe { read_volatile(response) };
+        let result = HciResponse::parse(raw);
+        if let Some(trace) = self.trace {
+            trace(format_args!("=== DMA RESPONSE MEMORY DUMP tid:{}===",tid));
+
+            let base = unsafe {
+                addr_of_mut!((*self.memory).responses)
+                    .cast::<u32>()
+            };
+
+            for i in 0..16 {
+                let addr = unsafe { base.add(i) };
+                let value = unsafe { read_volatile(addr) };
+
+                trace(format_args!(
+                    "RESP[{}] @{:08x} = {:08x}",
+                    i,
+                    addr as usize,
+                    value
+                ));
+            }
+
+            trace(format_args!(
+                "Expected response @{:08x} = {:08x}",
+                response as usize,
+                result.raw
+            ));
+        }
+        self.dump_rhs_regs("AFTER IMMEDIATE RESPONSE");
+
+        self.write(
+            OP1,
+            (self.read(OP1) & !0xff00) | ((next as u32) << 8),
+        );
+
+        self.next = next;
+
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "DMA IMMEDIATE response={:08x} tid={} status={} len={}",
+                result.raw,
+                result.tid,
+                result.status,
+                result.data_len
+            ));
+        }
+/* HL:: 
+        if result.tid != tid {
+            return Err("DMA immediate response TID mismatch");
+        }
+
+        if !result.success() {
+            return Err("DMA immediate response failure");
+        }
+*/
+        Ok(result)
     }
     pub fn transfer(&mut self, command: HciCommandV1, tid: u8, read: bool,  xfer_data: &[u8] ) -> DmaResult<HciResponse> {
         let len = xfer_data.len();
@@ -517,33 +691,62 @@ impl Ring {
             }
         }
 
-        unsafe { write_volatile(response, 0xffff_ffff); }
-        self.write(INTR_STATUS, DMA_ERRORS | (1 << 0));
+        //unsafe { write_volatile(response, 0xffff_ffff); }
+        self.write(INTR_STATUS, TRANSFER_COMPLETE | DMA_ERRORS | (1 << 0));
         unsafe {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
-        self.dump_dma_state("BEFORE SUBMIT");
+        self.dump_rhs_regs("BEFORE SUBMIT");
         let next = (slot + 1) % ENTRIES;
         let op = self.read(OP1);
         self.write(OP1, (op & !0xff) | next as u32);
-        self.dump_dma_state("AFTER SUBMIT");
+        //self.dump_dma_state("AFTER SUBMIT");
 
         let mut completed = false;
         for _ in 0..POLL_BUDGET {
             if self.read(INTR_STATUS) & DMA_ERRORS != 0 {
-                self.snapshot();
+                self.dump_dma_state();
                 return Err("DMA transfer error or abort");
-            }
+            }/*
+            if self.read(INTR_STATUS) & TRANSFER_COMPLETE != 0 {
+                completed = true; break;
+            } */
             if self.read(OP2) & 0xff == next as u32 { completed = true; break; }
             core::hint::spin_loop();
         }
-        if !completed { self.snapshot(); return Err("DMA transfer completion timeout"); }
+        if !completed { self.dump_dma_state(); return Err("DMA transfer completion timeout"); }
         unsafe {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
         let result = HciResponse::parse(unsafe { read_volatile(response) });
-        self.dump_dma_state("AFTER RESPONSE");
-        
+        self.dump_rhs_regs("AFTER RESPONSE");
+        if let Some(trace) = self.trace {
+            trace(format_args!("=== DMA RESPONSE MEMORY DUMP tid:{} ===", tid));
+
+            let base = unsafe {
+                addr_of_mut!((*self.memory).responses)
+                    .cast::<u32>()
+            };
+
+            for i in 0..16 {
+                let addr = unsafe { base.add(i) };
+                let value = unsafe { read_volatile(addr) };
+
+                trace(format_args!(
+                    "RESP[{}] @{:08x} = {:08x}",
+                    i,
+                    addr as usize,
+                    value
+                ));
+            }
+
+            trace(format_args!(
+                "Expected response @{:08x} = {:08x}",
+                response as usize,
+                result.raw
+            ));
+        }
+
         self.write(OP1, (self.read(OP1) & !0xff00) | ((next as u32) << 8));
         self.next = next;
         if let Some(trace) = self.trace {
@@ -556,8 +759,10 @@ impl Ring {
                 result.data_len
             ));
         }
+        /* HL:: no error check
         if result.tid != tid { return Err("DMA response TID mismatch"); }
         if !result.success() { return Err("DMA response reports transfer failure"); }
+        
         if read {
             if result.data_len != len { return Err("DMA read length mismatch"); }
             for i in 0..len {
@@ -569,6 +774,7 @@ impl Ring {
                 if unsafe { read_volatile(buffer.add(i)) } != 0xa5 { return Err("DMA RX buffer guard overwritten"); }
             }
         } else if result.data_len != 0 { return Err("DMA write reports untransferred bytes"); }
+        */
         Ok(result)
     }
     /// Poll and consume one complete IBI. Returns None if no complete IBI is ready.

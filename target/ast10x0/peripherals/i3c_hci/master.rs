@@ -330,7 +330,25 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             }
         }
     }
+    pub fn prepare_ibi_dma(
+        &mut self,
+        device: HciI3cDevice,
+        max_len: u16,
+    ) -> Result<()> {
+        let mut entry = self.read_dat_entry(device.dat_index)?;
 
+        entry = entry.clear_flags(DAT_0_SIR_REJECT, 0);
+
+        if max_len != 0 {
+            entry = entry.set_flags(DAT_0_IBI_PAYLOAD, 0);
+            self.regs.aspeed_ibi_terminate(max_len);
+        } else {
+            entry = entry.clear_flags(DAT_0_IBI_PAYLOAD, 0);
+        }
+
+        self.write_dat_entry(device.dat_index, entry)?;
+        Ok(())
+    }
     fn entdaa_once_v1(&mut self, dat_index: u8, dynamic_addr: u8) -> Result<Option<HciI3cDevice>> {
         let tid = self.next_tid();
         let step = prepare_entdaa_step(dat_index, dynamic_addr, tid)?;
