@@ -21,13 +21,20 @@ fn run() -> Result<()> {
     let mut core = unsafe { I3cHciCore::new(I3cHciConfig::dma(0), |_| {}) }
         .map_err(|_| "core creation failed")?;
     core.init_primary(8).map_err(|_| "primary init failed")?;
-    core.disable_irq_signals();
+    // Enable HCI global signaling while retaining the polling consumer.
+    // NVIC remains masked: no interrupt handler may consume DMA state here.
+    core.enable_irq_signals();
+    bare_metal::info!("HCI global interrupt signaling enabled; NVIC masked (DMA polling)");
     if core.command_descriptor() != Some(CommandDescriptor::V1) {
         return Err("dma_test supports HCI v1 commands only");
     }
 
     // Rings exist before the first command, including ENTDAA. There is no
     // PIO command submission or PIO-to-DMA transition in this test.
+    // SAFETY: no DMA ring is active; standalone test owns SCU.
+    unsafe {
+        bare_metal::i3c_setup::prepare_dma_memory();
+    }
     let ring = Ring::init_with_trace(&core, |args| bare_metal::info!("{}", args))?;
     let sections = core.sections();
     let mut master = I3cHciMaster::new(core.regs(), sections, 12_500_000, |_| {})
@@ -56,16 +63,41 @@ fn run() -> Result<()> {
         }
         let device = table.iter().next().ok_or("No I3C target discovered")?;
 
-        // This configures DAT/payload termination and submits ENEC through
-        // the master's selected DMA transport, requiring a successful response.
+        // Intentionally bypass ENEC response validation to test IBI reception
+        // independently of the response visibility issue.
         bare_metal::info!("Enabling IBI through DMA (max payload=2)...");
-        master
-            .enable_ibi_with_max_payload(device, 2)
-            .map_err(|error| {
-                bare_metal::error!("DMA ENEC failed: {:?}", error);
-                "DMA IBI enable failed"
-            })?;
-        bare_metal::info!("READY: IBI enabled; send aa,ee,33,44,55,66,77,88 from AST2700");
+        let result = master.enable_ibi_with_max_payload(device, 2);
+        match result {
+            Ok(result) => bare_metal::info!(
+                "ENEC response (diagnostic bypass): raw={:08x} status={} length={}",
+                result.response.raw,
+                result.response.status,
+                result.response.data_len,
+            ),
+            Err(error) => bare_metal::info!("ENEC error (diagnostic bypass): {:?}", error),
+        }
+        let dump_target = || {
+            let regs = core.regs();
+            bare_metal::info!(
+                "IBI DAT[{}]: word0={:08x?} word1={:08x?} IBI_TERMINATE={:08x}",
+                device.dat_index,
+                regs.table_word(
+                    sections.dat.offset,
+                    sections.dat.entry_size,
+                    device.dat_index,
+                    0
+                ),
+                regs.table_word(
+                    sections.dat.offset,
+                    sections.dat.entry_size,
+                    device.dat_index,
+                    1
+                ),
+                regs.aspeed_ibi_terminate_control(),
+            );
+        };
+        dump_target();
+        bare_metal::info!("READY: IBI diagnostic; send aa,ee,33,44,55,66,77,88 from AST2700");
         bare_metal::info!("Waiting for DMA IBI (infinite wait)...");
 
         let ring = master.dma_ring_mut().ok_or("DMA ring missing")?;
@@ -73,7 +105,12 @@ fn run() -> Result<()> {
         let mut ibi_data = [0u8; 128];
         let mut polls = 0u32;
         loop {
-            match ring.poll_ibi(&mut ibi_data)? {
+            let event = ring.poll_ibi(&mut ibi_data).map_err(|error| {
+                dump_target();
+                ring.dump_ibi_state();
+                error
+            })?;
+            match event {
                 Some(event) => {
                     bare_metal::info!(
                         "IBI received: DA=0x{:02x}, length={}, payload={:02x?}",
@@ -93,6 +130,7 @@ fn run() -> Result<()> {
                 None => {
                     polls = polls.wrapping_add(1);
                     if polls % 1_000_000 == 0 {
+                        dump_target();
                         ring.dump_ibi_state();
                     }
                     core::hint::spin_loop();

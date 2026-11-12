@@ -66,7 +66,16 @@ impl HciTargetCommand {
     /// Queue IBI payload bytes that will be sent when the ASPEED target IBI
     /// request bit is asserted.
     pub fn ibi_payload(len: usize) -> Result<Self> {
-        Self::target_command(TID_TARGET_IBI, len, true)
+        let mut command = Self::target_command(TID_TARGET_IBI, len, true)?;
+        command.word |= 1; // Target IBI attribute, not a target read command.
+        Ok(command)
+    }
+
+    /// ASPEED target IBI: MDB is inline; data_len counts bytes after the MDB.
+    pub fn ibi_with_mdb(mdb: u8, payload_len: usize) -> Result<Self> {
+        let mut command = Self::ibi_payload(payload_len)?;
+        command.word |= (1 << 6) | (u32::from(mdb) << 8);
+        Ok(command)
     }
 
     /// Queue data that will be returned when the active controller performs
@@ -723,5 +732,29 @@ impl HciCommandV1 {
     pub const fn with_roc(mut self) -> Self {
         self.words[0] |= CMD_0_ROC;
         self
+    }
+}
+
+#[cfg(test)]
+mod target_descriptor_tests {
+    use super::HciTargetCommand;
+
+    #[test]
+    fn mctp_ibi_embeds_mdb_and_counts_only_trailing_data() {
+        // Matches ASPEED Linux: attr=1, TID=1, MDB_EN=1, MDB=ae, tail=1.
+        let command = HciTargetCommand::ibi_with_mdb(0xae, 1).unwrap();
+        assert_eq!(command.word, 0x0001_ae49);
+        assert_eq!(command.data_len, 1);
+        assert_eq!(
+            HciTargetCommand::ibi_with_mdb(0xae, 0).unwrap().word,
+            0x0000_ae49
+        );
+        assert!(HciTargetCommand::ibi_with_mdb(0xae, 65536).is_err());
+    }
+
+    #[test]
+    fn target_read_and_payloadless_ibi_have_distinct_attributes() {
+        assert_eq!(HciTargetCommand::read_data(8).unwrap().word, 0x0008_0010);
+        assert_eq!(HciTargetCommand::ibi_payload(0).unwrap().word, 0x0000_0009);
     }
 }

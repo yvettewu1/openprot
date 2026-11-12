@@ -303,9 +303,10 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
          * buffer is too small. Otherwise the next target transaction starts
          * with stale RX data.
          */
+        // The caller has consumed a completed target response. Its byte
+        // count authorizes these FIFO reads, including a partial final word.
+        // Match Zephyr hci_pio_target_read_rx_fifo: no RX_THLD wait here.
         while remaining != 0 {
-            self.wait_status(STAT_RX_THLD)?;
-
             let word = self.regs.pio_rx_data_port();
             let chunk = core::cmp::min(4, remaining);
 
@@ -331,8 +332,13 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     }
 
     pub fn target_queue_ibi_payload(&mut self, data: &[u8]) -> Result<()> {
-        let command = HciTargetCommand::ibi_payload(data.len())?;
-        self.target_queue_command(command, data)
+        // Match ASPEED Linux prep_ibi_xfer: encode MDB in the descriptor,
+        // and put only the remaining bytes into the target TX FIFO.
+        let (command, payload) = match data.split_first() {
+            Some((&mdb, payload)) => (HciTargetCommand::ibi_with_mdb(mdb, payload.len())?, payload),
+            None => (HciTargetCommand::ibi_payload(0)?, data),
+        };
+        self.target_queue_command(command, payload)
     }
 
     /// Receive one complete IBI, returning the final descriptor and total bytes.

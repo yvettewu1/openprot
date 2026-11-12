@@ -210,6 +210,21 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         Ok(())
     }
 
+    pub fn clear_hc_irq(&self) -> u32 {
+        let status = self.regs.intr_status();
+
+        if status == 0 {
+            return status;
+        }
+        /*
+         * INTR_STATUS is W1C. Latch before clearing so normal driver context can
+         * decide whether recovery is required.
+         */
+
+        self.regs.write_intr_status(status);
+        status
+    }
+
     pub fn isr_ctx(&self) -> Result<IsrCtx> {
         let io_mode = self.selected_io.ok_or(I3cHciError::InvalidArgs)?;
 
@@ -234,8 +249,14 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
 
         let pio_irqs = super::pio::STAT_RESP_READY | super::pio::STAT_ALL_ERRORS;
 
-        self.regs.write_pio_intr_status_enable(u32::MAX);
-        self.regs.write_pio_intr_signal_enable(pio_irqs);
+        if self.selected_io == Some(IoMode::Pio) {
+            self.regs.write_pio_intr_status_enable(u32::MAX);
+            self.regs.write_pio_intr_signal_enable(pio_irqs);
+        } else {
+            // DMA ring interrupt signaling is configured by Ring::init.
+            // Do not also signal the shared PIO FIFO interrupts in DMA mode.
+            self.regs.write_pio_intr_signal_enable(0);
+        }
     }
 
     pub fn disable_irq_signals(&self) {

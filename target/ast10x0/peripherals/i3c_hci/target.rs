@@ -23,7 +23,7 @@ use super::constants::{
 };
 use super::daa::valid_i3c_address;
 use super::error::{I3cHciError, Result};
-use super::pio::{I3cHciPio, TargetResponse, STAT_ALL_ERRORS, STAT_RESP_READY};
+use super::pio::{I3cHciPio, STAT_ALL_ERRORS, STAT_RESP_READY, TargetResponse};
 use super::registers::I3cHciRegisters;
 use super::types::InitMode;
 
@@ -171,8 +171,12 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
                 | ASPEED_I3C_SLV_CAP_CTRL_MR_WAIT,
         );
 
-        self.regs.write_pio_intr_status_enable(TARGET_PIO_IRQS);
-
+        // Polling queue helpers need CMD_QUEUE_READY and TX/RX thresholds,
+        // even though only completion/errors should signal a CPU interrupt.
+        self.regs.write_pio_intr_status_enable(u32::MAX);
+        // Threshold encoding zero means one DWORD. The controller defaults
+        // use half-FIFO thresholds, which strand short target CCC payloads.
+        self.regs.write_pio_data_buffer_thld_ctrl(0);
         self.regs.write_pio_intr_signal_enable(TARGET_PIO_IRQS);
 
         let role = self.regs.aspeed_target_role();
@@ -233,6 +237,14 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
     /// active controller enabled SIR for this target, then set the private
     /// IBI request bit and wait for hardware to consume it.
     pub fn request_ibi(&mut self) -> Result<()> {
+        self.start_ibi()?;
+        self.pio
+            .wait_aspeed_cap_ctrl_clear(ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ)
+    }
+
+    /// Start an IBI without waiting, so a single CPU can service both ports.
+    /// Queue the payload first and consume the target completion afterwards.
+    pub fn start_ibi(&mut self) -> Result<()> {
         if !self.enabled {
             return Err(I3cHciError::Busy);
         }
@@ -241,7 +253,33 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
             return Err(I3cHciError::Busy);
         }
 
-        self.request_slave_capability(ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ)
+        let cap_ctrl = self.regs.aspeed_slave_cap_ctrl();
+        if cap_ctrl & ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ != 0 {
+            return Err(I3cHciError::Busy);
+        }
+        self.regs
+            .write_aspeed_slave_cap_ctrl(cap_ctrl | ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ);
+        Ok(())
+    }
+
+    /// Hardware event-enable state updated by ENEC/DISEC.
+    pub fn ibi_enabled(&self) -> bool {
+        self.regs.aspeed_slave_status1() & ASPEED_I3C_SLV_STS1_IBI_EN != 0
+    }
+
+    /// Poll for a target response without waiting for a new bus transaction.
+    pub fn poll_event(&mut self, rx: &mut [u8]) -> Result<Option<HciTargetEvent>> {
+        if !self.enabled {
+            return Err(I3cHciError::Busy);
+        }
+        let status = self.regs.pio_intr_status();
+        if status & STAT_ALL_ERRORS != 0 {
+            return Err(I3cHciError::TransferStatus(status));
+        }
+        if status & STAT_RESP_READY == 0 {
+            return Ok(None);
+        }
+        self.next_event(rx).map(Some)
     }
 
     pub fn accept_controller_role_requests(&self, enable: bool) {

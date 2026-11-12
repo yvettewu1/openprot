@@ -211,21 +211,40 @@ pub unsafe fn prepare_and_show(buses: &[u8], hv: bool) {
         scu.regs().scu408().write(|w| unsafe { w.bits(0x2222) });
     } else {
         crate::info!("I3C LV setup");
-        // scu.apply_pinctrl_group(pinctrl::PINCTRL_I3C_HCI0);  
-        scu.regs().scu400().write(|w| unsafe { w.bits(0x1111) }); 
-        scu.regs().scu408().write(|w| unsafe { w.bits(0x22220000) }); 
+        // scu.apply_pinctrl_group(pinctrl::PINCTRL_I3C_HCI0);
+        scu.regs().scu400().write(|w| unsafe { w.bits(0x11111111) });
+        scu.regs().scu404().write(|w| unsafe { w.bits(0x11111111) });
+        scu.regs().scu408().write(|w| unsafe { w.bits(0x11111111) });
+        scu.regs().scu40c().write(|w| unsafe { w.bits(0x00001111) });
+
+        scu.regs().scu420().write(|w| unsafe { w.bits(0x11110000) });
+        scu.regs().scu424().write(|w| unsafe { w.bits(0x11111111) });
+        scu.regs().scu428().write(|w| unsafe { w.bits(0x11111111) });
+        scu.regs().scu42c().write(|w| unsafe { w.bits(0x00001111) });
+
+        crate::info!("disable dram cache");
+        scu.regs().scu910().write(|w| unsafe { w.bits(0x0) });
+        scu.regs().scu918().write(|w| unsafe { w.bits(0x0) });
     }
-     crate::info!("SCU pinctrl applied for I3C HCI0");
+    crate::info!("SCU pinctrl applied for I3C HCI0");
     let scu400 = scu.regs().scu400().read().bits();
     let scu408 = scu.regs().scu408().read().bits();
+    let scu420 = scu.regs().scu420().read().bits();
     crate::info!(
-        "SCU400 [0x74C02400] = 0x{:08x}, I3C0 SCL mux={} SDA mux={}, SCU400 = 0x{:08x}",
+        "SCU400 [0x74C02400] = 0x{:08x}, I3C0 SCL mux={} SDA mux={}, SCU408 = 0x{:08x} , SCU420 = 0x{:08x}",
         scu400,
         scu400 & 0x7,
         (scu400 >> 4) & 0x7,
-        scu408
+        scu408,
+        scu420
     );
-
+    crate::info!(
+        "SCU900 = 0x{:08x}, SCU910 = 0x{:08x},SCU914 = 0x{:08x},SCU918 = 0x{:08x}",
+        scu.regs().scu900().read().bits(),
+        scu.regs().scu910().read().bits(),
+        scu.regs().scu914().read().bits(),
+        scu.regs().scu918().read().bits()
+    );
 
     reset_and_enable_i3cs(scu.regs());
     show_scu(scu.regs());
@@ -238,4 +257,52 @@ pub unsafe fn prepare_and_show(buses: &[u8], hv: bool) {
             crate::error!("HCI{} startup decode error: {:?}", bus, error);
         }
     }
+}
+
+/// Make the standalone DMA test window non-cacheable on AST1040/G2 CM4.
+///
+/// # Safety
+/// Call before creating any DMA ring, with exclusive SCU ownership. The G2
+/// write-through cache uses 512 KiB areas; this affects 0x80000..0xfffff,
+/// including the stack, not just the reserved 0xa0000..0xbffff DMA allocation.
+/// No MPU permissions or cache enable/closely-coupled SRAM mode bits change.
+pub unsafe fn prepare_dma_memory() {
+    let scu = unsafe { ast10x0_scu_pinctrl::ScuRegisters::new_global_unlocked() };
+    cortex_m::interrupt::free(|_| {
+        // Log inherited MPU settings before changing only the SCU cache area.
+        let mpu = unsafe { &*cortex_m::peripheral::MPU::PTR };
+        let kind = mpu._type.read();
+        crate::info!("DMA MPU: TYPE={:08x} CTRL={:08x}", kind, mpu.ctrl.read());
+        let selected = mpu.rnr.read();
+        for region in 0..((kind >> 8) & 0xff) {
+            unsafe {
+                mpu.rnr.write(region);
+            }
+            crate::info!(
+                "DMA MPU[{}]: RBAR={:08x} RASR={:08x}",
+                region,
+                mpu.rbar.read(),
+                mpu.rasr.read()
+            );
+        }
+        unsafe {
+            mpu.rnr.write(selected);
+        }
+        let previous = scu.regs().scu910().read().bits();
+        // Zephyr cache_aspeed.c documents G2 as write-through. Drain CPU
+        // stores before bypassing this area's cache; no dirty writeback exists.
+        cortex_m::asm::dsb();
+        scu.regs()
+            .scu910()
+            .modify(|r, w| unsafe { w.bits(r.bits() & !(1 << 1)) });
+        cortex_m::asm::dsb();
+        cortex_m::asm::isb();
+        crate::info!(
+            "DMA cache: SCU910={:08x}->{:08x} SCU918={:08x}",
+            previous,
+            scu.regs().scu910().read().bits(),
+            scu.regs().scu918().read().bits()
+        );
+        crate::info!("DMA addresses: CPU 000a0000..000bffff; I3C uses unchanged buffer addresses");
+    });
 }

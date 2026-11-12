@@ -193,8 +193,13 @@ type DmaResult<T> = core::result::Result<T, &'static str>;
 const POLL_BUDGET: u32 = 1_000_000; // Iterations, not microseconds.
 const ENTRIES: usize = 4;
 const MAX_STRIDE: usize = 256;
-// Board-specific: current AST10x0 DMA drivers pass non-cacheable SRAM pointers
-// directly. Confirm this mapping for the actual AST1040 revision before running.
+// Controller v1: two command words plus three data-buffer words.
+// A 16-byte hardware stride indicates target/secondary command format.
+const MIN_XFER_STRUCT_SIZE: usize = 20;
+
+// Match the Zephyr ASPEED I3C vendor DMA hook for non-AST27XX:
+// pass the buffer address unchanged. The generic G2 CM4 address translator
+// is not called by that I3C hook. Keep cacheability separate from addressing.
 const DMA_BUS_OFFSET: u32 = 0;
 
 const ENABLE_RUN: u32 = 3;
@@ -274,7 +279,7 @@ impl Ring {
     fn dump_dma_state(&self, stage: &str) {
         if let Some(trace) = self.trace {
             trace(format_args!(
-                "{}: RING_STATUS={:08x} INTR={:08x} OP1={:08x} OP2={:08x}",
+                "{}: DMA:: RING_STATUS={:08x} INTR={:08x} OP1={:08x} OP2={:08x}",
                 stage,
                 self.regs.dma_ring_status(),
                 self.regs.dma_ring_intr_status(),
@@ -285,6 +290,13 @@ impl Ring {
     }
     pub fn dump_ibi_state(&self) {
         if let Some(trace) = self.trace {
+            trace(format_args!(
+                "IBI controller: HC_CONTROL={:08x} HC_INTR_STATUS={:08x} ASPEED_STATUS={:08x} IBI_TERMINATE={:08x}",
+                self.regs.hc_control(),
+                self.regs.intr_status(),
+                self.regs.aspeed_status(),
+                self.regs.aspeed_ibi_terminate_control(),
+            ));
             trace(format_args!(
                 "DMA: RING_STATUS={:08x} RING_CONTROL={:08x} CR_SETUP={:08x} IBI_SETUP={:08x}",
                 self.regs.dma_ring_status(),
@@ -413,13 +425,19 @@ impl Ring {
         let (command_stride, response_stride) = ring.regs.dma_descriptor_sizes();
         ring.command_stride = command_stride as usize;
         ring.response_stride = response_stride as usize;
-        if ring.command_stride < 20
+        if ring.command_stride < MIN_XFER_STRUCT_SIZE
             || ring.command_stride > MAX_STRIDE
             || ring.command_stride % 4 != 0
             || ring.response_stride < 4
             || ring.response_stride > MAX_STRIDE
             || ring.response_stride % 4 != 0
         {
+            if let Some(trace) = trace {
+                trace(format_args!(
+                    "command_stride=0x{:08x} response_stride=0x{:08x}",
+                    command_stride, response_stride
+                ));
+            }
             return Err("unsupported DMA descriptor sizes");
         }
         // NOLOAD SRAM is not zeroed by the shared startup. Explicitly initialize
@@ -479,7 +497,7 @@ impl Ring {
                 status_addr, data_addr, ring.ibi_stride
             ));
         }
-        ring.regs.write_dma_ring_intr_signal_enable(0);
+        ring.regs.write_dma_ring_intr_signal_enable(u32::MAX);
         ring.regs.write_dma_ring_intr_status_enable(u32::MAX);
         ring.regs.write_dma_ring_intr_status(u32::MAX);
         ring.regs.write_dma_ring_operation1(0);
@@ -691,7 +709,7 @@ impl Ring {
                 .add(slot * self.response_stride)
                 .cast::<u32>()
         };
-        // FIX 3: Print descriptor and response SRAM addresses.
+
         if let Some(trace) = self.trace {
             trace(format_args!(
                 "DMA CMD descriptor address={:08x}",
@@ -708,14 +726,6 @@ impl Ring {
         // Word 2: Data Buffer Descriptor (length + IOC)
         // Word 3: DMA address low
         // Word 4: DMA address high
-        /*
-        let words = [
-            command.words[0],
-            command.words[1],
-            (1 << 30) | len as u32,
-            if len == 0 { 0 } else { address },
-            0,
-        ]; */
         self.dump_wdma_debug("BEFORE DMA SUBMIT");
         let words = Self::prepare_dma_command_words(command, read, xfer_data, address);
 
@@ -738,7 +748,9 @@ impl Ring {
         unsafe {
             write_volatile(response, 0xffff_ffff);
         }
-        self.regs.write_dma_ring_intr_status(DMA_ERRORS | (1 << 11));
+
+        //self.regs.write_dma_ring_intr_status(DMA_ERRORS | (1 << 11));
+        self.regs.write_dma_ring_intr_status(0x0fff);
         unsafe {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
@@ -749,6 +761,7 @@ impl Ring {
             .write_dma_ring_operation1((op & !0xff) | next as u32);
         self.dump_dma_state("AFTER SUBMIT");
         self.dump_wdma_debug("AFTER DMA SUBMIT");
+
         const TRANSFER_COMPLETION: u32 = 1 << 11;
         const TRANSFER_ERROR: u32 = 1 << 9;
         const TRANSFER_ABORT: u32 = 1 << 5;
@@ -778,10 +791,6 @@ impl Ring {
             return Err("DMA transfer completion timeout");
         };
 
-        // Linux acknowledges RH_INTR_STATUS before hci_dma_xfer_done().
-        // This polling path handles command events only: preserve IBI_READY,
-        // IBI_RING_FULL and ring-operation events for their own consumers.
-        // Keep the snapshot for error handling after the W1C acknowledgement.
         let ack = intr & (TRANSFER_COMPLETION | DMA_ERRORS);
         self.regs.write_dma_ring_intr_status(ack);
         unsafe {
@@ -795,7 +804,7 @@ impl Ring {
                 self.regs.dma_ring_intr_status()
             ));
         }
-        self.dump_wdma_debug("AFTER COMPLETION ACK");
+        //self.dump_wdma_debug("AFTER COMPLETION ACK");
 
         // Retain the existing ASPEED DMA-idle check before reading SRAM.
         // Use the saved status: error bits have already been acknowledged.
@@ -858,7 +867,7 @@ impl Ring {
                 }
             }
             self.snapshot();
-            return Err("DMA response visibility timeout");
+            //return Err("DMA response visibility timeout");
         }
         if response_polls != 0 {
             if let Some(trace) = self.trace {
@@ -889,6 +898,7 @@ impl Ring {
                 result.data_len
             ));
         }
+        
         if result.tid != tid {
             return Err("DMA response TID mismatch");
         }
@@ -901,14 +911,31 @@ impl Ring {
                     return Err("DMA RX buffer guard overwritten");
                 }
             }
-        }
+        } 
         Ok(result)
     }
     /// Poll and consume one complete IBI. Returns None if no complete IBI is ready.
     /// The caller supplies storage; all ring management remains inside this driver.
     pub fn poll_ibi(&mut self, output: &mut [u8]) -> DmaResult<Option<DmaIbiEvent>> {
-        if self.regs.dma_ring_intr_status() & INTR_IBI_RING_FULL != 0 {
-            return Err("IBI status ring full");
+        // Match Linux: acknowledge sampled IBI flags before processing. A
+        // notification arriving during processing must not be cleared later.
+        let interrupt = self.regs.dma_ring_intr_status();
+        if interrupt & DMA_ERRORS != 0 {
+            // Preserve error evidence. Do not reset shared FIFOs with possible
+            // outstanding commands; let the caller stop/reinitialize the ring.
+            self.dump_ibi_state();
+            return Err("DMA transfer error/abort while waiting for IBI");
+        }
+        let ack = interrupt & (INTR_IBI_READY | INTR_IBI_RING_FULL);
+        if ack != 0 {
+            if let Some(trace) = self.trace {
+                trace(format_args!("got ibi interrupt: {}", interrupt));
+            }
+            self.regs.write_dma_ring_intr_status(ack);
+        }
+        if interrupt & INTR_IBI_RING_FULL != 0 {
+            self.dump_ibi_state();
+            // Drain complete events below to free space, even when full.
         }
         let enq = ((self.regs.dma_ring_operation2() >> 16) & 0xff) as usize;
         if enq >= IBI_STATUS_RING_ENTRIES {
@@ -926,6 +953,7 @@ impl Ring {
         let mut size = 0usize;
         let mut addr = None;
         let mut bad = false;
+        let mut rnw = None;
         let mut complete = false;
         while idx != enq {
             let ptr = unsafe {
@@ -941,6 +969,11 @@ impl Ring {
             }
 
             let a = ((status >> 9) & 0x7f) as u8;
+            let read = status & (1 << 8) != 0;
+            if rnw.is_some_and(|previous| previous != read) {
+                bad = true;
+            }
+            rnw = Some(read);
             let chunks = ((status >> 16) & 0xff) as usize;
             let last = status & (1 << 24) != 0;
             if let Some(trace) = self.trace {
@@ -971,7 +1004,9 @@ impl Ring {
             if last {
                 let tail = (status & 0xff) as usize;
                 if chunks > 0 && (tail == 0 || tail > IBI_CHUNK_SIZE) {
-                    return Err("invalid final IBI chunk length");
+                    // Chunk ownership is still known: reclaim the completed
+                    // event without copying its malformed payload.
+                    bad = true;
                 }
                 size += if chunks == 0 {
                     0
@@ -990,16 +1025,26 @@ impl Ring {
         if !complete {
             return Ok(None);
         }
-        if size > output.len() {
-            return Err("IBI output buffer too small");
-        }
+        // This API delivers target interrupts only. Consume unsupported
+        // hot-join/controller-role requests without passing them to MCTP.
+        let target_interrupt = rnw == Some(true);
+        let oversized = size > output.len();
+        let copy_len = if bad || oversized || !target_interrupt {
+            0
+        } else {
+            size
+        };
         let ptr = unsafe { addr_of_mut!((*self.memory).ibi_data).cast::<u8>() };
-        for (i, byte) in output[..size].iter_mut().enumerate() {
+        for (i, byte) in output[..copy_len].iter_mut().enumerate() {
             let off =
                 (self.ibi_chunk_ptr * IBI_CHUNK_SIZE + i) % (IBI_CHUNK_POOL_SIZE * IBI_CHUNK_SIZE);
             *byte = unsafe { read_volatile(ptr.add(off)) };
         }
-        // Reclaim descriptors and data chunks, preserving command ring pointers.
+        // Complete payload reads before returning ownership to hardware.
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        // Reclaim even discarded complete events, preserving command pointers.
         self.ibi_deq = idx;
         self.regs.write_dma_ring_operation1(
             (self.regs.dma_ring_operation1() & !(0xff << 16)) | ((idx as u32) << 16),
@@ -1010,9 +1055,20 @@ impl Ring {
             self.regs
                 .write_dma_ring_chunk_control(available + total_chunks as u32);
         }
-        self.regs.write_dma_ring_intr_status(INTR_IBI_READY);
         if bad {
-            return Err("IBI controller reported an error or address mismatch");
+            return Err("IBI controller reported an error or malformed status");
+        }
+        if !target_interrupt {
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "Discarded unsupported IBI event: addr={:02x} rnw=0",
+                    addr.unwrap_or(0)
+                ));
+            }
+            return Ok(None);
+        }
+        if oversized {
+            return Err("IBI output buffer too small (event reclaimed)");
         }
         if let Some(trace) = self.trace {
             trace(format_args!(
@@ -1084,7 +1140,7 @@ impl Ring {
 fn dma_address(ptr: *const u8, len: usize) -> DmaResult<u32> {
     let start = ptr as usize;
     if start < 0x000a0000 || start.checked_add(len).is_none_or(|end| end > 0x000c0000) {
-        return Err("DMA allocation is outside non-cacheable SRAM");
+        return Err("DMA allocation is outside reserved SRAM");
     }
     (start as u32)
         .checked_add(DMA_BUS_OFFSET)

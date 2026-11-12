@@ -43,8 +43,9 @@ SECTIONS
         __bss_end = .;
     } > SRAM
 
-    /* Same non-cacheable SRAM window as target/ast10x0/target.ld.tmpl.
-     * NOLOAD memory is explicitly initialized by the test before ring enable. */
+    /* Reserved CPU-address window, not inherently non-cacheable on G2.
+     * prepare_dma_memory() disables cacheability for its 512 KiB SCU area.
+     * NOLOAD memory is initialized explicitly before ring enable. */
     .dma_nc (NOLOAD) : ALIGN(64)
     {
         __dma_nc_start = .;
