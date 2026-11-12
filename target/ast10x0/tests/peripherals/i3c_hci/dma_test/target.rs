@@ -29,12 +29,6 @@ fn run() -> Result<()> {
         return Err("dma_test supports HCI v1 commands only");
     }
 
-    // Rings exist before the first command, including ENTDAA. There is no
-    // PIO command submission or PIO-to-DMA transition in this test.
-    // SAFETY: no DMA ring is active; standalone test owns SCU.
-    unsafe {
-        bare_metal::i3c_setup::prepare_dma_memory();
-    }
     let ring = Ring::init_with_trace(&core, |args| bare_metal::info!("{}", args))?;
     let sections = core.sections();
     let mut master = I3cHciMaster::new(core.regs(), sections, 12_500_000, |_| {})

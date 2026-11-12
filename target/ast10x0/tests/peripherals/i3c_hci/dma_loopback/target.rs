@@ -57,10 +57,7 @@ fn run() -> Result<()> {
     if core.command_descriptor() != Some(CommandDescriptor::V1) {
         return Err("loopback requires HCI v1");
     }
-    // SAFETY: no DMA ring is active; standalone test owns SCU.
-    unsafe {
-        bare_metal::i3c_setup::prepare_dma_memory();
-    }
+    
     let ring = Ring::init_with_trace(&core, |args| bare_metal::info!("{}", args))?;
     let sections = core.sections();
     let mut master = I3cHciMaster::new(core.regs(), sections, 12_500_000, |_| {})

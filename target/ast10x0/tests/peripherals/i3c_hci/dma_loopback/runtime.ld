@@ -44,7 +44,6 @@ SECTIONS
     } > SRAM
 
     /* Reserved CPU-address window, not inherently non-cacheable on G2.
-     * prepare_dma_memory() disables cacheability for its 512 KiB SCU area.
      * NOLOAD memory is initialized explicitly before ring enable. */
     .dma_nc (NOLOAD) : ALIGN(64)
     {
