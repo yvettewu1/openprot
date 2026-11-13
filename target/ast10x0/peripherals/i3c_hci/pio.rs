@@ -283,8 +283,28 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
 
         let raw = self.regs.pio_response_queue_port();
         let response = TargetResponse::parse(raw);
+        // Log before validation: target errors otherwise disappear before the
+        // loopback can explain a short controller read or a halted target.
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "TARGET HCI{} response={:08x} status={} tid={} received={} ccc={} len={} HC={:08x} PIO={:08x}",
+                self.regs.bus(),
+                raw,
+                response.status,
+                response.tid,
+                response.target_received,
+                response.ccc,
+                response.data_len,
+                self.regs.hc_control(),
+                self.regs.pio_intr_status(),
+            ));
+        }
 
         if !response.success() {
+            if let Some(trace) = self.trace {
+                self.regs
+                    .trace_transfer_state("target completion error", trace);
+            }
             return Err(I3cHciError::Transfer(response.status));
         }
 
@@ -436,13 +456,36 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     }
 
     fn target_queue_command(&mut self, command: HciTargetCommand, data: &[u8]) -> Result<()> {
+        if command.data_len != data.len() {
+            return Err(I3cHciError::InvalidArgs);
+        }
         self.check_errors()?;
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "TARGET HCI{} queue cmd={:08x} tid={} bytes={} payload={:02x?} HC={:08x} PIO={:08x}",
+                self.regs.bus(),
+                command.word,
+                command.tid,
+                data.len(),
+                data,
+                self.regs.hc_control(),
+                self.regs.pio_intr_status()
+            ));
+        }
 
         /*
          * Zephyr queues target TX/IBI data before putting the target
          * descriptor into the command queue.
          */
+        if let Some(trace) = self.trace {
+            self.regs
+                .trace_transfer_state("before target TX fill", trace);
+        }
         self.write_tx_data(data)?;
+        if let Some(trace) = self.trace {
+            self.regs
+                .trace_transfer_state("after target TX fill", trace);
+        }
 
         self.wait_status(STAT_CMD_QUEUE_READY)?;
 
@@ -450,6 +493,21 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
          * Target command descriptors are one word.
          */
         self.regs.write_pio_command_queue_port(command.word);
+        // Publish the queued target transfer before the other local HCI is
+        // allowed to initiate its controller read.
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "TARGET HCI{} queued HC={:08x} PIO={:08x}",
+                self.regs.bus(),
+                self.regs.hc_control(),
+                self.regs.pio_intr_status()
+            ));
+            self.regs
+                .trace_transfer_state("after target command", trace);
+        }
 
         Ok(())
     }

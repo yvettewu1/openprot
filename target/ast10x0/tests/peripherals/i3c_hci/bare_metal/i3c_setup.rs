@@ -259,3 +259,50 @@ pub unsafe fn prepare_and_show(buses: &[u8], hv: bool) {
     }
 }
 
+pub fn display_pio_reg(hci: u32) {
+    let start_addr = 0x74C20000 + (hci * 0x1000);
+
+    for addr in (start_addr..=(start_addr+0x4c)).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        crate::info!("Capability:0x00 [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+    for addr in ((start_addr+0xe0)..=(start_addr+0xfc)).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        crate::info!("PIO [0x{:08x}] = 0x{:08x}", addr, value);
+    } /*
+    for addr in (0x74C20100usize..=0x74C20200).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        crate::info!("DAT [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+    for addr in (0x74C20500usize..=0x74C20600).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        crate::info!("DCT [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+    for addr in (0x74C20d00usize..=0x74C20e00).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        crate::info!("control [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+    for addr in (0x74C20F00usize..=0x74C20ff0).step_by(4) {
+        let value = unsafe {
+            core::ptr::read_volatile(addr as *const u32)
+        };
+
+        crate::info!("ext cap [0x{:08x}] = 0x{:08x}", addr, value);
+    }
+        */
+}

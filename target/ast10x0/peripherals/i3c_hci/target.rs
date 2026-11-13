@@ -143,6 +143,12 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         self
     }
 
+    /// Trace target TX descriptors and raw completion responses.
+    pub fn with_trace(mut self, trace: fn(core::fmt::Arguments<'_>)) -> Self {
+        self.pio = self.pio.with_trace(trace);
+        self
+    }
+
     pub fn configure(&self, config: &HciTargetConfig) -> Result<()> {
         config.validate()?;
 
@@ -161,7 +167,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
          *
          * ASPEED_I3C_CTRL_INIT | INIT_SLV_MODE
          */
-        self.regs.aspeed_init(InitMode::Target);
+        self.regs.aspeed_init(InitMode::Secondary);
 
         let cap_ctrl = self.regs.aspeed_slave_cap_ctrl();
         self.regs.write_aspeed_slave_cap_ctrl(
@@ -176,7 +182,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         self.regs.write_pio_intr_status_enable(u32::MAX);
         // Threshold encoding zero means one DWORD. The controller defaults
         // use half-FIFO thresholds, which strand short target CCC payloads.
-        self.regs.write_pio_data_buffer_thld_ctrl(0);
+        //self.regs.write_pio_data_buffer_thld_ctrl(0);
         self.regs.write_pio_intr_signal_enable(TARGET_PIO_IRQS);
 
         let role = self.regs.aspeed_target_role();

@@ -26,7 +26,9 @@ fn run() -> Result<()> {
         .map_err(|_| "target core creation failed")?;
     peer_core.init().map_err(|_| "target core init failed")?;
     peer_core.disable_irq_signals();
-    let mut peer = I3cHciTarget::new(peer_core.regs(), |_| {}).with_timeout_us(POLLS);
+    let mut peer = I3cHciTarget::new(peer_core.regs(), |_| {})
+        .with_timeout_us(POLLS)
+        .with_trace(|args| bare_metal::info!("{}", args));
     peer.configure(&HciTargetConfig {
         pid: PID,
         bcr: 0x06,
@@ -38,7 +40,12 @@ fn run() -> Result<()> {
     if !peer.role().target {
         return Err("HCI1 is not a target");
     }
-
+    bare_metal::info!(
+        "Target HCI1 ASPEED_CTRL=0x{:08x} ASPEED_STATUS=0x{:08x} INTR_SUMMARY=0x{:08x}",
+        peer_core.regs().aspeed_ctrl(),
+        peer_core.regs().aspeed_status(),
+        peer_core.regs().aspeed_intr_summary()
+    );
     let mut core = unsafe { I3cHciCore::new(I3cHciConfig::dma(0), |_| {}) }
         .map_err(|_| "controller core creation failed")?;
     core.init_primary(8).map_err(|_| "controller init failed")?;
@@ -49,7 +56,7 @@ fn run() -> Result<()> {
         (core.regs().hc_control() >> 31) & 1
     );
     bare_metal::info!(
-        "ASPEED_CTRL=0x{:08x} ASPEED_STATUS=0x{:08x} INTR_SUMMARY=0x{:08x}",
+        "Master HCI0 ASPEED_CTRL=0x{:08x} ASPEED_STATUS=0x{:08x} INTR_SUMMARY=0x{:08x}",
         core.regs().aspeed_ctrl(),
         core.regs().aspeed_status(),
         core.regs().aspeed_intr_summary()
@@ -57,10 +64,21 @@ fn run() -> Result<()> {
     if core.command_descriptor() != Some(CommandDescriptor::V1) {
         return Err("loopback requires HCI v1");
     }
-    
+
+    // Keep the default timing bank consistent with the slow private-transfer
+    // bank, as Zephyr does. In particular, IBI has no submitted command whose
+    // mode field could select SDR4. Do this before DAA/ENEC can enable an IBI.
+    core.regs().aspeed_copy_sdr4_to_sdr0();
+    core.regs().trace_transfer_state("SDR0 aligned with SDR4", |args| {
+        bare_metal::info!("{}", args)
+    });
     let ring = Ring::init_with_trace(&core, |args| bare_metal::info!("{}", args))?;
     let sections = core.sections();
-    let mut master = I3cHciMaster::new(core.regs(), sections, 12_500_000, |_| {})
+    // Diagnostic: select SDR4 instead of SDR0 for the jumper loopback.
+    // This argument selects a timing bank; it does not program a 1 MHz clock.
+    // Log the actual counters rather than claiming a measured bus frequency.
+    bare_metal::info!("Loopback timing diagnostic: SDR4 selected; PHY counters determine SCL rate");
+    let mut master = I3cHciMaster::new(core.regs(), sections, 1_000_000, |_| {})
         .with_dma(ring)
         .map_err(|_| "DMA transport setup failed")?;
     let outcome = (|| -> Result<()> {
@@ -122,8 +140,9 @@ fn run() -> Result<()> {
         for round in 0..ROUNDS {
             let written = [0x11, round, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
             let expected = [0xaa, round, 0xcc, 0xdd, 0xee, 0x12, 0x34, 0x56];
-            master
-                .private_write(device.dat_index, &written)
+            bare_metal::info!("====================== test round{} =====================", round);
+            bare_metal::info!("================master private write================");
+            master.private_write(device.dat_index, &written)
                 .map_err(|e| {
                     bare_metal::error!("DMA write: {:?}", e);
                     "DMA write failed"
@@ -155,24 +174,41 @@ fn run() -> Result<()> {
             bare_metal::info!("core irq status:{:08x}", status);
             bare_metal::info!("ROUND {} DMA WRITE PASS", round);
 
+            bare_metal::info!("================master private read================");
+            bare_metal::i3c_setup::display_pio_reg(1);
+            core.regs().trace_transfer_state("before private read", |args| {
+                bare_metal::info!("{}", args)
+            });
             peer.queue_read_data(&expected)
-                .map_err(|_| "target read queue failed")?;
+                .map_err(|_| "target read queue failed")?;    
+            bare_metal::i3c_setup::spin_sleep(0x10_0000);
             let mut read = [0u8; 8];
-            let result = master
-                .private_read(device.dat_index, &mut read)
+            let result = master.private_read(device.dat_index, &mut read)
                 .map_err(|e| {
                     bare_metal::error!("DMA read: {:?}", e);
                     "DMA read failed"
                 })?;
+            // Print received length and data
+            bare_metal::info!("DMA read rx_len={}", result.rx_len);
+            bare_metal::info!("DMA read data={:02x?}", read);
+            bare_metal::info!("Expected data={:02x?}", expected);
+            // Always collect the target response before interpreting the
+            // master's short read. This preserves the target's actual error.
+            match peer.next_event(&mut peer_rx) {
+                Ok(HciTargetEvent::ReadComplete { len }) => {
+                    bare_metal::info!("TARGET: read completion length={}", len);
+                }
+                Ok(event) => {
+                    bare_metal::error!("Unexpected target read event: {:?}", event);
+                    return Err("unexpected target event after read");
+                }
+                Err(error) => {
+                    bare_metal::error!("Target read completion: {:?}", error);
+                    return Err("target read completion failed");
+                }
+            }
             if result.rx_len != expected.len() || read != expected {
                 return Err("DMA read payload/length mismatch");
-            }
-            match peer
-                .next_event(&mut peer_rx)
-                .map_err(|_| "target read completion failed")?
-            {
-                HciTargetEvent::ReadComplete { .. } => {}
-                _ => return Err("unexpected target event after read"),
             }
             bare_metal::info!("ROUND {} DMA READ PASS", round);
 
@@ -187,16 +223,16 @@ fn run() -> Result<()> {
             let ring = master.dma_ring_mut().ok_or("DMA ring missing")?;
             let mut payload = [0u8; 8];
             let mut got_ibi = false;
+            let mut ibi_matches = false;
             let mut target_done = false;
             for _ in 0..POLLS {
                 if !got_ibi {
                     if let Some(event) = ring.poll_ibi(&mut payload)? {
-                        if event.target_addr != device.dynamic_addr
-                            || event.payload_len != IBI.len()
-                            || payload[..IBI.len()] != IBI
-                        {
-                            return Err("DMA IBI address/payload mismatch");
-                        }
+                        ibi_matches = event.target_addr == device.dynamic_addr
+                            && event.payload_len == IBI.len()
+                            && payload[..IBI.len()] == IBI;
+                        // Consume the target completion even on a malformed
+                        // IBI so its raw error response is not hidden.
                         got_ibi = true;
                     }
                 }
@@ -228,8 +264,11 @@ fn run() -> Result<()> {
             if !target_done {
                 return Err("target IBI completion timeout");
             }
+            if !ibi_matches {
+                return Err("DMA IBI address/payload mismatch");
+            }
             bare_metal::info!("ROUND {} DMA IBI PASS: ae 2b", round);
-        }
+        }//rounds
         Ok(())
     })();
     let ring = master.dma_ring_mut().ok_or("DMA ring missing")?;

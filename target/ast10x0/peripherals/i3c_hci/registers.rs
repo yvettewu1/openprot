@@ -521,6 +521,56 @@ impl I3cHciRegisters {
     pub fn write_dma_ring_ibi_data_base_hi(&self, value: u32) {
         self.regs().hcirhs07c().write(|w| unsafe { w.bits(value) });
     }
+    /// Use the SDR4 timing for SDR0 too, for slow-bus bring-up.
+    /// Call with an idle bus before discovery or enabling target events.
+    /// Zephyr programs both the selected SDR bank and SDR0 in
+    /// mipi_i3c_hci_aspeed_populate_bus_timing. A command's mode selection
+    /// alone does not change the default bank used outside that command.
+    pub fn aspeed_copy_sdr4_to_sdr0(&self) {
+        let regs = self.regs();
+        let scl = regs.i3cphyctrlreg068().read().bits();
+        let tbit = regs.i3cphyctrlreg06c().read().bits();
+        let hold = regs.i3cphyctrlreg070().read().bits();
+        regs.i3cphyctrlreg038().write(|w| unsafe { w.bits(scl) });
+        regs.i3cphyctrlreg03c().write(|w| unsafe { w.bits(tbit) });
+        regs.i3cphyctrlreg040().write(|w| unsafe { w.bits(hold) });
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+    }
+
+    /// Non-destructive snapshots; never read FIFO ports for diagnostics.
+    pub fn trace_transfer_state(&self, stage: &str, trace: fn(core::fmt::Arguments<'_>)) {
+        let queue = self.regs().i3ccontrol0d8().read().bits();
+        trace(format_args!(
+            "HCI{} {} QUEUE_PTR0={:08x} CMD W/R={}/{} TX W/R={}/{} CTRL={:08x}",
+            self.bus,
+            stage,
+            queue,
+            queue & 3,
+            (queue >> 2) & 3,
+            (queue >> 12) & 0x1f,
+            (queue >> 20) & 0x1f,
+            self.aspeed_ctrl()
+        ));
+        trace(format_args!(
+            "HCI{} PHY SDR0 SCL={:08x} TBIT={:08x} HOLD={:08x} TARGET_HOLD={:08x} OPTION={:08x}",
+            self.bus,
+            self.regs().i3cphyctrlreg038().read().bits(),
+            self.regs().i3cphyctrlreg03c().read().bits(),
+            self.regs().i3cphyctrlreg040().read().bits(),
+            self.regs().i3cphyctrlreg090().read().bits(),
+            self.regs().i3cphyctrlreg0cc().read().bits()
+        ));
+        trace(format_args!(
+            "HCI{} PHY SDR4 SCL={:08x} TBIT={:08x} HOLD={:08x}",
+            self.bus,
+            self.regs().i3cphyctrlreg068().read().bits(),
+            self.regs().i3cphyctrlreg06c().read().bits(),
+            self.regs().i3cphyctrlreg070().read().bits()
+        ));
+    }
+
     #[inline]
     pub fn aspeed_ctrl(&self) -> u32 {
         self.regs().i3ccontrol000().read().bits()
