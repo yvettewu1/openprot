@@ -40,6 +40,7 @@ fn run_mctp_write_test() -> Result<(), &'static str> {
 
     let mut core = unsafe { I3cHciCore::new(I3cHciConfig::pio(I3C_BUS), |_us| {}) }
         .map_err(|_| "HCI core create failed")?;
+    core.regs().aspeed_copy_sdr4_to_sdr0();
     core.init_primary(0x08).map_err(|error| {
         bare_metal::error!("HCI core init failed: {:?}", error);
         let _ = bare_metal::i3c_setup::show_registers(core.regs(), "core init failure");

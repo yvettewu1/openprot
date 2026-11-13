@@ -38,50 +38,7 @@ fn ibi_pec(address: u8, mdb: u8) -> u8 {
     crc
 }
 
-fn display_pio_reg() {
-    for addr in (0x74C20000usize..=0x74C200c0).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
 
-        bare_metal::info!("Capability:0x00 [0x{:08x}] = 0x{:08x}", addr, value);
-    }
-    for addr in (0x74C200E0usize..=0x74C200FC).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
-
-        bare_metal::info!("PIO [0x{:08x}] = 0x{:08x}", addr, value);
-    }
-    for addr in (0x74C20100usize..=0x74C20200).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
-
-        bare_metal::info!("DAT [0x{:08x}] = 0x{:08x}", addr, value);
-    }
-    for addr in (0x74C20500usize..=0x74C20600).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
-
-        bare_metal::info!("DCT [0x{:08x}] = 0x{:08x}", addr, value);
-    }
-    for addr in (0x74C20d00usize..=0x74C20e00).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
-
-        bare_metal::info!("control [0x{:08x}] = 0x{:08x}", addr, value);
-    }
-    for addr in (0x74C20F00usize..=0x74C20ff0).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
-
-        bare_metal::info!("ext cap [0x{:08x}] = 0x{:08x}", addr, value);
-    }
-}
 
 fn run_ibi_read_test() -> Result<(), &'static str> {
     bare_metal::info!("=== AST10x0 external AST2700 IBI/private-read test ===");
@@ -89,6 +46,7 @@ fn run_ibi_read_test() -> Result<(), &'static str> {
 
     let mut core = unsafe { I3cHciCore::new(I3cHciConfig::pio(I3C_BUS), |_us| {}) }
         .map_err(|_| "HCI core create failed")?;
+    core.regs().aspeed_copy_sdr4_to_sdr0();
     core.init_primary(0x08).map_err(|error| {
         bare_metal::error!("HCI core init failed: {:?}", error);
         let _ = bare_metal::i3c_setup::show_registers(core.regs(), "core init failure");
@@ -135,7 +93,7 @@ fn run_ibi_read_test() -> Result<(), &'static str> {
     bare_metal::info!(
         "Timeout callback is a no-op: budget counts polling iterations, not calibrated microseconds"
     );
-    let _ = bare_metal::i3c_setup::show_registers(core.regs(), "before ENTDAA");
+    //let _ = bare_metal::i3c_setup::show_registers(core.regs(), "before ENTDAA");
     bare_metal::info!("ENTDAA: entering command submission / response wait");
     let count = match master.entdaa_all(&mut table, &mut dat_allocator) {
         Ok(count) => count,
@@ -162,7 +120,7 @@ fn run_ibi_read_test() -> Result<(), &'static str> {
             return Err("ENTDAA all failed");
         }
     };
-    let _ = bare_metal::i3c_setup::show_registers(core.regs(), "after ENTDAA");
+    //let _ = bare_metal::i3c_setup::show_registers(core.regs(), "after ENTDAA");
     bare_metal::info!("ENTDAA discovered {} I3C devices", count as u32);
     expect(
         count >= EXPECTED_MIN_DEVICES,
@@ -221,8 +179,7 @@ fn run_ibi_read_test() -> Result<(), &'static str> {
     bare_metal::info!("Waiting indefinitely for IBI; transfer timeouts count polling iterations");
     bare_metal::info!("=====================================================");
     core.regs().write_pio_intr_signal_enable(0x226);
-    display_pio_reg();
-
+  
     let received = (|| -> Result<(), &'static str> {
         // Wait without repeatedly consuming status/data or timing out before
         // the operator starts the Linux sender. Transfers themselves are bounded.
