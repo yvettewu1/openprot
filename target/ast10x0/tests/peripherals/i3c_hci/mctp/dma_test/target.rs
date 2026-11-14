@@ -14,8 +14,6 @@ type Result<T> = core::result::Result<T, &'static str>;
 fn run() -> Result<()> {
     bare_metal::info!("=== DMA TEST: DMA discovery, IBI, private read ===");
 
-    bare_metal::i3c_setup::spin_sleep(0x5000_0000);
-
     cortex_m::peripheral::NVIC::mask(ast1080_pac::Interrupt::i3c);
 
     let mut core = unsafe { I3cHciCore::new(I3cHciConfig::dma(0), |_| {}) }
@@ -28,13 +26,13 @@ fn run() -> Result<()> {
     if core.command_descriptor() != Some(CommandDescriptor::V1) {
         return Err("dma_test supports HCI v1 commands only");
     }
-
+    core.regs().aspeed_copy_sdr4_to_sdr0();
     let ring = Ring::init_with_trace(&core, |args| bare_metal::info!("{}", args))?;
     let sections = core.sections();
-    let mut master = I3cHciMaster::new(core.regs(), sections, 12_500_000, |_| {})
+    let mut master = I3cHciMaster::new(core.regs(), sections, 1_000_000, |_| {})
         .with_dma(ring)
         .map_err(|_| "DMA master setup failed")?;
-
+    
     let outcome = (|| -> Result<()> {
         let mut table = HciDeviceTable::<8>::new();
         let mut allocator = DatAllocator::new(sections.dat.entries.min(128) as u8, true);

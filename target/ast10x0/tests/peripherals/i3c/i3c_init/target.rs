@@ -42,6 +42,8 @@ fn yield_spin(_ns: u32) {
 const CORE_CLK_HZ: u32 = 200_000_000;
 /// Target I3C push-pull SCL (12.5 MHz, SDR0).
 const I3C_SCL_HZ: u32 = 12_500_000;
+/// Target I3C push-pull SCL (1 MHz, SDR4).
+const I3C_SCL_1MHZ: u32 = 1_000_000;
 /// Target legacy-I2C SCL (Fast-mode, 400 kHz).
 const I2C_SCL_HZ: u32 = 400_000;
 
