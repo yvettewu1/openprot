@@ -180,7 +180,7 @@ fn run() -> Result<()> {
                 bare_metal::info!("{}", args)
             });
             peer.queue_read_data(&expected)
-                .map_err(|_| "target read queue failed")?;    
+                .map_err(|_| "target queue read payload failed")?;    
             bare_metal::i3c_setup::spin_sleep(0x10_0000);
             let mut read = [0u8; 8];
             let result = master.private_read(device.dat_index, &mut read)
