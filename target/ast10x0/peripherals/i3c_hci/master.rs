@@ -239,11 +239,12 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         self
     }
 
-    /// Use an initialized HCI0 DMA ring for v1 discovery and command transfers.
+    /// Use an initialized HCI0 DMA ring matching the selected command format.
+    /// V2 discovery publishes its PID-read/address-assignment pair together.
     /// IBI polling is available through `dma_ring_mut`; PIO IRQ helpers must not
     /// be used with this transport. The ring currently supports 64-byte buffers.
     pub fn with_dma(mut self, ring: super::dma::Ring) -> Result<Self> {
-        if self.command_descriptor != CommandDescriptor::V1 || self.regs.bus() != 0 {
+        if self.command_descriptor != ring.command_format() || self.regs.bus() != 0 {
             return Err(I3cHciError::Unsupported);
         }
         self.dma = Some(ring);
@@ -476,7 +477,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
 
             match classify_entdaa_response(result.response) {
                 Ok(DaaResponse::Assigned) => {
-                    let dct = match self.read_dct_entry(0) {  
+                    let dct = match self.read_dct_entry(0) {
                         Ok(dct) => dct,
                         Err(error) => {
                             let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
@@ -484,12 +485,9 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                             return Err(error);
                         }
                     };
-                     // Verify that ENTDAA actually discovered a target.
+                    // Verify that ENTDAA actually discovered a target.
                     if dct.pid == 0 {
-                        self.write_dat_entry(
-                            step.dat_index,
-                            DatEntryV1::rejected(),
-                        )?;
+                        self.write_dat_entry(step.dat_index, DatEntryV1::rejected())?;
 
                         dat_allocator.free(step.dat_index)?;
 
@@ -502,7 +500,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                         bcr: dct.bcr,
                         dcr: dct.dcr,
                     };
-                    
+
                     if let Err(error) = table.push(device) {
                         let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
                         let _ = dat_allocator.free(step.dat_index);
@@ -585,13 +583,26 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
     }
 
     fn entdaa_submit_v2(&mut self, dynamic_addr: u8, rx: &mut [u8; 8]) -> Result<DaaResponse> {
-        if self.dma.is_some() {
-            return Err(I3cHciError::Unsupported);
-        }
         let read_tid = self.next_tid();
         let assign_tid = self.next_tid();
         let read = HciCommand::V2(HciCommandV2::daa_read_pid(read_tid, rx.len())?);
         let assign = HciCommand::V2(HciCommandV2::daa_assign_address(assign_tid, dynamic_addr)?);
+        if let Some(ring) = self.dma.as_mut() {
+            let (first, second) = ring.submit_daa_pair(read, assign, rx)?;
+            return match classify_entdaa_response(first)? {
+                DaaResponse::Assigned => {
+                    let response = second.ok_or(I3cHciError::InvalidArgs)?;
+                    if !response.success() {
+                        return Err(I3cHciError::Transfer(response.status));
+                    }
+                    Ok(DaaResponse::Assigned)
+                }
+                DaaResponse::NoMoreDevices => {
+                    ring.recover_after_daa_nack(self.regs)?;
+                    Ok(DaaResponse::NoMoreDevices)
+                }
+            };
+        }
         let result = self.pio.submit_pair_raw(read, assign, rx)?;
 
         match classify_entdaa_response(result.first_response)? {
