@@ -11,6 +11,7 @@ use super::constants;
 use super::error::{I3cHciError, Result};
 use super::irq::IsrCtx;
 use super::registers::I3cHciRegisters;
+use super::types::InitMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoMode {
@@ -135,20 +136,23 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.selected_io
     }
 
-    pub fn init(&mut self) -> Result<()> {
-        self.init_with_primary_addr(None)
+   pub fn init(&mut self) -> Result<()> {
+    self.init_with_mode(None, None)
     }
 
-    /// Initialize the primary-controller role before enabling the bus.
-    /// The caller reserves this address and configures board clocks/PHY timing.
     pub fn init_primary(&mut self, address: u8) -> Result<()> {
         if !super::daa::valid_i3c_address(address) {
             return Err(I3cHciError::InvalidArgs);
         }
-        self.init_with_primary_addr(Some(address))
+
+        self.init_with_mode(Some(InitMode::Primary), Some(address))
     }
 
-    fn init_with_primary_addr(&mut self, primary_addr: Option<u8>) -> Result<()> {
+    pub fn init_secondary(&mut self) -> Result<()> {
+        self.init_with_mode(Some(InitMode::Secondary), None)
+    }
+
+    fn init_with_mode(&mut self, mode:Option<InitMode>, primary_addr: Option<u8>) -> Result<()> {
         self.detect_version()?;
         self.discover_sections()?;
         self.soft_reset()?;
@@ -156,20 +160,24 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.setup_endianness()?;
         self.select_cmd_ops()?;
         self.select_io_ops()?;
-        if let Some(address) = primary_addr {
-            // ASPEED Zephyr vendor init and program_master_addr precede BUS_ENABLE.
-            self.regs.aspeed_init(super::types::InitMode::Primary);
-            self.regs.write_controller_device_addr(
-                constants::MASTER_DYNAMIC_ADDR_VALID
-                    | (u32::from(address) << constants::MASTER_DYNAMIC_ADDR_SHIFT),
-            );
-            // Normal MIPI I3C transfers include the broadcast-address
-            // preamble. Zephyr and Linux enable IBA for a primary controller;
-            // leaving the reset default is appropriate only for other contexts
-            // such as JESD403, which this initialization path does not select.
-            self.regs.set_hc_control(
-                constants::HC_CONTROL_HOT_JOIN_CTRL | constants::HC_CONTROL_IBA_INCLUDE,
-            );
+        if let Some(mode) = mode {
+            self.regs.aspeed_init(mode);
+
+            if let Some(address) = primary_addr {
+                // ASPEED Zephyr vendor init and program_master_addr precede BUS_ENABLE.
+                self.regs.aspeed_init(super::types::InitMode::Primary);
+                self.regs.write_controller_device_addr(
+                    constants::MASTER_DYNAMIC_ADDR_VALID
+                        | (u32::from(address) << constants::MASTER_DYNAMIC_ADDR_SHIFT),
+                );
+                // Normal MIPI I3C transfers include the broadcast-address
+                // preamble. Zephyr and Linux enable IBA for a primary controller;
+                // leaving the reset default is appropriate only for other contexts
+                // such as JESD403, which this initialization path does not select.
+                self.regs.set_hc_control(
+                    constants::HC_CONTROL_HOT_JOIN_CTRL | constants::HC_CONTROL_IBA_INCLUDE,
+                );
+            }
         }
         self.configure_polling_status();
         self.enable_bus()?;

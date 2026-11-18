@@ -24,7 +24,7 @@ fn run() -> Result<()> {
 
     let mut peer_core = unsafe { I3cHciCore::new(I3cHciConfig::pio(1), |_| {}) }
         .map_err(|_| "target core creation failed")?;
-    peer_core.init().map_err(|_| "target core init failed")?;
+    peer_core.init_secondary().map_err(|_| "target core init failed")?;
     peer_core.disable_irq_signals();
     let mut peer = I3cHciTarget::new(peer_core.regs(), |_| {})
         .with_timeout_us(POLLS)

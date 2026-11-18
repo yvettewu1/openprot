@@ -38,6 +38,7 @@ pub struct RhsInfo {
     pub ring_headers_offset: u16,
 }
 
+
 #[must_use]
 pub const fn parse_rhs_control(control: u32, ring_headers_offset: u16) -> RhsInfo {
     RhsInfo {
@@ -196,6 +197,7 @@ const MAX_STRIDE: usize = 256;
 // Controller v1: two command words plus three data-buffer words.
 // A 16-byte hardware stride indicates target/secondary command format.
 const MIN_XFER_STRUCT_SIZE: usize = 20;
+const MIN_TARGET_XFER_STRUCT_SIZE: usize = 16;
 
 // Match the Zephyr ASPEED I3C vendor DMA hook for non-AST27XX:
 // pass the buffer address unchanged. The generic G2 CM4 address translator
@@ -211,7 +213,7 @@ const DMA_ERRORS: u32 = (1 << 9) | (1 << 5);
 struct DmaMemory {
     commands: [u32; ENTRIES * MAX_STRIDE / 4],
     responses: [u32; ENTRIES * MAX_STRIDE / 4],
-    tx: [u8; 64],
+    tx: [u8; ENTRIES * 64],
     rx: [u8; 64],
 
     ibi_status: [u32; IBI_STATUS_RING_ENTRIES * IBI_STATUS_MAX_STRIDE / 4],
@@ -222,14 +224,32 @@ struct DmaMemory {
 static mut DMA_MEMORY: DmaMemory = DmaMemory {
     commands: [0; ENTRIES * MAX_STRIDE / 4],
     responses: [0; ENTRIES * MAX_STRIDE / 4],
-    tx: [0; 64],
+    tx: [0; ENTRIES * 64],
     rx: [0; 64],
     ibi_status: [0; IBI_STATUS_RING_ENTRIES * IBI_STATUS_MAX_STRIDE / 4],
     ibi_data: [0; IBI_CHUNK_SIZE * IBI_CHUNK_POOL_SIZE],
 };
 
+// Independent backing storage: HCI0 and HCI1 must never share DMA descriptors.
+#[unsafe(link_section = ".dma_nc")]
+static mut DMA_MEMORY_HCI1: DmaMemory = DmaMemory {
+    commands: [0; ENTRIES * MAX_STRIDE / 4],
+    responses: [0; ENTRIES * MAX_STRIDE / 4],
+    tx: [0; ENTRIES * 64],
+    rx: [0; 64],
+    ibi_status: [0; IBI_STATUS_RING_ENTRIES * IBI_STATUS_MAX_STRIDE / 4],
+    ibi_data: [0; IBI_CHUNK_SIZE * IBI_CHUNK_POOL_SIZE],
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaMode {
+    Controller,
+    Target,
+}
+
 pub struct Ring {
     regs: I3cHciRegisters,
+    mode: DmaMode,
     memory: *mut DmaMemory,
     command_stride: usize,
     response_stride: usize,
@@ -237,6 +257,8 @@ pub struct Ring {
     ibi_stride: usize,
     ibi_deq: usize,
     ibi_chunk_ptr: usize,
+    target_resp_deq: usize,
+    target_queued: [bool; ENTRIES],
     trace: Option<fn(core::fmt::Arguments<'_>)>,
 }
 
@@ -244,6 +266,25 @@ pub struct Ring {
 pub struct DmaIbiEvent {
     pub target_addr: u8,
     pub payload_len: usize,
+}
+
+
+/// Raw target response, including the target-specific response flags.
+#[derive(Debug, Clone, Copy)]
+pub struct DmaTargetResponse {
+    pub raw: u32,
+    pub tid: u8,
+    pub status: u8,
+    pub data_len: usize,
+}
+
+/// Target RX record received through the DMA IBI status/data ring.
+#[derive(Debug, Clone, Copy)]
+pub struct DmaTargetRx {
+    pub len: usize,
+    pub ccc: bool,
+    pub ccc_hdr: u8,
+    pub raw_status: u32,
 }
 
 impl Ring {
@@ -391,9 +432,12 @@ impl Ring {
         F: FnMut(u32),
     {
         let regs = core.regs();
-        if regs.bus() != 0 {
-            return Err("DMA ring currently supports HCI0 only");
-        }
+        // TODO:: need to use the InitMode instead of DmaMode
+        let mode = match regs.bus() {
+            0 => DmaMode::Controller,
+            1 => DmaMode::Target,
+            _ => return Err("unsupported DMA bus"),
+        };
         let sections = core.sections();
         let rhs = sections.ring_headers_offset as usize;
         if rhs != 0x800 {
@@ -410,13 +454,20 @@ impl Ring {
             // SAFETY: this facade is used synchronously with the core/master
             // under their existing unique, serialized controller ownership.
             regs: unsafe { I3cHciRegisters::new(regs.bus()) }.ok_or("invalid DMA bus")?,
-            memory: addr_of_mut!(DMA_MEMORY),
+            mode,
+            memory: if mode == DmaMode::Controller {
+                addr_of_mut!(DMA_MEMORY)
+            } else {
+                addr_of_mut!(DMA_MEMORY_HCI1)
+            },
             command_stride: 0,
             response_stride: 0,
             next: 0,
             ibi_stride: 0,
             ibi_deq: 0,
             ibi_chunk_ptr: 0,
+            target_resp_deq: 0,
+            target_queued: [false; ENTRIES],
             trace,
         };
         if ring.regs.dma_ring_status() & 3 != 0 {
@@ -425,7 +476,11 @@ impl Ring {
         let (command_stride, response_stride) = ring.regs.dma_descriptor_sizes();
         ring.command_stride = command_stride as usize;
         ring.response_stride = response_stride as usize;
-        if ring.command_stride < MIN_XFER_STRUCT_SIZE
+        let min_stride = match mode {
+            DmaMode::Controller => MIN_XFER_STRUCT_SIZE,
+            DmaMode::Target => MIN_TARGET_XFER_STRUCT_SIZE,
+        };
+        if ring.command_stride < min_stride
             || ring.command_stride > MAX_STRIDE
             || ring.command_stride % 4 != 0
             || ring.response_stride < 4
@@ -513,14 +568,42 @@ impl Ring {
         ring.wait(I3cHciRegisters::dma_ring_status, 3, 3)?;
         if let Some(trace) = ring.trace {
             trace(format_args!(
-                "DMA ring0 offset={:04x} cmd_stride={} resp_stride={} cmd={:08x} resp={:08x}",
-                offset, ring.command_stride, ring.response_stride, cmd_addr, resp_addr
+                "DMA {:?} ring0 offset={:04x} cmd_stride={} resp_stride={} cmd={:08x} resp={:08x}",
+                mode, offset, ring.command_stride, ring.response_stride, cmd_addr, resp_addr
             ));
         }
         Ok(ring)
     }
+    /// Mode selected from the HCI bus instance at initialization.
+    pub const fn mode(&self) -> DmaMode {
+        self.mode
+    }
+
+    /// Target DMA command encoding and event dispatch are not interchangeable
+    /// with controller DMA. Reject controller transfers on a target ring.
+    fn require_controller(&self) -> DmaResult<()> {
+        if self.mode != DmaMode::Controller {
+            return Err("controller DMA operation on target ring");
+        }
+        Ok(())
+    }
+
+    /// Report raw target DMA ring pointers for initial HCI1 bring-up.
+    pub fn target_ring_pointers(&self) -> DmaResult<(u32, u32, u32, u32)> {
+        if self.mode != DmaMode::Target {
+            return Err("not a target DMA ring");
+        }
+        Ok((
+            self.regs.dma_ring_operation1(),
+            self.regs.dma_ring_operation2(),
+            self.regs.dma_ring_intr_status(),
+            self.regs.dma_ring_status(),
+        ))
+    }
+
     /// Submit without interpreting response status: DAA's final NACK is expected.
     pub(crate) fn submit_raw(&mut self, transfer: HciTransfer<'_>) -> Result<HciTransferResult> {
+        self.require_controller().map_err(|_| I3cHciError::Unsupported)?;
         validate_transfer(&transfer)?;
         let super::cmd::HciCommand::V1(command) = transfer.command else {
             return Err(I3cHciError::Unsupported);
@@ -579,6 +662,7 @@ impl Ring {
         read: bool,
         xfer_data: &[u8],
     ) -> DmaResult<HciResponse> {
+        self.require_controller()?;
         let result = self.transfer_raw(command, tid, read, xfer_data)?;
         if !result.success() {
             return Err("DMA response reports transfer failure");
@@ -656,6 +740,9 @@ impl Ring {
         let len = xfer_data.len();
         if len > 64 {
             return Err("DMA transfer exceeds 64-byte buffer");
+        }
+        if self.mode != DmaMode::Controller {
+            return Err("controller transfer called on target DMA ring");
         }
         let slot = self.next;
         if self.regs.dma_ring_operation2() & 0xff != slot as u32 {
@@ -867,7 +954,7 @@ impl Ring {
                 }
             }
             self.snapshot();
-            //return Err("DMA response visibility timeout");
+            return Err("DMA response visibility timeout");
         }
         if response_polls != 0 {
             if let Some(trace) = self.trace {
@@ -917,6 +1004,10 @@ impl Ring {
     /// Poll and consume one complete IBI. Returns None if no complete IBI is ready.
     /// The caller supplies storage; all ring management remains inside this driver.
     pub fn poll_ibi(&mut self, output: &mut [u8]) -> DmaResult<Option<DmaIbiEvent>> {
+        if self.mode != DmaMode::Controller {
+            return Err("controller IBI polling called on target DMA ring");
+        }
+        self.require_controller()?;
         // Match Linux: acknowledge sampled IBI flags before processing. A
         // notification arriving during processing must not be cleared later.
         let interrupt = self.regs.dma_ring_intr_status();
@@ -1083,6 +1174,282 @@ impl Ring {
             payload_len: size,
         }))
     }
+
+
+    /// Queue a v1 target DMA descriptor without waiting for a bus transaction.
+    /// `command_word` is the target-format command (not a controller v1 command).
+    /// This function owns a separate 64-byte DMA buffer per outstanding slot.
+    pub fn target_queue_command(&mut self, command_word: u32, data: &[u8]) -> DmaResult<usize> {
+        if self.mode != DmaMode::Target {
+            return Err("target DMA command requires HCI1 target ring");
+        }
+        if data.len() > 64 {
+            return Err("target DMA payload exceeds 64 bytes");
+        }
+        let slot = self.next;
+        if self.target_queued[slot] {
+            return Err("target DMA command ring full");
+        }
+        let tx = unsafe { addr_of_mut!((*self.memory).tx).cast::<u8>().add(slot * 64) };
+        for i in 0..64 {
+            unsafe { write_volatile(tx.add(i), data.get(i).copied().unwrap_or(0)) };
+        }
+        let addr = if data.is_empty() { 0 } else { dma_address(tx, 64)? };
+        let desc = unsafe {
+            addr_of_mut!((*self.memory).commands).cast::<u8>()
+                .add(slot * self.command_stride).cast::<u32>()
+        };
+        let resp = unsafe {
+            addr_of_mut!((*self.memory).responses).cast::<u8>()
+                .add(slot * self.response_stride).cast::<u32>()
+        };
+        // HCI v1 target: one command word and three data-buffer words.
+        // Data buffer descriptor: IOC (bit 30) and length (bits 21:0).
+        let words = [command_word, (1u32 << 30) | data.len() as u32, addr, 0];
+        for i in 0..self.command_stride / 4 {
+            unsafe { write_volatile(desc.add(i), words.get(i).copied().unwrap_or(0)) };
+        }
+        unsafe {
+            write_volatile(resp, 0xffff_ffff);
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        let next = (slot + 1) % ENTRIES;
+        let op = self.regs.dma_ring_operation1();
+        self.regs.write_dma_ring_operation1((op & !0xff) | next as u32);
+        self.target_queued[slot] = true;
+        self.next = next;
+        if let Some(trace) = self.trace {
+            trace(format_args!("target DMA queued slot={} cmd={:08x} len={} addr={:08x}",
+                slot, command_word, data.len(), addr));
+        }
+        Ok(slot)
+    }
+    fn target_advance_ibi_status(
+        &mut self,
+        next_deq: usize,
+        chunks: usize,
+        ) {
+            self.ibi_deq = next_deq;
+
+            self.regs.write_dma_ring_operation1(
+                (self.regs.dma_ring_operation1() & !(0xff << 16))
+                    | ((next_deq as u32) << 16),
+            );
+
+            if chunks > 0 {
+                self.ibi_chunk_ptr =
+                    (self.ibi_chunk_ptr + chunks) % IBI_CHUNK_POOL_SIZE;
+
+                self.regs.write_dma_ring_chunk_control(
+                    self.regs.dma_ring_chunk_control() + chunks as u32,
+                );
+            }
+        }
+    
+    pub fn target_poll_rx(
+        &mut self,
+        output: &mut [u8],
+    ) -> DmaResult<Option<DmaTargetRx>> {
+        if self.mode != DmaMode::Target {
+            return Err("target RX polling requires HCI1 target ring");
+        }
+
+        let intr = self.regs.dma_ring_intr_status();
+        if intr & DMA_ERRORS != 0 {
+            self.snapshot();
+            return Err("target DMA RX error");
+        }
+
+        // OP2[23:16] is the hardware status enqueue pointer.
+        let enq = ((self.regs.dma_ring_operation2() >> 16) & 0xff) as usize;
+
+        if enq >= IBI_STATUS_RING_ENTRIES {
+            return Err("invalid target RX status enqueue pointer");
+        }
+
+        if enq == self.ibi_deq {
+            return Ok(None);
+        }
+
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        // Process one target response descriptor per call.
+        let idx = self.ibi_deq;
+        let ptr = unsafe {
+            addr_of_mut!((*self.memory).ibi_status)
+                .cast::<u8>()
+                .add(idx * self.ibi_stride)
+                .cast::<u32>()
+        };
+
+        let raw = unsafe { read_volatile(ptr) };
+
+        // MIPI I3C HCI target response descriptor.
+        let status = ((raw >> 28) & 0x0f) as u8;
+        let received = (raw & (1 << 27)) != 0;
+        let ccc = (raw & (1 << 26)) != 0;
+        let ccc_hdr = ((raw >> 16) & 0xff) as u8;
+        let len = (raw & 0xffff) as usize;
+
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "HCI1 target RX[{}] raw={:08x} status={} received={} ccc={} hdr={:02x} len={}",
+                idx, raw, status, received, ccc, ccc_hdr, len
+            ));
+        }
+
+        if status != 0 {
+            return Err("target RX response reports error");
+        }
+
+        if !received {
+            return Err("unexpected target RX transfer direction");
+        }
+
+        // Target-mode chunk count comes from data length,
+        // not from bits [23:16].
+        let chunks = (len + IBI_CHUNK_SIZE - 1) / IBI_CHUNK_SIZE;
+
+        if chunks > IBI_CHUNK_POOL_SIZE {
+            return Err("target RX chunk count invalid");
+        }
+
+        if len > output.len() {
+            return Err("target RX output buffer too small");
+        }
+
+        let base = unsafe {
+            addr_of_mut!((*self.memory).ibi_data).cast::<u8>()
+        };
+
+        for (i, byte) in output[..len].iter_mut().enumerate() {
+            let offset =
+                (self.ibi_chunk_ptr * IBI_CHUNK_SIZE + i)
+                    % (IBI_CHUNK_POOL_SIZE * IBI_CHUNK_SIZE);
+
+            *byte = unsafe { read_volatile(base.add(offset)) };
+        }
+
+        // Finish reading DMA memory before returning ownership.
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        let next = (idx + 1) % IBI_STATUS_RING_ENTRIES;
+
+        self.target_advance_ibi_status(next, chunks);
+
+        self.regs.write_dma_ring_intr_status(
+            intr & (INTR_IBI_READY | INTR_IBI_RING_FULL),
+        );
+
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "HCI1 RX complete: raw={:08x} ccc={} hdr={:02x} len={} chunks={}",
+                raw, ccc, ccc_hdr, len, chunks
+            ));
+        }
+
+        Ok(Some(DmaTargetRx {
+            len,
+            ccc,
+            ccc_hdr,
+            raw_status: raw,
+        }))
+    }
+    
+    /// Poll one target command completion, independently of incoming private writes.    
+    pub fn target_poll_response(
+        &mut self,
+    ) -> DmaResult<Option<DmaTargetResponse>> {
+        if self.mode != DmaMode::Target {
+            return Err("target response polling requires HCI1 target ring");
+        }
+
+        let intr = self.regs.dma_ring_intr_status();
+
+        if intr & DMA_ERRORS != 0 {
+            self.snapshot();
+            return Err("target DMA transfer error or abort");
+        }
+
+        let slot = self.target_resp_deq;
+
+        if !self.target_queued[slot] {
+            return Ok(None);
+        }
+
+        // Zephyr: RING_OP2_CR_DEQ_PTR.
+        // OP2[7:0] is the hardware command dequeue pointer.
+        let hw_deq = (self.regs.dma_ring_operation2() & 0xff) as usize;
+
+        if hw_deq >= ENTRIES {
+            return Err("invalid target DMA command dequeue pointer");
+        }
+
+        if slot == hw_deq {
+            return Ok(None);
+        }
+
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
+
+        let ptr = unsafe {
+            addr_of_mut!((*self.memory).responses)
+                .cast::<u8>()
+                .add(slot * self.response_stride)
+                .cast::<u32>()
+        };
+
+        let raw = unsafe { read_volatile(ptr) };
+
+        if raw == 0xffff_ffff {
+            return Ok(None);
+        }
+
+        // Target response format from Zephyr cmd.h.
+        let result = DmaTargetResponse {
+            raw,
+            tid: ((raw >> 24) & 0x03) as u8,
+            status: ((raw >> 28) & 0x0f) as u8,
+            data_len: (raw & 0xffff) as usize,
+        };
+
+        let next = (slot + 1) % ENTRIES;
+
+        // OP1[15:8] = software command/response dequeue pointer.
+        self.regs.write_dma_ring_operation1(
+            (self.regs.dma_ring_operation1() & !0xff00)
+                | ((next as u32) << 8),
+        );
+
+        self.target_queued[slot] = false;
+        self.target_resp_deq = next;
+
+        self.regs.write_dma_ring_intr_status(intr & (1 << 11));
+
+        if let Some(trace) = self.trace {
+            trace(format_args!(
+                "HCI1 target DMA response slot={} raw={:08x} tid={} status={} len={} hw_deq={}",
+                slot,
+                result.raw,
+                result.tid,
+                result.status,
+                result.data_len,
+                hw_deq,
+            ));
+        }
+
+        Ok(Some(result))
+    }
+
+
+    /// Receive one target-side write/CCC through the IBI status/data DMA ring.
+    /// In target mode these ring entries are not controller-originated IBIs.
+    //github.com/AspeedTech-BMC/zephyr/blob/aspeed-main-v3.7.0/drivers/i3c/mipi_hci/target.c
 
     /// Called only after consuming the final DAA NACK, with no queued work.
     pub(crate) fn recover_after_daa_nack(&mut self, regs: &I3cHciRegisters) -> Result<()> {
