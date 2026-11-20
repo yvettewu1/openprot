@@ -204,6 +204,36 @@ const MIN_TARGET_XFER_STRUCT_SIZE: usize = 16;
 // is not called by that I3C hook. Keep cacheability separate from addressing.
 const DMA_BUS_OFFSET: u32 = 0;
 
+// Per-ring allocation pool. Two pools plus descriptor/IBI storage fit the
+// board's 128 KiB DMA_NC region, leaving space for alignment and other users.
+// This is a total SRAM budget, not a per-transfer or per-slot size.
+const DMA_PAYLOAD_POOL_SIZE: usize = 48 * 1024;
+
+#[derive(Clone, Copy)]
+struct PayloadAllocation {
+    offset: usize,
+    len: usize,
+}
+
+/// First-fit allocation among the at most ENTRIES live command buffers.
+fn payload_offset(live: &[Option<PayloadAllocation>; ENTRIES], len: usize) -> Option<usize> {
+    let mut offset = 0usize;
+    loop {
+        let end = offset.checked_add(len)?;
+        if end > DMA_PAYLOAD_POOL_SIZE {
+            return None;
+        }
+        let overlap = live
+            .iter()
+            .flatten()
+            .find(|a| a.len != 0 && offset < a.offset + a.len && a.offset < end);
+        match overlap {
+            Some(a) => offset = a.offset + a.len,
+            None => return Some(offset),
+        }
+    }
+}
+
 const ENABLE_RUN: u32 = 3;
 const ABORT: u32 = 4;
 const RUNNING: u32 = 2;
@@ -213,19 +243,20 @@ const DMA_ERRORS: u32 = (1 << 9) | (1 << 5);
 struct DmaMemory {
     commands: [u32; ENTRIES * MAX_STRIDE / 4],
     responses: [u32; ENTRIES * MAX_STRIDE / 4],
-    tx: [u8; ENTRIES * 64],
-    rx: [u8; 64],
+    payload: [u8; DMA_PAYLOAD_POOL_SIZE],
 
     ibi_status: [u32; IBI_STATUS_RING_ENTRIES * IBI_STATUS_MAX_STRIDE / 4],
     ibi_data: [u8; IBI_CHUNK_SIZE * IBI_CHUNK_POOL_SIZE],
 }
 
+// Keep both HCI instances within the board's reserved DMA region.
+const _: () = assert!(2 * core::mem::size_of::<DmaMemory>() <= 128 * 1024);
+
 #[unsafe(link_section = ".dma_nc")]
 static mut DMA_MEMORY: DmaMemory = DmaMemory {
     commands: [0; ENTRIES * MAX_STRIDE / 4],
     responses: [0; ENTRIES * MAX_STRIDE / 4],
-    tx: [0; ENTRIES * 64],
-    rx: [0; 64],
+    payload: [0; DMA_PAYLOAD_POOL_SIZE],
     ibi_status: [0; IBI_STATUS_RING_ENTRIES * IBI_STATUS_MAX_STRIDE / 4],
     ibi_data: [0; IBI_CHUNK_SIZE * IBI_CHUNK_POOL_SIZE],
 };
@@ -235,8 +266,7 @@ static mut DMA_MEMORY: DmaMemory = DmaMemory {
 static mut DMA_MEMORY_HCI1: DmaMemory = DmaMemory {
     commands: [0; ENTRIES * MAX_STRIDE / 4],
     responses: [0; ENTRIES * MAX_STRIDE / 4],
-    tx: [0; ENTRIES * 64],
-    rx: [0; 64],
+    payload: [0; DMA_PAYLOAD_POOL_SIZE],
     ibi_status: [0; IBI_STATUS_RING_ENTRIES * IBI_STATUS_MAX_STRIDE / 4],
     ibi_data: [0; IBI_CHUNK_SIZE * IBI_CHUNK_POOL_SIZE],
 };
@@ -260,6 +290,7 @@ pub struct Ring {
     ibi_chunk_ptr: usize,
     target_resp_deq: usize,
     target_queued: [bool; ENTRIES],
+    payloads: [Option<PayloadAllocation>; ENTRIES],
     trace: Option<fn(core::fmt::Arguments<'_>)>,
 }
 
@@ -471,6 +502,7 @@ impl Ring {
             ibi_chunk_ptr: 0,
             target_resp_deq: 0,
             target_queued: [false; ENTRIES],
+            payloads: [None; ENTRIES],
             trace,
         };
         if ring.regs.dma_ring_status() & 3 != 0 {
@@ -611,6 +643,27 @@ impl Ring {
         self.command_format
     }
 
+    fn allocate_payload(&mut self, slot: usize, len: usize) -> DmaResult<*mut u8> {
+        if self.payloads[slot].is_some() {
+            return Err("DMA slot still owns a payload buffer; reinitialize after failed transfer");
+        }
+        let aligned = len.checked_add(3).ok_or("DMA payload length overflow")? & !3;
+        let offset = payload_offset(&self.payloads, aligned).ok_or("DMA payload SRAM exhausted")?;
+        let pointer = unsafe {
+            addr_of_mut!((*self.memory).payload)
+                .cast::<u8>()
+                .add(offset)
+        };
+        if len != 0 {
+            dma_address(pointer, len)?;
+        }
+        self.payloads[slot] = Some(PayloadAllocation {
+            offset,
+            len: aligned,
+        });
+        Ok(pointer)
+    }
+
     // CPU pointers only: bus address translation remains in dma_address().
     // Callers validate ring slots before accessing these descriptors.
     fn command_ptr(&self, slot: usize) -> *mut u32 {
@@ -668,17 +721,16 @@ impl Ring {
         } else {
             transfer.tx.len()
         };
-        if len > 64 || (read && !transfer.tx.is_empty()) || (!read && !transfer.rx.is_empty()) {
+        if (read && !transfer.tx.is_empty()) || (!read && !transfer.rx.is_empty()) {
             return Err(I3cHciError::InvalidArgs);
         }
-        let placeholder = [0u8; 64];
         let data = if read {
-            &placeholder[..len]
+            &transfer.rx[..len]
         } else {
             transfer.tx
         };
-        let response = self
-            .transfer_raw(command, command.tid(), read, data)
+        let (response, buffer) = self
+            .transfer_buffered(command, command.tid(), read, data)
             .map_err(|message| {
                 if let Some(trace) = self.trace {
                     trace(format_args!("DMA submit failed: {}", message));
@@ -688,7 +740,7 @@ impl Ring {
                 {
                     I3cHciError::Timeout
                 } else {
-                    I3cHciError::TransferStatus(self.regs.dma_ring_intr_status())
+                    I3cHciError::Dma(message)
                 }
             })?;
         let rx_len = if read && response.success() {
@@ -700,7 +752,7 @@ impl Ring {
             return Err(I3cHciError::NoSpace);
         }
         for (i, byte) in transfer.rx[..rx_len].iter_mut().enumerate() {
-            *byte = unsafe { read_volatile(addr_of_mut!((*self.memory).rx).cast::<u8>().add(i)) };
+            *byte = unsafe { read_volatile(buffer.add(i)) };
         }
         Ok(HciTransferResult { response, rx_len })
     }
@@ -737,11 +789,10 @@ impl Ring {
         if self.regs.dma_ring_operation2() & 0xff != start as u32 {
             return Err(I3cHciError::Busy);
         }
-        let buffer = unsafe { addr_of_mut!((*self.memory).rx).cast::<u8>() };
-        let address = dma_address(buffer, 64).map_err(|_| I3cHciError::InvalidArgs)?;
-        for i in 0..64 {
-            unsafe { write_volatile(buffer.add(i), 0xa5) };
-        }
+        let buffer = self
+            .allocate_payload(start, rx.len())
+            .map_err(I3cHciError::Dma)?;
+        let address = dma_address(buffer, rx.len()).map_err(|_| I3cHciError::InvalidArgs)?;
         let mut responses = [core::ptr::null_mut::<u32>(); 2];
         for (index, (slot, command, data)) in
             [(start, first, &[0u8; 8][..]), (assign, second, &[][..])]
@@ -821,6 +872,7 @@ impl Ring {
                             raw, stopped
                         ));
                     }
+                    self.payloads[start] = None;
                     return Ok((first_response, None));
                 }
                 let second_raw = unsafe { read_volatile(responses[1]) };
@@ -839,11 +891,6 @@ impl Ring {
                     for (i, byte) in rx.iter_mut().enumerate() {
                         *byte = unsafe { read_volatile(buffer.add(i)) };
                     }
-                    for i in rx.len()..64 {
-                        if unsafe { read_volatile(buffer.add(i)) } != 0xa5 {
-                            return Err(I3cHciError::NoSpace);
-                        }
-                    }
                     self.regs.write_dma_ring_operation1(
                         (self.regs.dma_ring_operation1() & !0xff00) | ((end as u32) << 8),
                     );
@@ -854,6 +901,7 @@ impl Ring {
                             raw, second_raw, rx
                         ));
                     }
+                    self.payloads[start] = None;
                     return Ok((first_response, Some(second_response)));
                 }
             }
@@ -873,7 +921,8 @@ impl Ring {
         xfer_data: &[u8],
     ) -> DmaResult<HciResponse> {
         self.require_controller()?;
-        let result = self.transfer_raw(HciCommand::V1(command), tid, read, xfer_data)?;
+        let (result, buffer) =
+            self.transfer_buffered(HciCommand::V1(command), tid, read, xfer_data)?;
         if !result.success() {
             return Err("DMA response reports transfer failure");
         }
@@ -882,8 +931,7 @@ impl Ring {
                 return Err("DMA read length mismatch");
             }
             for (i, expected) in xfer_data.iter().enumerate() {
-                let actual =
-                    unsafe { read_volatile(addr_of_mut!((*self.memory).rx).cast::<u8>().add(i)) };
+                let actual = unsafe { read_volatile(buffer.add(i)) };
                 if actual != *expected {
                     return Err("DMA read payload mismatch");
                 }
@@ -957,62 +1005,68 @@ impl Ring {
         ]
     }
 
-    fn transfer_raw(
+    /// Allocate the requested payload length in reserved SRAM. Keep allocation
+    /// ownership after submission errors; hardware may still reference it.
+    /// Reinitialization after stopping the ring reclaims quarantined buffers.
+    fn transfer_buffered(
         &mut self,
         command: HciCommand,
         tid: u8,
         read: bool,
-        xfer_data: &[u8],
-    ) -> DmaResult<HciResponse> {
+        data: &[u8],
+    ) -> DmaResult<(HciResponse, *mut u8)> {
+        self.require_controller()?;
         if !self.accepts_command(command) {
             return Err("DMA command format does not match hardware");
         }
-        let len = xfer_data.len();
-        if len > 64 {
-            return Err("DMA transfer exceeds 64-byte buffer");
+        if self.regs.dma_ring_operation2() & 0xff != self.next as u32 {
+            return Err("DMA ring has outstanding work");
         }
-        if self.mode != DmaMode::Controller {
-            return Err("controller transfer called on target DMA ring");
+        let slot = self.next;
+        let buffer = self.allocate_payload(slot, data.len())?;
+        // RX is written by hardware. TX copies only the actual payload:
+        // neither direction needs diagnostic fill or padding initialization.
+        if !read {
+            for (i, &byte) in data.iter().enumerate() {
+                unsafe { write_volatile(buffer.add(i), byte) };
+            }
+        }
+        let address = if data.is_empty() {
+            0
+        } else {
+            dma_address(buffer, data.len())?
+        };
+        let words = Self::prepare_dma_command_words(command, read, data, address);
+        let result = self.transfer_raw(command, tid, &words[..command.words().len() + 3])?;
+        if read && result.success() && result.data_len > data.len() {
+            return Err("DMA read exceeds requested buffer");
+        }
+        // Completion made this allocation reusable. The returned pointer is
+        // consumed synchronously before another &mut self submission can occur.
+        self.payloads[slot] = None;
+        Ok((result, buffer))
+    }
+
+    /// Submit a prepared descriptor and consume its response. Buffer ownership,
+    /// DMA mapping and lifetime are established by the caller before entry.
+    /// No payload allocation, initialization or content validation belongs here.
+    fn transfer_raw(
+        &mut self,
+        command: HciCommand,
+        tid: u8,
+        words: &[u32],
+    ) -> DmaResult<HciResponse> {
+        self.require_controller()?;
+        if !self.accepts_command(command) {
+            return Err("DMA command format does not match hardware");
+        }
+        if words.len() > self.command_stride / 4 {
+            return Err("DMA descriptor exceeds command stride");
         }
         let slot = self.next;
         if self.regs.dma_ring_operation2() & 0xff != slot as u32 {
             return Err("DMA ring has outstanding work");
         }
-        let buffer = unsafe {
-            if read {
-                addr_of_mut!((*self.memory).rx).cast::<u8>()
-            } else {
-                addr_of_mut!((*self.memory).tx).cast::<u8>()
-            }
-        };
-        for i in 0..64 {
-            let value = if read {
-                0xa5
-            } else {
-                xfer_data.get(i).copied().unwrap_or(0)
-            };
-            unsafe {
-                write_volatile(buffer.add(i), value);
-            }
-        }
-        let address = dma_address(buffer, 64)?;
-
-        // Print the actual DMA buffer contents.
-        if !read {
-            if let Some(trace) = self.trace {
-                trace(format_args!(
-                    "DMA TX SRAM address={:08x} len={}",
-                    address, len
-                ));
-
-                for i in 0..len {
-                    let value = unsafe { read_volatile(buffer.add(i)) };
-
-                    trace(format_args!("DMA TX[{}]={:02x}", i, value));
-                }
-            }
-        }
-
         let descriptor = self.command_ptr(slot);
 
         let response = self.response_ptr(slot);
@@ -1031,10 +1085,9 @@ impl Ring {
         // Two v1 or four v2 command words, then length/IOC and a 64-bit
         // DMA address. Hardware stride may include additional padding.
         self.dump_wdma_debug("BEFORE DMA SUBMIT");
-        let words = Self::prepare_dma_command_words(command, read, xfer_data, address);
 
         // Write the complete descriptor.
-        self.write_command(slot, &words);
+        self.write_command(slot, words);
 
         // Read back the actual descriptor from SRAM.
         if let Some(trace) = self.trace {
@@ -1202,16 +1255,6 @@ impl Ring {
         if result.tid != tid {
             return Err("DMA response TID mismatch");
         }
-        if read {
-            if result.success() && result.data_len > len {
-                return Err("DMA read exceeds requested buffer");
-            }
-            for i in len..64 {
-                if unsafe { read_volatile(buffer.add(i)) } != 0xa5 {
-                    return Err("DMA RX buffer guard overwritten");
-                }
-            }
-        }
         Ok(result)
     }
     /// Poll and consume one complete IBI. Returns None if no complete IBI is ready.
@@ -1371,26 +1414,26 @@ impl Ring {
 
     /// Queue a v1 target DMA descriptor without waiting for a bus transaction.
     /// `command_word` is the target-format command (not a controller v1 command).
-    /// This function owns a separate 64-byte DMA buffer per outstanding slot.
+    /// Each outstanding slot owns a payload allocation sized to its command.
     pub fn target_queue_command(&mut self, command_word: u32, data: &[u8]) -> DmaResult<usize> {
         if self.mode != DmaMode::Target {
             return Err("target DMA command requires HCI1 target ring");
         }
-        if data.len() > 64 {
-            return Err("target DMA payload exceeds 64 bytes");
+        if data.len() > 0xffff || (command_word >> 16) as usize != data.len() {
+            return Err("target DMA command/payload length mismatch");
         }
         let slot = self.next;
         if self.target_queued[slot] {
             return Err("target DMA command ring full");
         }
-        let tx = unsafe { addr_of_mut!((*self.memory).tx).cast::<u8>().add(slot * 64) };
-        for i in 0..64 {
-            unsafe { write_volatile(tx.add(i), data.get(i).copied().unwrap_or(0)) };
+        let tx = self.allocate_payload(slot, data.len())?;
+        for (i, &byte) in data.iter().enumerate() {
+            unsafe { write_volatile(tx.add(i), byte) };
         }
         let addr = if data.is_empty() {
             0
         } else {
-            dma_address(tx, 64)?
+            dma_address(tx, data.len())?
         };
         let resp = self.response_ptr(slot);
         // HCI v1 target: one command word and three data-buffer words.
@@ -1607,6 +1650,7 @@ impl Ring {
         );
 
         self.target_queued[slot] = false;
+        self.payloads[slot] = None;
         self.target_resp_deq = next;
 
         self.regs.write_dma_ring_intr_status(intr & (1 << 11));
@@ -1692,6 +1736,51 @@ fn dma_address(ptr: *const u8, len: usize) -> DmaResult<u32> {
 mod command_layout_tests {
     use super::super::cmd::{HciCommandKind, HciCommandV2};
     use super::*;
+
+    #[test]
+    fn payloads_larger_than_64_bytes_use_available_pool() {
+        let live = [None; ENTRIES];
+        assert_eq!(payload_offset(&live, 4096), Some(0));
+        assert_eq!(payload_offset(&live, DMA_PAYLOAD_POOL_SIZE), Some(0));
+        assert_eq!(payload_offset(&live, DMA_PAYLOAD_POOL_SIZE + 1), None);
+        assert_eq!(payload_offset(&live, usize::MAX), None);
+    }
+
+    #[test]
+    fn live_target_payloads_do_not_overlap_and_freed_holes_are_reused() {
+        // Slot order differs from address order after ring wrap.
+        let mut live = [
+            Some(PayloadAllocation {
+                offset: 1024,
+                len: 2048,
+            }),
+            Some(PayloadAllocation {
+                offset: 0,
+                len: 1024,
+            }),
+            None,
+            None,
+        ];
+        assert_eq!(payload_offset(&live, 4096), Some(3072));
+        live[1] = None;
+        assert_eq!(payload_offset(&live, 512), Some(0));
+        assert_eq!(payload_offset(&live, 2048), Some(3072));
+    }
+
+    #[test]
+    fn payload_pool_exhaustion_keeps_outstanding_storage_reserved() {
+        let live = [
+            Some(PayloadAllocation {
+                offset: 0,
+                len: DMA_PAYLOAD_POOL_SIZE,
+            }),
+            None,
+            None,
+            None,
+        ];
+        assert_eq!(payload_offset(&live, 4), None);
+        assert_eq!(payload_offset(&live, 0), Some(0));
+    }
 
     #[test]
     fn v2_buffer_descriptor_follows_all_four_command_words() {

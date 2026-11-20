@@ -176,8 +176,8 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         self.dma.is_some()
     }
 
-    fn dma_error(_message: &'static str) -> I3cHciError {
-        I3cHciError::Unsupported
+    fn dma_error(message: &'static str) -> I3cHciError {
+        I3cHciError::Dma(message)
     }
 
     pub fn configure(&self, config: &HciTargetConfig) -> Result<()> {
@@ -257,9 +257,6 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
     /// Queue bytes that will be returned by the next controller private read.
     pub fn queue_read_data(&mut self, data: &[u8]) -> Result<()> {
         self.require_enabled()?;
-        if self.dma.is_some() && data.len() > 64 {
-            return Err(I3cHciError::InvalidArgs);
-        }
         let command = HciTargetCommand::read_data(data.len())?;
         self.queue_command(command, data)
     }
@@ -298,7 +295,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         if self.dma.is_some() {
             // The MDB is inline (enable bit 6); only the remaining bytes
             // belong in the DMA data buffer, exactly as for the PIO command.
-            if data.is_empty() || data.len() > 65 {
+            if data.is_empty() {
                 return Err(I3cHciError::InvalidArgs);
             }
             if self.dma_ibi_queued {
