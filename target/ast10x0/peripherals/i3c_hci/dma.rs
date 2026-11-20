@@ -12,6 +12,9 @@ use super::{HciCommandV1, HciResponse};
 use core::arch::asm;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
+#[path = "dma_wait.rs"]
+mod waiting;
+
 pub const RHS_CONTROL_MAX_HEADER_COUNT_SHIFT: u32 = 0;
 pub const RHS_CONTROL_MAX_HEADER_COUNT_MASK: u32 = 0x0f << RHS_CONTROL_MAX_HEADER_COUNT_SHIFT;
 pub const RHS_CONTROL_MAX_HEADER_COUNT_CAP_SHIFT: u32 = 4;
@@ -277,6 +280,13 @@ pub enum DmaMode {
     Target,
 }
 
+struct PendingCommand {
+    command: HciCommand,
+    tid: u8,
+    slot: usize,
+    next: usize,
+}
+
 pub struct Ring {
     regs: I3cHciRegisters,
     mode: DmaMode,
@@ -406,44 +416,8 @@ impl Ring {
             ));
         }
     }
-    fn wait(&self, read: fn(&I3cHciRegisters) -> u32, mask: u32, expected: u32) -> DmaResult<()> {
-        for _ in 0..POLL_BUDGET {
-            if read(&self.regs) & mask == expected {
-                return Ok(());
-            }
-            core::hint::spin_loop();
-        }
-        self.snapshot();
-        Err("DMA ring control timeout")
-    }
-    fn wait_aspeed_dma_idle(&self) -> DmaResult<()> {
-        for (name, read) in [
-            (
-                "WDMA",
-                I3cHciRegisters::aspeed_wdma_debug_low as fn(&I3cHciRegisters) -> u32,
-            ),
-            (
-                "RDMA",
-                I3cHciRegisters::aspeed_rdma_debug_low as fn(&I3cHciRegisters) -> u32,
-            ),
-        ] {
-            let mut idle = false;
-            for _ in 0..POLL_BUDGET {
-                if read(&self.regs) & 2 == 0 {
-                    idle = true;
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-            if !idle {
-                if let Some(trace) = self.trace {
-                    trace(format_args!("ASPEED {} engine busy timeout", name));
-                }
-                return Err("ASPEED DMA engine busy timeout");
-            }
-        }
-        Ok(())
-    }
+
+
     pub fn init(core: &I3cHciCore<impl FnMut(u32)>) -> DmaResult<Self> {
         Self::init_internal(core, None)
     }
@@ -1056,6 +1030,15 @@ impl Ring {
         tid: u8,
         words: &[u32],
     ) -> DmaResult<HciResponse> {
+        let pending = self.submit_descriptor(command, tid, words)?;
+        let status = self.wait_command_event(&pending)?;
+        self.acknowledge_command_event(status);
+        self.wait_aspeed_dma_idle()?;
+        let response = self.wait_response_visible(&pending)?;
+        self.complete_descriptor(pending, response)
+    }
+
+    fn submit_descriptor(&mut self, command: HciCommand, tid: u8, words: &[u32]) -> DmaResult<PendingCommand> {
         self.require_controller()?;
         if !self.accepts_command(command) {
             return Err("DMA command format does not match hardware");
@@ -1115,35 +1098,38 @@ impl Ring {
         self.dump_dma_state("AFTER SUBMIT");
         self.dump_wdma_debug("AFTER DMA SUBMIT");
 
+        Ok(PendingCommand { command, tid, slot, next })
+    }
+
+    /// Inspect one hardware snapshot without waiting or consuming a response.
+    fn try_command_event(&self, pending: &PendingCommand) -> DmaResult<Option<u32>> {
+        const COMPLETE: u32 = 1 << 11;
+        const ERROR: u32 = 1 << 9;
+        const ABORTED: u32 = 1 << 5;
+        let status = self.regs.dma_ring_intr_status();
+        if status & (COMPLETE | ERROR) != 0
+            && self.regs.dma_ring_operation2() & 0xff == pending.next as u32
+        {
+            return Ok(Some(status));
+        }
+        if status & ABORTED != 0 {
+            self.snapshot();
+            self.regs.write_dma_ring_intr_status(status & (COMPLETE | DMA_ERRORS));
+            return Err("DMA transfer aborted");
+        }
+        Ok(None)
+    }
+
+    fn try_response_visible(&self, pending: &PendingCommand) -> Option<u32> {
+        // Dequeue advancement does not guarantee SRAM writeback is visible.
+        unsafe { asm!("dsb sy", options(nostack, preserves_flags)); }
+        let raw = unsafe { read_volatile(self.response_ptr(pending.slot)) };
+        (raw != u32::MAX).then_some(raw)
+    }
+
+    fn acknowledge_command_event(&self, intr: u32) {
         const TRANSFER_COMPLETION: u32 = 1 << 11;
         const TRANSFER_ERROR: u32 = 1 << 9;
-        const TRANSFER_ABORT: u32 = 1 << 5;
-        let mut completion_status = None;
-        for _ in 0..POLL_BUDGET {
-            let status = self.regs.dma_ring_intr_status();
-            // Like Linux's IRQ path, require a completion/error event before
-            // consuming the response. A terminal DAA NACK is still returned
-            // as a raw response for the DAA classifier.
-            if status & (TRANSFER_COMPLETION | TRANSFER_ERROR) != 0
-                && self.regs.dma_ring_operation2() & 0xff == next as u32
-            {
-                completion_status = Some(status);
-                break;
-            }
-            if status & TRANSFER_ABORT != 0 {
-                self.snapshot();
-                self.regs
-                    .write_dma_ring_intr_status(status & (TRANSFER_COMPLETION | DMA_ERRORS));
-                return Err("DMA transfer aborted");
-            }
-            core::hint::spin_loop();
-        }
-        let Some(intr) = completion_status else {
-            self.dump_wdma_debug("RESPONSE TIMEOUT");
-            self.snapshot();
-            return Err("DMA transfer completion timeout");
-        };
-
         let ack = intr & (TRANSFER_COMPLETION | DMA_ERRORS);
         self.regs.write_dma_ring_intr_status(ack);
         unsafe {
@@ -1169,68 +1155,10 @@ impl Ring {
                 ));
             }
         }
-        self.wait_aspeed_dma_idle()?;
+    }
 
-        unsafe {
-            asm!("dsb sy", options(nostack, preserves_flags));
-        }
-
-        // CR_DEQ advancement alone does not prove that the response is
-        // visible in SRAM. Poll the poisoned slot with a bounded budget. This
-        // diagnoses delayed writeback without accepting an unwritten response.
-        // A barrier orders CPU accesses; it does not complete a DMA write.
-        let mut raw_response = 0xffff_ffff;
-        let mut response_polls = 0;
-        for poll in 0..POLL_BUDGET {
-            unsafe {
-                asm!("dsb sy", options(nostack, preserves_flags));
-            }
-            raw_response = unsafe { read_volatile(response) };
-            if raw_response != 0xffff_ffff {
-                response_polls = poll;
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        if raw_response == 0xffff_ffff {
-            if let Some(trace) = self.trace {
-                trace(format_args!(
-                    "DMA response timeout: slot={} expected_tid={} address={:08x} stride={}",
-                    slot, tid, response as usize, self.response_stride
-                ));
-                trace(format_args!(
-                    "DMA RESP_BASE={:08x}:{:08x} CR_SETUP={:08x} WDMA_DBG={:08x} RDMA_DBG={:08x}",
-                    self.regs.dma_ring_resp_base_hi(),
-                    self.regs.dma_ring_resp_base_lo(),
-                    self.regs.dma_ring_cr_setup(),
-                    self.regs.aspeed_wdma_debug_low(),
-                    self.regs.aspeed_rdma_debug_low()
-                ));
-                // Include nearby padding to expose writes at an unexpected
-                // stride. Never consume a response from a different address.
-                let base = unsafe { addr_of_mut!((*self.memory).responses).cast::<u32>() };
-                for i in 0..16 {
-                    let ptr = unsafe { base.add(i) };
-                    trace(format_args!(
-                        "DMA RESP word[{}] addr={:08x} value={:08x}",
-                        i,
-                        ptr as usize,
-                        unsafe { read_volatile(ptr) }
-                    ));
-                }
-            }
-            self.snapshot();
-            return Err("DMA response visibility timeout");
-        }
-        if response_polls != 0 {
-            if let Some(trace) = self.trace {
-                trace(format_args!(
-                    "DMA response visible after {} extra polls",
-                    response_polls
-                ));
-            }
-        }
-
+    fn complete_descriptor(&mut self, pending: PendingCommand, raw_response: u32) -> DmaResult<HciResponse> {
+        let PendingCommand { command, tid, next, .. } = pending;
         // Parse valid response.
         let result = HciResponse::parse(raw_response);
 
