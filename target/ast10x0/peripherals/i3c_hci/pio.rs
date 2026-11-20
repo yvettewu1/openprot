@@ -197,9 +197,7 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             ));
         }
         // Keep descriptor writes contiguous; do not print between words.
-        for word in transfer.command.words() {
-            self.regs.write_pio_command_queue_port(*word);
-        }
+        self.write_command_words(transfer.command.words());
         if let Some(trace) = self.trace {
             trace(format_args!(
                 "All command words written; waiting for RESP_READY mask=0x{:08x} TID={}",
@@ -220,10 +218,7 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         }
         self.check_errors()?;
         self.write_tx_data(transfer.tx)?;
-        self.wait_status(STAT_CMD_QUEUE_READY)?;
-        for word in transfer.command.words() {
-            self.regs.write_pio_command_queue_port(*word);
-        }
+        self.queue_command_words(transfer.command.words())?;
         self.rearm_pio_irqs(STAT_CMD_QUEUE_READY | STAT_TX_THLD | STAT_ALL_ERRORS);
         Ok(())
     }
@@ -245,14 +240,8 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         }
 
         self.check_errors()?;
-        self.wait_status(STAT_CMD_QUEUE_READY)?;
-        for word in first.words() {
-            self.regs.write_pio_command_queue_port(*word);
-        }
-        self.wait_status(STAT_CMD_QUEUE_READY)?;
-        for word in second.words() {
-            self.regs.write_pio_command_queue_port(*word);
-        }
+        self.queue_command_words(first.words())?;
+        self.queue_command_words(second.words())?;
 
         let first_response = self.wait_response(first.tid())?;
         let rx_len = self.read_rx_data(rx, first_response.data_len)?;
@@ -313,37 +302,9 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     }
 
     pub fn target_read_rx(&mut self, buf: &mut [u8], count: usize) -> Result<usize> {
-        let copy_len = core::cmp::min(buf.len(), count);
-
-        let mut copied = 0usize;
-        let mut remaining = count;
-
-        /*
-         * Always drain the complete hardware FIFO even when the caller's
-         * buffer is too small. Otherwise the next target transaction starts
-         * with stale RX data.
-         */
-        // The caller has consumed a completed target response. Its byte
-        // count authorizes these FIFO reads, including a partial final word.
-        // Match Zephyr hci_pio_target_read_rx_fifo: no RX_THLD wait here.
-        while remaining != 0 {
-            let word = self.regs.pio_rx_data_port();
-            let chunk = core::cmp::min(4, remaining);
-
-            if copied < copy_len {
-                let copy_chunk = core::cmp::min(chunk, copy_len - copied);
-                bytes_from_word(word, &mut buf[copied..copied + copy_chunk]);
-                copied += copy_chunk;
-            }
-
-            remaining -= chunk;
-        }
-
-        if count > buf.len() {
-            return Err(I3cHciError::NoSpace);
-        }
-
-        Ok(copied)
+        // A consumed response authorizes every word, including the tail.
+        // Do not wait for RX_THLD; drain even when the output is too small.
+        drain_fifo(buf, count, || Ok(self.regs.pio_rx_data_port()))
     }
 
     pub fn target_queue_read_data(&mut self, data: &[u8]) -> Result<()> {
@@ -455,7 +416,11 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         read.map(|_| status)
     }
 
-    fn target_queue_command(&mut self, command: HciTargetCommand, data: &[u8]) -> Result<()> {
+    pub(crate) fn target_queue_command(
+        &mut self,
+        command: HciTargetCommand,
+        data: &[u8],
+    ) -> Result<()> {
         if command.data_len != data.len() {
             return Err(I3cHciError::InvalidArgs);
         }
@@ -526,6 +491,18 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         }
     }
 
+    fn write_command_words(&self, words: &[u32]) {
+        for &word in words {
+            self.regs.write_pio_command_queue_port(word);
+        }
+    }
+
+    fn queue_command_words(&mut self, words: &[u32]) -> Result<()> {
+        self.wait_status(STAT_CMD_QUEUE_READY)?;
+        self.write_command_words(words);
+        Ok(())
+    }
+
     fn write_tx_data(&mut self, tx: &[u8]) -> Result<()> {
         let mut offset = 0;
         while offset < tx.len() {
@@ -539,15 +516,14 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     }
 
     fn read_rx_data(&mut self, rx: &mut [u8], expected: usize) -> Result<usize> {
-        let wanted = core::cmp::min(rx.len(), expected);
+        // Preserve the controller's existing clipped-read behavior. Target RX
+        // and IBI instead drain the full advertised length on overflow.
+        let wanted = rx.len().min(expected);
         let mut offset = 0;
-        // Called only after the matching completion response. Like Zephyr's
-        // hci_pio_do_trailing_rx, use the response length to drain the tail:
-        // RX_THLD may be clear for a short read (including the final word).
-        while offset < wanted {
+        // Completion authorizes the short tail even when RX_THLD is clear.
+        drain_fifo(rx, wanted, || {
             let word = self.regs.pio_rx_data_port();
-            let chunk = core::cmp::min(4, wanted - offset);
-            bytes_from_word(word, &mut rx[offset..offset + chunk]);
+            let chunk = (wanted - offset).min(4);
             if let Some(trace) = self.trace {
                 trace(format_args!(
                     "RX offset={} bytes={} raw=0x{:08x} PIO_STATUS=0x{:08x}",
@@ -558,25 +534,16 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
                 ));
             }
             offset += chunk;
-        }
-        Ok(offset)
+            Ok(word)
+        })
     }
 
     fn read_ibi_data(&mut self, buf: &mut [u8], count: usize) -> Result<usize> {
-        let copy_len = core::cmp::min(buf.len(), count);
-
-        let mut copied = 0usize;
+        // STATUS_THLD counts status entries, not payload words. The popped
+        // descriptor authorizes draining its complete payload without a wait.
         let mut remaining = count;
-
-        if let Some(trace) = self.trace {
-            trace(format_args!("read_ibi_data()...."));
-        }
-        // ASPEED G7 STATUS_THLD tracks status entries, not payload words.
-        // Once a descriptor is popped, drain exactly its advertised length,
-        // including the padded final word, as in Zephyr's ASPEED PIO path.
-        while remaining != 0 {
+        let copied = drain_fifo(buf, count, || {
             self.check_errors()?;
-
             let word = self.regs.pio_ibi_port();
             if let Some(trace) = self.trace {
                 trace(format_args!(
@@ -584,25 +551,18 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
                     remaining, word
                 ));
             }
-
-            let chunk = core::cmp::min(4, remaining);
-
-            if copied < copy_len {
-                let copy_chunk = core::cmp::min(chunk, copy_len - copied);
-                bytes_from_word(word, &mut buf[copied..copied + copy_chunk]);
-                copied += copy_chunk;
+            remaining -= remaining.min(4);
+            Ok(word)
+        });
+        // A hardware read failure stops immediately. Overflow is reported only
+        // after the final status check, once the full payload has been drained.
+        if let Err(error) = &copied {
+            if !matches!(error, I3cHciError::NoSpace) {
+                return copied;
             }
-
-            remaining -= chunk;
         }
-
         self.check_errors()?;
-
-        if count > buf.len() {
-            return Err(I3cHciError::NoSpace);
-        }
-
-        Ok(copied)
+        copied
     }
 
     /// Recover after a consumed end-of-DAA NACK, with no other commands queued.
@@ -781,4 +741,28 @@ pub fn bytes_from_word(word: u32, out: &mut [u8]) {
         out[i] = ((word >> (i as u32 * 8)) & 0xff) as u8;
         i += 1;
     }
+}
+
+/// Drain the advertised byte count, including a padded final FIFO word.
+/// Truncation never leaves unread words for the next transaction.
+fn drain_fifo(
+    output: &mut [u8],
+    count: usize,
+    mut read_word: impl FnMut() -> Result<u32>,
+) -> Result<usize> {
+    let copy_len = output.len().min(count);
+    let mut offset = 0;
+    while offset < count {
+        let word = read_word()?;
+        let chunk = (count - offset).min(4);
+        if offset < copy_len {
+            let copied = chunk.min(copy_len - offset);
+            bytes_from_word(word, &mut output[offset..offset + copied]);
+        }
+        offset += chunk;
+    }
+    if count > output.len() {
+        return Err(I3cHciError::NoSpace);
+    }
+    Ok(copy_len)
 }

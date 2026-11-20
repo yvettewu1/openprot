@@ -48,6 +48,8 @@ rust_library(
         "i3c/mod.rs",
         "i3c/registers.rs",
         "i3c/types.rs",
+        "i3c_hci/api.rs",
+        "i3c_hci/controller.rs",
         "i3c_hci/cmd.rs",
         "i3c_hci/ccc.rs",
         "i3c_hci/constants.rs",
@@ -165,6 +167,8 @@ rust_library(
     name = "i3c_hci",
     srcs = [
         "i3c_hci_crate.rs",
+        "i3c_hci/api.rs",
+        "i3c_hci/controller.rs",
         "i3c_hci/cmd.rs",
         "i3c_hci/ccc.rs",
         "i3c_hci/constants.rs",

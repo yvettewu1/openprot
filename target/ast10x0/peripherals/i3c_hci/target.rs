@@ -6,6 +6,7 @@
 //! Covers target identity, target mode selection, private write/read handling,
 //! target IBI requests, and Hot-Join requests.
 
+use super::api::{I3cTarget, TargetEvent};
 use super::ccc::{
     I3C_CCC_DISEC_BROADCAST, I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST, I3C_CCC_ENEC_DIRECT,
     I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMRL, I3C_CCC_GETMWL, I3C_CCC_GETMXDS,
@@ -14,7 +15,6 @@ use super::ccc::{
     I3C_CCC_SETMWL_DIRECT, I3C_CCC_SETNEWDA,
 };
 use super::cmd::{HciTargetCommand, TID_TARGET_IBI, TID_TARGET_RD_DATA};
-use super::dma::{Ring};
 use super::constants::{
     ASPEED_I3C_SLV_CAP_CTRL_ACCEPT_CR, ASPEED_I3C_SLV_CAP_CTRL_HJ_REQ,
     ASPEED_I3C_SLV_CAP_CTRL_HJ_WAIT, ASPEED_I3C_SLV_CAP_CTRL_IBI_REQ,
@@ -23,6 +23,7 @@ use super::constants::{
     ASPEED_I3C_SLV_STS1_IBI_EN,
 };
 use super::daa::valid_i3c_address;
+use super::dma::Ring;
 use super::error::{I3cHciError, Result};
 use super::pio::{I3cHciPio, STAT_ALL_ERRORS, STAT_RESP_READY, TargetResponse};
 use super::registers::I3cHciRegisters;
@@ -211,9 +212,9 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         // even though only completion/errors should signal a CPU interrupt.
         if self.dma.is_none() {
             self.regs.write_pio_intr_status_enable(u32::MAX);
-        // Threshold encoding zero means one DWORD. The controller defaults
-        // use half-FIFO thresholds, which strand short target CCC payloads.
-        //self.regs.write_pio_data_buffer_thld_ctrl(0);
+            // Threshold encoding zero means one DWORD. The controller defaults
+            // use half-FIFO thresholds, which strand short target CCC payloads.
+            //self.regs.write_pio_data_buffer_thld_ctrl(0);
             self.regs.write_pio_intr_signal_enable(TARGET_PIO_IRQS);
         } else {
             self.regs.write_pio_intr_signal_enable(0);
@@ -255,36 +256,57 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
 
     /// Queue bytes that will be returned by the next controller private read.
     pub fn queue_read_data(&mut self, data: &[u8]) -> Result<()> {
-        if !self.enabled {
-            return Err(I3cHciError::Busy);
+        self.require_enabled()?;
+        if self.dma.is_some() && data.len() > 64 {
+            return Err(I3cHciError::InvalidArgs);
         }
+        let command = HciTargetCommand::read_data(data.len())?;
+        self.queue_command(command, data)
+    }
 
-        if let Some(dma) = self.dma.as_mut() {
-            if data.len() > 64 { return Err(I3cHciError::InvalidArgs); }
-            // PIO and DMA share the same target command word. Only the
-            // transport of the command and data buffer differs.
-            let command = HciTargetCommand::read_data(data.len())?;
-            dma.target_queue_command(command.word, data).map_err(Self::dma_error)?;
+    fn require_enabled(&self) -> Result<()> {
+        if self.enabled {
             Ok(())
         } else {
-            self.pio.target_queue_read_data(data)
+            Err(I3cHciError::Busy)
+        }
+    }
+
+    /// Both transports consume the same target command word and payload.
+    fn queue_command(&mut self, command: HciTargetCommand, data: &[u8]) -> Result<()> {
+        if let Some(dma) = self.dma.as_mut() {
+            dma.target_queue_command(command.word, data)
+                .map_err(Self::dma_error)?;
+            Ok(())
+        } else {
+            self.pio.target_queue_command(command, data)
+        }
+    }
+
+    fn received_event(ccc: bool, ccc_hdr: u8, len: usize) -> HciTargetEvent {
+        if ccc {
+            HciTargetEvent::Ccc { ccc: ccc_hdr, len }
+        } else {
+            HciTargetEvent::PrivateWrite { len }
         }
     }
 
     /// Queue optional IBI payload bytes before requesting an IBI.
     pub fn queue_ibi_payload(&mut self, data: &[u8]) -> Result<()> {
-        if !self.enabled {
-            return Err(I3cHciError::Busy);
-        }
+        self.require_enabled()?;
 
-        if let Some(dma) = self.dma.as_mut() {
+        if self.dma.is_some() {
             // The MDB is inline (enable bit 6); only the remaining bytes
             // belong in the DMA data buffer, exactly as for the PIO command.
-            if data.is_empty() || data.len() > 65 { return Err(I3cHciError::InvalidArgs); }
-            if self.dma_ibi_queued { return Err(I3cHciError::Busy); }
+            if data.is_empty() || data.len() > 65 {
+                return Err(I3cHciError::InvalidArgs);
+            }
+            if self.dma_ibi_queued {
+                return Err(I3cHciError::Busy);
+            }
             let payload = &data[1..];
             let command = HciTargetCommand::ibi_with_mdb(data[0], payload.len())?;
-            dma.target_queue_command(command.word, payload).map_err(Self::dma_error)?;
+            self.queue_command(command, payload)?;
             self.dma_ibi_queued = true;
             Ok(())
         } else {
@@ -306,9 +328,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
     /// Start an IBI without waiting, so a single CPU can service both ports.
     /// Queue the payload first and consume the target completion afterwards.
     pub fn start_ibi(&mut self) -> Result<()> {
-        if !self.enabled {
-            return Err(I3cHciError::Busy);
-        }
+        self.require_enabled()?;
 
         if (self.regs.aspeed_slave_status1() & ASPEED_I3C_SLV_STS1_IBI_EN) == 0 {
             return Err(I3cHciError::Busy);
@@ -333,9 +353,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
 
     /// Poll for a target response without waiting for a new bus transaction.
     pub fn poll_event(&mut self, rx: &mut [u8]) -> Result<Option<HciTargetEvent>> {
-        if !self.enabled {
-            return Err(I3cHciError::Busy);
-        }
+        self.require_enabled()?;
         if self.dma.is_some() {
             return self.poll_dma_event(rx);
         }
@@ -361,9 +379,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
 
     /// Request controller-role ownership from the active controller.
     pub fn request_controller_role(&mut self) -> Result<()> {
-        if !self.enabled {
-            return Err(I3cHciError::Busy);
-        }
+        self.require_enabled()?;
 
         if (self.regs.aspeed_slave_status1() & ASPEED_I3C_SLV_STS1_CR_EN) == 0 {
             return Err(I3cHciError::Busy);
@@ -374,9 +390,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
 
     /// Request Hot-Join while the target has no dynamic address.
     pub fn request_hotjoin(&mut self) -> Result<()> {
-        if !self.enabled {
-            return Err(I3cHciError::Busy);
-        }
+        self.require_enabled()?;
 
         if self.dynamic_addr().is_some() {
             return Err(I3cHciError::InvalidArgs);
@@ -393,13 +407,13 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
     ///
     /// `rx` is used when the active controller writes data to this target.
     pub fn next_event(&mut self, rx: &mut [u8]) -> Result<HciTargetEvent> {
-        if !self.enabled {
-            return Err(I3cHciError::Busy);
-        }
+        self.require_enabled()?;
 
         if self.dma.is_some() {
             loop {
-                if let Some(event) = self.poll_dma_event(rx)? { return Ok(event); }
+                if let Some(event) = self.poll_dma_event(rx)? {
+                    return Ok(event);
+                }
                 core::hint::spin_loop();
             }
         }
@@ -414,14 +428,7 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
 
             self.pio.target_read_rx(rx, len)?;
 
-            if response.ccc {
-                HciTargetEvent::Ccc {
-                    ccc: response.ccc_hdr,
-                    len,
-                }
-            } else {
-                HciTargetEvent::PrivateWrite { len }
-            }
+            Self::received_event(response.ccc, response.ccc_hdr, len)
         } else if response.tid == TID_TARGET_RD_DATA {
             /*
              * Target transmitted previously queued read data.
@@ -448,33 +455,30 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         // Incoming private writes/CCCs are delivered through the target IBI ring.
         let record = dma.target_poll_rx(rx).map_err(|error| {
             if let Some(trace) = self.trace {
-                trace(format_args!(
-                    "HCI1 target_poll_rx failed: {}",
-                    error
-                ));
+                trace(format_args!("HCI1 target_poll_rx failed: {}", error));
             }
             Self::dma_error(error)
         })?;
 
         if let Some(record) = record {
-             if let Some(trace) = self.trace {
+            if let Some(trace) = self.trace {
                 trace(format_args!(
                     "HCI1 DMA RX: len={} ccc={} hdr=0x{:02x}",
-                    record.len,
-                    record.ccc,
-                    record.ccc_hdr
+                    record.len, record.ccc, record.ccc_hdr
                 ));
             }
-            return Ok(Some(if record.ccc {
-                HciTargetEvent::Ccc { ccc: record.ccc_hdr, len: record.len }
-            } else {
-                HciTargetEvent::PrivateWrite { len: record.len }
-            }));
+            return Ok(Some(Self::received_event(
+                record.ccc,
+                record.ccc_hdr,
+                record.len,
+            )));
         }
         if let Some(response) = dma.target_poll_response().map_err(Self::dma_error)? {
             if response.tid == TID_TARGET_IBI {
                 self.dma_ibi_queued = false;
-                return Ok(Some(HciTargetEvent::IbiComplete { status: response.status }));
+                return Ok(Some(HciTargetEvent::IbiComplete {
+                    status: response.status,
+                }));
             }
             if response.tid == TID_TARGET_RD_DATA {
                 // Match the PIO path: an unsuccessful target TX must not be
@@ -482,10 +486,14 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
                 if response.status != 0 {
                     return Err(I3cHciError::Transfer(response.status));
                 }
-                return Ok(Some(HciTargetEvent::ReadComplete { len: response.data_len }));
+                return Ok(Some(HciTargetEvent::ReadComplete {
+                    len: response.data_len,
+                }));
             }
             return Ok(Some(HciTargetEvent::DmaComplete {
-                tid: response.tid, status: response.status, raw: response.raw,
+                tid: response.tid,
+                status: response.status,
+                raw: response.raw,
             }));
         }
         Ok(None)
@@ -496,5 +504,46 @@ impl<'a, Y: FnMut(u32)> I3cHciTarget<'a, Y> {
         self.regs
             .write_aspeed_slave_cap_ctrl(cap_ctrl | request_bit);
         self.pio.wait_aspeed_cap_ctrl_clear(request_bit)
+    }
+}
+
+impl<Y: FnMut(u32)> I3cTarget for I3cHciTarget<'_, Y> {
+    fn address(&self) -> Option<u8> {
+        self.dynamic_addr()
+    }
+    fn queue_read(&mut self, data: &[u8]) -> Result<()> {
+        self.queue_read_data(data)
+    }
+    fn queue_ibi(&mut self, payload: &[u8]) -> Result<()> {
+        self.queue_ibi_payload(payload)
+    }
+    fn start_ibi(&mut self) -> Result<()> {
+        I3cHciTarget::start_ibi(self)
+    }
+    fn poll_event(&mut self, data: &mut [u8]) -> Result<Option<TargetEvent>> {
+        let Some(event) = I3cHciTarget::poll_event(self, data)? else {
+            return Ok(None);
+        };
+        Ok(Some(match event {
+            HciTargetEvent::PrivateWrite { len } => TargetEvent::WriteReceived { len },
+            HciTargetEvent::Ccc { ccc, len } => TargetEvent::CccReceived { ccc, len },
+            HciTargetEvent::ReadComplete { len } => TargetEvent::ReadComplete { remaining: len },
+            HciTargetEvent::IbiComplete { status } => {
+                if status != 0 {
+                    return Err(I3cHciError::Transfer(status));
+                }
+                TargetEvent::IbiComplete
+            }
+            HciTargetEvent::Other(response) if response.tid == super::cmd::TID_TARGET_IBI => {
+                if !response.success() {
+                    return Err(I3cHciError::Transfer(response.status));
+                }
+                TargetEvent::IbiComplete
+            }
+            HciTargetEvent::DmaComplete { status, .. } if status != 0 => {
+                return Err(I3cHciError::Transfer(status));
+            }
+            _ => TargetEvent::Other,
+        }))
     }
 }

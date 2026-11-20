@@ -3,6 +3,7 @@
 
 //! Minimal OpenProt-facing MIPI I3C HCI master API.
 
+use super::api::ControllerEvent;
 use super::ccc::{
     I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST, I3C_CCC_ENEC_DIRECT, I3C_CCC_EVENT_HJ,
     I3C_CCC_EVENT_SIR, I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS, I3C_CCC_GETPID,
@@ -269,6 +270,28 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             return Err(I3cHciError::Transfer(result.response.status));
         }
         Ok(result)
+    }
+
+    fn submit_write(&mut self, command: HciCommand, data: &[u8]) -> Result<HciTransferResult> {
+        // Immediate command bytes already live in the descriptor.
+        let tx = if command.kind() == HciCommandKind::Immediate {
+            &[]
+        } else {
+            data
+        };
+        self.submit(HciTransfer {
+            command,
+            tx,
+            rx: &mut [],
+        })
+    }
+
+    fn submit_read(&mut self, command: HciCommand, out: &mut [u8]) -> Result<HciTransferResult> {
+        self.submit(HciTransfer {
+            command,
+            tx: &[],
+            rx: out,
+        })
     }
 
     fn recover_after_daa_nack(&mut self) -> Result<()> {
@@ -625,12 +648,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .i3c_private_write_regular_command(dat_index, tid, data.len())?
             .with_roc()
             .with_toc();
-        let mut rx = [];
-        self.submit(HciTransfer {
-            command,
-            tx: data,
-            rx: &mut rx,
-        })
+        self.submit_write(command, data)
     }
 
     pub fn private_read(&mut self, dat_index: u8, out: &mut [u8]) -> Result<HciTransferResult> {
@@ -639,11 +657,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .i3c_private_read_command(dat_index, tid, out.len())?
             .with_roc()
             .with_toc();
-        self.submit(HciTransfer {
-            command,
-            tx: &[],
-            rx: out,
-        })
+        self.submit_read(command, out)
     }
 
     pub fn private_write_addr<const N: usize>(
@@ -701,12 +715,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .i2c_write_regular_command(dat_index, tid, data.len())?
             .with_roc()
             .with_toc();
-        let mut rx = [];
-        self.submit(HciTransfer {
-            command,
-            tx: data,
-            rx: &mut rx,
-        })
+        self.submit_write(command, data)
     }
 
     pub fn i2c_read(&mut self, dat_index: u8, out: &mut [u8]) -> Result<HciTransferResult> {
@@ -720,11 +729,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .i2c_read_command(dat_index, tid, out.len())?
             .with_roc()
             .with_toc();
-        self.submit(HciTransfer {
-            command,
-            tx: &[],
-            rx: out,
-        })
+        self.submit_read(command, out)
     }
 
     pub fn ccc_broadcast_write(&mut self, ccc: u8, data: &[u8]) -> Result<()> {
@@ -735,19 +740,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .ccc_command(0, tid, false, ccc, data, None)?
             .with_roc()
             .with_toc();
-        // Immediate payload is already in the descriptor, not the TX FIFO.
-        let tx = if command.kind() == HciCommandKind::Immediate {
-            &[][..]
-        } else {
-            data
-        };
-        let mut rx = [];
-        self.submit(HciTransfer {
-            command,
-            tx,
-            rx: &mut rx,
-        })
-        .map(|_| ())
+        self.submit_write(command, data).map(|_| ())
     }
 
     pub fn rstdaa_broadcast(&mut self) -> Result<()> {
@@ -805,12 +798,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .ccc_regular_command(dat_index, tid, false, ccc, data.len(), None)?
             .with_roc()
             .with_toc();
-        let mut rx = [];
-        self.submit(HciTransfer {
-            command,
-            tx: data,
-            rx: &mut rx,
-        })
+        self.submit_write(command, data)
     }
 
     pub fn ccc_direct_read(
@@ -825,11 +813,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .ccc_regular_command(dat_index, tid, true, ccc, out.len(), defining_byte)?
             .with_roc()
             .with_toc();
-        self.submit(HciTransfer {
-            command,
-            tx: &[],
-            rx: out,
-        })
+        self.submit_read(command, out)
     }
 
     pub fn ccc_direct_write_addr<const N: usize>(
@@ -978,6 +962,53 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         dat_allocator: &mut DatAllocator,
     ) -> Result<usize> {
         self.entdaa_new_devices(table, dat_allocator)
+    }
+
+    /// Poll one notification through the selected transport. This method does
+    /// not enable CPU interrupt signaling; scheduling belongs to the caller.
+    pub fn poll_controller_event(&mut self, payload: &mut [u8]) -> Result<Option<ControllerEvent>> {
+        if let Some(ring) = self.dma.as_mut() {
+            return ring
+                .poll_ibi(payload)
+                .map_err(I3cHciError::Dma)
+                .map(|event| {
+                    event.map(|event| ControllerEvent::TargetInterrupt {
+                        dynamic_addr: event.target_addr,
+                        payload_len: event.payload_len,
+                    })
+                });
+        }
+        let pending = self.regs.pio_intr_status();
+        if pending & STAT_ALL_ERRORS != 0 {
+            return Err(I3cHciError::TransferStatus(pending));
+        }
+        if pending & STAT_IBI_STATUS_THLD == 0 {
+            return Ok(None);
+        }
+        // PIO consumption currently rearms its signals. Restore the caller's
+        // signaling policy instead of silently enabling IRQs in a polling app.
+        let signals = self.regs.pio_intr_signal_enable();
+        let received = self.pio.next_ibi(payload);
+        self.regs.write_pio_intr_signal_enable(signals);
+        let (status, payload_len) = received?;
+        if status.error {
+            return Err(I3cHciError::TransferStatus(status.raw));
+        }
+        Ok(Some(
+            if status.target_addr == I3C_HOT_JOIN_ADDR && !status.read {
+                ControllerEvent::HotJoin
+            } else if status.read {
+                ControllerEvent::TargetInterrupt {
+                    dynamic_addr: status.target_addr,
+                    payload_len,
+                }
+            } else {
+                ControllerEvent::Unknown {
+                    address: status.target_addr,
+                    payload_len,
+                }
+            },
+        ))
     }
 
     pub fn next_ibi_event<const N: usize>(

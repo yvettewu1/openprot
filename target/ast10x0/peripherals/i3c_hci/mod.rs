@@ -5,11 +5,14 @@
 //!
 //! This module starts with the PAC-backed register facade needed to port
 //! Zephyr's drivers/i3c/mipi_hci logic into OpenProt. Protocol layers should
-//! build on [I3cHciRegisters] rather than touching PAC-generated names.
+//! use [I3cController] and [I3cTarget]. Register access is reserved for board
+//! setup and low-level diagnostics.
 
+pub mod api;
 pub mod ccc;
 pub mod cmd;
 pub mod constants;
+pub mod controller;
 pub mod core;
 pub mod daa;
 pub mod dat;
@@ -23,12 +26,14 @@ pub mod registers;
 pub mod target;
 pub mod types;
 
+pub use api::{ControllerEvent, I3cController, I3cDevice, I3cTarget, TargetEvent};
 pub use ccc::*;
 pub use cmd::{
     HciCommand, HciCommandKind, HciCommandV1, HciCommandV2, HciResponse, HciTargetCommand,
     TID_TARGET_IBI, TID_TARGET_RD_DATA, i2c_mode, i2c_v2_rate, i3c_sdr_mode, i3c_sdr_v2_rate,
 };
 pub use constants::*;
+pub use controller::Controller;
 pub use core::{
     CommandDescriptor, HciSections, HciVersion, I3cHciConfig, I3cHciCore, IoMode, TableSection,
     discover_sections_from_regs, parse_hci_version, select_command_descriptor,

@@ -611,6 +611,36 @@ impl Ring {
         self.command_format
     }
 
+    // CPU pointers only: bus address translation remains in dma_address().
+    // Callers validate ring slots before accessing these descriptors.
+    fn command_ptr(&self, slot: usize) -> *mut u32 {
+        debug_assert!(slot < ENTRIES);
+        unsafe {
+            addr_of_mut!((*self.memory).commands)
+                .cast::<u8>()
+                .add(slot * self.command_stride)
+                .cast::<u32>()
+        }
+    }
+
+    fn response_ptr(&self, slot: usize) -> *mut u32 {
+        debug_assert!(slot < ENTRIES);
+        unsafe {
+            addr_of_mut!((*self.memory).responses)
+                .cast::<u8>()
+                .add(slot * self.response_stride)
+                .cast::<u32>()
+        }
+    }
+
+    /// Fill padding as well as command/data words before publishing the slot.
+    fn write_command(&self, slot: usize, words: &[u32]) {
+        let descriptor = self.command_ptr(slot);
+        for i in 0..self.command_stride / 4 {
+            unsafe { write_volatile(descriptor.add(i), words.get(i).copied().unwrap_or(0)) };
+        }
+    }
+
     fn accepts_command(&self, command: HciCommand) -> bool {
         matches!(
             (self.command_format, command),
@@ -718,22 +748,9 @@ impl Ring {
                 .into_iter()
                 .enumerate()
         {
-            let descriptor = unsafe {
-                addr_of_mut!((*self.memory).commands)
-                    .cast::<u8>()
-                    .add(slot * self.command_stride)
-                    .cast::<u32>()
-            };
-            responses[index] = unsafe {
-                addr_of_mut!((*self.memory).responses)
-                    .cast::<u8>()
-                    .add(slot * self.response_stride)
-                    .cast::<u32>()
-            };
+            responses[index] = self.response_ptr(slot);
             let words = Self::prepare_dma_command_words(command, command.read(), data, address);
-            for i in 0..self.command_stride / 4 {
-                unsafe { write_volatile(descriptor.add(i), words.get(i).copied().unwrap_or(0)) };
-            }
+            self.write_command(slot, &words);
             unsafe { write_volatile(responses[index], u32::MAX) };
         }
         const COMPLETE: u32 = 1 << 11;
@@ -996,19 +1013,9 @@ impl Ring {
             }
         }
 
-        let descriptor = unsafe {
-            addr_of_mut!((*self.memory).commands)
-                .cast::<u8>()
-                .add(slot * self.command_stride)
-                .cast::<u32>()
-        };
+        let descriptor = self.command_ptr(slot);
 
-        let response = unsafe {
-            addr_of_mut!((*self.memory).responses)
-                .cast::<u8>()
-                .add(slot * self.response_stride)
-                .cast::<u32>()
-        };
+        let response = self.response_ptr(slot);
 
         if let Some(trace) = self.trace {
             trace(format_args!(
@@ -1027,11 +1034,7 @@ impl Ring {
         let words = Self::prepare_dma_command_words(command, read, xfer_data, address);
 
         // Write the complete descriptor.
-        for i in 0..self.command_stride / 4 {
-            unsafe {
-                write_volatile(descriptor.add(i), words.get(i).copied().unwrap_or(0));
-            }
-        }
+        self.write_command(slot, &words);
 
         // Read back the actual descriptor from SRAM.
         if let Some(trace) = self.trace {
@@ -1257,12 +1260,7 @@ impl Ring {
         let mut rnw = None;
         let mut complete = false;
         while idx != enq {
-            let ptr = unsafe {
-                addr_of_mut!((*self.memory).ibi_status)
-                    .cast::<u8>()
-                    .add(idx * self.ibi_stride)
-                    .cast::<u32>()
-            };
+            let ptr = self.ibi_status_ptr(idx);
             let status = unsafe { read_volatile(ptr) };
 
             if let Some(trace) = self.trace {
@@ -1335,27 +1333,13 @@ impl Ring {
         } else {
             size
         };
-        let ptr = unsafe { addr_of_mut!((*self.memory).ibi_data).cast::<u8>() };
-        for (i, byte) in output[..copy_len].iter_mut().enumerate() {
-            let off =
-                (self.ibi_chunk_ptr * IBI_CHUNK_SIZE + i) % (IBI_CHUNK_POOL_SIZE * IBI_CHUNK_SIZE);
-            *byte = unsafe { read_volatile(ptr.add(off)) };
-        }
+        self.copy_ibi_data(&mut output[..copy_len]);
         // Complete payload reads before returning ownership to hardware.
         unsafe {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
         // Reclaim even discarded complete events, preserving command pointers.
-        self.ibi_deq = idx;
-        self.regs.write_dma_ring_operation1(
-            (self.regs.dma_ring_operation1() & !(0xff << 16)) | ((idx as u32) << 16),
-        );
-        self.ibi_chunk_ptr = (self.ibi_chunk_ptr + total_chunks) % IBI_CHUNK_POOL_SIZE;
-        if total_chunks != 0 {
-            let available = self.regs.dma_ring_chunk_control();
-            self.regs
-                .write_dma_ring_chunk_control(available + total_chunks as u32);
-        }
+        self.advance_ibi_status(idx, total_chunks);
         if bad {
             return Err("IBI controller reported an error or malformed status");
         }
@@ -1408,24 +1392,11 @@ impl Ring {
         } else {
             dma_address(tx, 64)?
         };
-        let desc = unsafe {
-            addr_of_mut!((*self.memory).commands)
-                .cast::<u8>()
-                .add(slot * self.command_stride)
-                .cast::<u32>()
-        };
-        let resp = unsafe {
-            addr_of_mut!((*self.memory).responses)
-                .cast::<u8>()
-                .add(slot * self.response_stride)
-                .cast::<u32>()
-        };
+        let resp = self.response_ptr(slot);
         // HCI v1 target: one command word and three data-buffer words.
         // Data buffer descriptor: IOC (bit 30) and length (bits 21:0).
         let words = [command_word, (1u32 << 30) | data.len() as u32, addr, 0];
-        for i in 0..self.command_stride / 4 {
-            unsafe { write_volatile(desc.add(i), words.get(i).copied().unwrap_or(0)) };
-        }
+        self.write_command(slot, &words);
         unsafe {
             write_volatile(resp, 0xffff_ffff);
             asm!("dsb sy", options(nostack, preserves_flags));
@@ -1447,7 +1418,27 @@ impl Ring {
         }
         Ok(slot)
     }
-    fn target_advance_ibi_status(&mut self, next_deq: usize, chunks: usize) {
+    fn ibi_status_ptr(&self, index: usize) -> *mut u32 {
+        debug_assert!(index < IBI_STATUS_RING_ENTRIES);
+        unsafe {
+            addr_of_mut!((*self.memory).ibi_status)
+                .cast::<u8>()
+                .add(index * self.ibi_stride)
+                .cast::<u32>()
+        }
+    }
+
+    /// Copy from the circular chunk pool before returning ownership to hardware.
+    fn copy_ibi_data(&self, output: &mut [u8]) {
+        let base = unsafe { addr_of_mut!((*self.memory).ibi_data).cast::<u8>() };
+        for (i, byte) in output.iter_mut().enumerate() {
+            let offset =
+                (self.ibi_chunk_ptr * IBI_CHUNK_SIZE + i) % (IBI_CHUNK_POOL_SIZE * IBI_CHUNK_SIZE);
+            *byte = unsafe { read_volatile(base.add(offset)) };
+        }
+    }
+
+    fn advance_ibi_status(&mut self, next_deq: usize, chunks: usize) {
         self.ibi_deq = next_deq;
 
         self.regs.write_dma_ring_operation1(
@@ -1490,12 +1481,7 @@ impl Ring {
 
         // Process one target response descriptor per call.
         let idx = self.ibi_deq;
-        let ptr = unsafe {
-            addr_of_mut!((*self.memory).ibi_status)
-                .cast::<u8>()
-                .add(idx * self.ibi_stride)
-                .cast::<u32>()
-        };
+        let ptr = self.ibi_status_ptr(idx);
 
         let raw = unsafe { read_volatile(ptr) };
 
@@ -1533,14 +1519,7 @@ impl Ring {
             return Err("target RX output buffer too small");
         }
 
-        let base = unsafe { addr_of_mut!((*self.memory).ibi_data).cast::<u8>() };
-
-        for (i, byte) in output[..len].iter_mut().enumerate() {
-            let offset =
-                (self.ibi_chunk_ptr * IBI_CHUNK_SIZE + i) % (IBI_CHUNK_POOL_SIZE * IBI_CHUNK_SIZE);
-
-            *byte = unsafe { read_volatile(base.add(offset)) };
-        }
+        self.copy_ibi_data(&mut output[..len]);
 
         // Finish reading DMA memory before returning ownership.
         unsafe {
@@ -1549,7 +1528,7 @@ impl Ring {
 
         let next = (idx + 1) % IBI_STATUS_RING_ENTRIES;
 
-        self.target_advance_ibi_status(next, chunks);
+        self.advance_ibi_status(next, chunks);
 
         self.regs
             .write_dma_ring_intr_status(intr & (INTR_IBI_READY | INTR_IBI_RING_FULL));
@@ -1604,12 +1583,7 @@ impl Ring {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
 
-        let ptr = unsafe {
-            addr_of_mut!((*self.memory).responses)
-                .cast::<u8>()
-                .add(slot * self.response_stride)
-                .cast::<u32>()
-        };
+        let ptr = self.response_ptr(slot);
 
         let raw = unsafe { read_volatile(ptr) };
 

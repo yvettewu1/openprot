@@ -5,6 +5,8 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum I3cHciError {
+    /// DMA backend failure retained for application diagnostics.
+    Dma(&'static str),
     InvalidBus,
     InvalidArgs,
     Timeout,

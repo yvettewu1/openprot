@@ -136,8 +136,8 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.selected_io
     }
 
-   pub fn init(&mut self) -> Result<()> {
-    self.init_with_mode(None, None)
+    pub fn init(&mut self) -> Result<()> {
+        self.init_with_mode(None, None)
     }
 
     pub fn init_primary(&mut self, address: u8) -> Result<()> {
@@ -152,7 +152,7 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.init_with_mode(Some(InitMode::Secondary), None)
     }
 
-    fn init_with_mode(&mut self, mode:Option<InitMode>, primary_addr: Option<u8>) -> Result<()> {
+    fn init_with_mode(&mut self, mode: Option<InitMode>, primary_addr: Option<u8>) -> Result<()> {
         self.detect_version()?;
         self.discover_sections()?;
         self.soft_reset()?;
@@ -165,7 +165,6 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
 
             if let Some(address) = primary_addr {
                 // ASPEED Zephyr vendor init and program_master_addr precede BUS_ENABLE.
-                self.regs.aspeed_init(super::types::InitMode::Primary);
                 self.regs.write_controller_device_addr(
                     constants::MASTER_DYNAMIC_ADDR_VALID
                         | (u32::from(address) << constants::MASTER_DYNAMIC_ADDR_SHIFT),
@@ -339,25 +338,19 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
     }
 
     fn wait_reset_bits_clear(&mut self, mask: u32) -> Result<()> {
-        let mut remaining = constants::MIPI_I3C_HCI_RESET_TIMEOUT_US;
-        while remaining > 0 {
-            if (self.regs.reset_control() & mask) == 0 {
-                return Ok(());
-            }
-            (self.yield_us)(1);
-            remaining -= 1;
-        }
-        Err(I3cHciError::Timeout)
+        self.wait_register_clear(I3cHciRegisters::reset_control, mask)
     }
 
     fn wait_hc_control_clear(&mut self, mask: u32) -> Result<()> {
-        let mut remaining = constants::MIPI_I3C_HCI_RESET_TIMEOUT_US;
-        while remaining > 0 {
-            if (self.regs.hc_control() & mask) == 0 {
+        self.wait_register_clear(I3cHciRegisters::hc_control, mask)
+    }
+
+    fn wait_register_clear(&mut self, read: fn(&I3cHciRegisters) -> u32, mask: u32) -> Result<()> {
+        for _ in 0..constants::MIPI_I3C_HCI_RESET_TIMEOUT_US {
+            if read(&self.regs) & mask == 0 {
                 return Ok(());
             }
             (self.yield_us)(1);
-            remaining -= 1;
         }
         Err(I3cHciError::Timeout)
     }
