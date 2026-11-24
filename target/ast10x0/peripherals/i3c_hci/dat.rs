@@ -158,3 +158,126 @@ impl DatAllocator {
         self.allocated |= 1u128 << slot;
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HciI3cDevice {
+    pub dat_index: u8,
+    pub dynamic_addr: u8,
+    pub pid: u64,
+    pub bcr: u8,
+    pub dcr: u8,
+}
+
+pub struct HciDeviceTable<const N: usize> {
+    entries: [Option<HciI3cDevice>; N],
+    len: usize,
+}
+
+impl<const N: usize> HciDeviceTable<N> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; N],
+            len: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.len >= N
+    }
+
+    pub fn clear(&mut self) {
+        let mut idx = 0;
+        while idx < N {
+            self.entries[idx] = None;
+            idx += 1;
+        }
+        self.len = 0;
+    }
+
+    pub fn push(&mut self, device: HciI3cDevice) -> Result<()> {
+        if self.is_full() {
+            return Err(I3cHciError::NoSpace);
+        }
+        self.entries[self.len] = Some(device);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn push_or_replace(&mut self, device: HciI3cDevice) -> Result<()> {
+        let mut idx = 0;
+        while idx < self.len {
+            if let Some(entry) = self.entries[idx] {
+                if entry.dat_index == device.dat_index
+                    || (device.pid != 0 && entry.pid == device.pid)
+                {
+                    self.entries[idx] = Some(device);
+                    return Ok(());
+                }
+            }
+            idx += 1;
+        }
+
+        self.push(device)
+    }
+
+    #[must_use]
+    pub fn by_dynamic_addr(&self, dynamic_addr: u8) -> Option<HciI3cDevice> {
+        self.iter()
+            .find(|device| device.dynamic_addr == dynamic_addr)
+    }
+
+    #[must_use]
+    pub fn by_pid(&self, pid: u64) -> Option<HciI3cDevice> {
+        self.iter().find(|device| device.pid == pid)
+    }
+
+    pub fn iter(&self) -> HciDeviceTableIter<'_, N> {
+        HciDeviceTableIter {
+            table: self,
+            index: 0,
+        }
+    }
+}
+
+impl<const N: usize> Default for HciDeviceTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct HciDeviceTableIter<'a, const N: usize> {
+    table: &'a HciDeviceTable<N>,
+    index: usize,
+}
+
+impl<const N: usize> Iterator for HciDeviceTableIter<'_, N> {
+    type Item = HciI3cDevice;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.table.len {
+            let index = self.index;
+            self.index += 1;
+            if let Some(device) = self.table.entries[index] {
+                return Some(device);
+            }
+        }
+        None
+    }
+}

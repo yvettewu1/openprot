@@ -21,7 +21,6 @@ use super::constants::{
     MAX_BUSES, MIPI_I3C_HCI_CORE_IRQS,
 };
 use super::core::IoMode;
-use super::pio::STAT_ALL_ERRORS;
 use super::registers::I3cHciRegisters;
 
 /// Everything needed directly by the ISR for one HCI instance.
@@ -60,6 +59,7 @@ pub struct IsrEvents {
     core_status: AtomicU32,
     io_status: AtomicU32,
     vendor_status: AtomicU32,
+    masked_io_signals: AtomicU32,
 }
 
 impl IsrEvents {
@@ -68,6 +68,7 @@ impl IsrEvents {
             core_status: AtomicU32::new(0),
             io_status: AtomicU32::new(0),
             vendor_status: AtomicU32::new(0),
+            masked_io_signals: AtomicU32::new(0),
         }
     }
 
@@ -81,6 +82,27 @@ impl IsrEvents {
         self.io_status.swap(0, Ordering::AcqRel)
     }
 
+    /// Serialize task-side sampling with ISR latching/masking. FIFO levels in
+    /// the latch are wakeup hints only; callers must use the live level.
+    pub(crate) fn snapshot_io_status(&self, read: impl FnOnce() -> u32) -> (u32, u32) {
+        critical_section::with(|_| (read(), self.take_io_status()))
+    }
+
+    /// The deferred consumer owns W1C. Retire only its sampled bits while the
+    /// ISR is excluded, preserving unrelated command/IBI evidence.
+    pub(crate) fn ack_io_status(&self, mask: u32, acknowledge: impl FnOnce()) {
+        critical_section::with(|_| {
+            acknowledge();
+            self.io_status.fetch_and(!mask, Ordering::AcqRel);
+        });
+    }
+
+    pub(crate) fn rearm_io_signals(&self, rearm: impl FnOnce(u32)) {
+        critical_section::with(|_| {
+            rearm(self.masked_io_signals.swap(0, Ordering::AcqRel));
+        });
+    }
+
     /// Peek at pending PIO/DMA interrupt bits without clearing them.
     pub fn pending_io_status(&self) -> u32 {
         self.io_status.load(Ordering::Acquire)
@@ -91,11 +113,14 @@ impl IsrEvents {
         self.vendor_status.swap(0, Ordering::AcqRel)
     }
 
-    /// Drop stale state before enabling an interrupt source.
+    /// Drop stale software state while NVIC is masked, before registration.
+    /// This does not acknowledge hardware or restore masked signal enables.
+    /// Never clear an active transport's latch.
     pub fn clear(&self) {
         self.core_status.store(0, Ordering::Release);
         self.io_status.store(0, Ordering::Release);
         self.vendor_status.store(0, Ordering::Release);
+        self.masked_io_signals.store(0, Ordering::Release);
     }
 }
 
@@ -131,6 +156,9 @@ pub fn isr_events(bus: usize) -> Option<&'static IsrEvents> {
 /// One live HCI controller is allowed per physical bus.
 #[must_use]
 pub fn register_i3c_hci_irq_handler(bus: usize, ctx: IsrCtx) -> bool {
+    if bus != usize::from(ctx.regs.bus()) {
+        return false;
+    }
     let Some(slot) = BUS_ISR.get(bus) else {
         return false;
     };
@@ -276,9 +304,12 @@ fn handle_rhs_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
     }
 
     events.io_status.fetch_or(status, Ordering::AcqRel);
-    // Ring 0 reports event bits (5, 6, 9..12), not a bitmap of ring IDs.
-    // Acknowledge exactly the observed W1C events after latching them.
-    regs.write_dma_ring_intr_status(status);
+    // Leave W1C to the task: a second acknowledgement here/there could clear
+    // a newer same-bit notification. Mask until the consumer acknowledges.
+    events
+        .masked_io_signals
+        .fetch_or(regs.dma_ring_intr_signal_enable(), Ordering::AcqRel);
+    regs.write_dma_ring_intr_signal_enable(0);
 }
 fn handle_pio_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
     let status = regs.pio_intr_status();
@@ -295,22 +326,38 @@ fn handle_pio_irq(regs: &I3cHciRegisters, events: &IsrEvents) {
      */
     events.io_status.fetch_or(status, Ordering::AcqRel);
 
-    /*
-     * Error bits are W1C and do not require FIFO draining.
-     *
-     * RESP_READY/RX_THLD/TX_THLD are deliberately left asserted; their
-     * underlying queue/FIFO condition is cleared by the normal PIO path.
-     */
-    let errors = status & STAT_ALL_ERRORS;
-
-    if errors != 0 {
-        regs.write_pio_intr_status(errors);
-    }
-
-    /*
-     * Prevent a level-sensitive PIO source from continuously refiring before
-     * normal context has drained the queue. Normal context re-enables the desired
-     * PIO signals after the deferred event is consumed.
-     */
+    // All FIFO work and W1C acknowledgement belong to deferred context.
+    // Save the complete policy, including IBI, before masking level sources.
+    events
+        .masked_io_signals
+        .fetch_or(regs.pio_intr_signal_enable(), Ordering::AcqRel);
     regs.write_pio_intr_signal_enable(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn acknowledgement_preserves_unrelated_events() {
+        let events = IsrEvents::new();
+        events
+            .io_status
+            .store((1 << 11) | (1 << 12), Ordering::Release);
+        events.ack_io_status(1 << 11, || {});
+        assert_eq!(events.pending_io_status(), 1 << 12);
+    }
+    #[test]
+    fn rearm_takes_saved_subscription_once() {
+        let events = IsrEvents::new();
+        events.masked_io_signals.store(0x1010, Ordering::Release);
+        events.rearm_io_signals(|saved| assert_eq!(saved, 0x1010));
+        events.rearm_io_signals(|saved| assert_eq!(saved, 0));
+    }
+    #[test]
+    fn snapshot_keeps_live_levels_separate_from_latched_hints() {
+        let events = IsrEvents::new();
+        events.io_status.store(0x10, Ordering::Release);
+        assert_eq!(events.snapshot_io_status(|| 0), (0, 0x10));
+        assert_eq!(events.pending_io_status(), 0);
+    }
 }

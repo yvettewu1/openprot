@@ -7,7 +7,7 @@
 //! queue response expectation, write command descriptor words, then process the
 //! response and trailing RX in polling mode.
 
-use super::cmd::{HciCommand, HciResponse, HciTargetCommand};
+use super::cmd::{HciCommand, HciCommandKind, HciResponse, HciTargetCommand};
 use super::error::{I3cHciError, Result};
 use super::irq::{IsrEvents, isr_events};
 use super::master::{HciTransfer, HciTransferResult, validate_transfer};
@@ -28,7 +28,6 @@ pub const STAT_TRANSFER_ABORT: u32 = 1 << 5;
 pub const STAT_RESP_READY: u32 = 1 << 4;
 pub const STAT_CMD_QUEUE_READY: u32 = 1 << 3;
 pub const STAT_IBI_STATUS_THLD: u32 = 1 << 2;
-pub const STAT_RX_THLD: u32 = 1 << 1;
 pub const STAT_TX_THLD: u32 = 1 << 0;
 
 pub const STAT_PROG_ERRORS: u32 = STAT_TRANSFER_BLOCKED
@@ -50,31 +49,7 @@ pub struct PioTransferPairResult {
     pub rx_len: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IbiStatus {
-    pub raw: u32,
-    pub error: bool,
-    pub last: bool,
-    pub chunks: u8,
-    pub target_addr: u8,
-    pub read: bool,
-    pub data_len: usize,
-}
-
-impl IbiStatus {
-    #[must_use]
-    pub const fn parse(raw: u32) -> Self {
-        Self {
-            raw,
-            error: ((raw >> 30) & 1) != 0,
-            last: ((raw >> 24) & 1) != 0,
-            chunks: ((raw >> 16) & 0xff) as u8,
-            target_addr: ((raw >> 9) & 0x7f) as u8,
-            read: ((raw >> 8) & 1) != 0,
-            data_len: (raw & 0xff) as usize,
-        }
-    }
-}
+pub use super::cmd::IbiStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetResponse {
@@ -105,16 +80,43 @@ impl TargetResponse {
         }
     }
 
+    /// Bytes deposited in the target RX FIFO/DMA chunk pool. A target-transmit
+    /// notification (including an automatic CCC read) owns no RX data, even
+    /// when its response length field is nonzero.
+    #[must_use]
+    pub const fn received_len(self) -> usize {
+        if self.target_received {
+            self.data_len
+        } else {
+            0
+        }
+    }
+
     #[must_use]
     pub const fn success(self) -> bool {
         self.status == 0
     }
 }
 
+/// State of a segmented IBI. No payload allocation: callers retain the same
+/// output buffer until the event completes (or the controller is reset).
+#[derive(Default)]
+struct IbiAssembly {
+    total: usize,
+    source: Option<(u8, bool)>,
+    failure: Option<I3cHciError>,
+    buffer: usize,
+    capacity: usize,
+    discard: bool,
+}
+
 pub struct I3cHciPio<'a, Y: FnMut(u32)> {
     regs: &'a I3cHciRegisters,
+    ibi: Option<IbiAssembly>,
+    ibi_faulted: bool,
+    command_faulted: bool,
     yield_us: Y,
-    timeout_us: u32,
+    poll_budget: u32,
     irq_events: Option<&'static IsrEvents>,
     pending_irq_status: u32,
     trace: Option<fn(core::fmt::Arguments<'_>)>,
@@ -125,8 +127,11 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     pub const fn new(regs: &'a I3cHciRegisters, yield_us: Y) -> Self {
         Self {
             regs,
+            ibi: None,
+            ibi_faulted: false,
+            command_faulted: false,
             yield_us,
-            timeout_us: 10_000,
+            poll_budget: 10_000,
             irq_events: None,
             pending_irq_status: 0,
             trace: None,
@@ -134,16 +139,18 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     }
 
     #[must_use]
-    pub const fn with_timeout_us(mut self, timeout_us: u32) -> Self {
-        self.timeout_us = timeout_us;
+    pub const fn with_poll_budget(mut self, poll_budget: u32) -> Self {
+        self.poll_budget = poll_budget;
         self
     }
 
     #[must_use]
     pub fn with_irq_events(mut self, bus: usize) -> Self {
-        self.irq_events = isr_events(bus);
-        if let Some(events) = self.irq_events {
-            self.pending_irq_status = events.take_io_status();
+        if bus == self.regs.bus() as usize {
+            self.irq_events = isr_events(bus);
+            if let Some(events) = self.irq_events {
+                self.pending_irq_status |= events.take_io_status() & STAT_ALL_ERRORS;
+            }
         }
         self
     }
@@ -165,62 +172,110 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     }
 
     pub fn submit_raw(&mut self, transfer: HciTransfer<'_>) -> Result<HciTransferResult> {
+        let budget = self.poll_budget.saturating_add(1);
+        let operation = self.begin_command(transfer)?;
+        super::completion::Polling { budget }.run(operation, I3cHciError::Timeout)
+    }
+
+    pub(crate) fn begin_command<'operation, 'buffer>(
+        &'operation mut self,
+        transfer: HciTransfer<'buffer>,
+    ) -> Result<PioCommandOperation<'operation, 'a, 'buffer, Y>> {
+        self.require_command_ready()?;
         validate_transfer(&transfer)?;
         if !transfer.command.expects_response() {
             return Err(I3cHciError::Unsupported);
         }
+        self.check_errors()?;
         if let Some(trace) = self.trace {
             trace(format_args!(
-                "HCI{} submit_raw TID={} TX bytes={} RX capacity={}",
+                "HCI{} submit TID={} TX={} RX={}",
                 self.regs.bus(),
                 transfer.command.tid(),
                 transfer.tx.len(),
                 transfer.rx.len()
             ));
             for (index, word) in transfer.command.words().iter().enumerate() {
-                trace(format_args!("CMD[{}]=0x{:08x}", index, word));
+                trace(format_args!("CMD[{}]={:08x}", index, word));
             }
         }
-        self.check_errors()?;
-        self.write_tx_data(transfer.tx)?;
-        if let Some(trace) = self.trace {
-            trace(format_args!(
-                "Waiting for CMD_QUEUE_READY mask=0x{:08x}",
-                STAT_CMD_QUEUE_READY
-            ));
+        let pending = PioCommand {
+            transfer,
+            tx_offset: 0,
+            phase: PioPhase::Tx,
+        };
+        Ok(PioCommandOperation {
+            pio: self,
+            pending,
+            completed: false,
+        })
+    }
+
+    /// One bounded hardware step. The descriptor's words remain contiguous.
+    fn progress_command(
+        &mut self,
+        pending: &mut PioCommand<'_>,
+    ) -> Result<super::completion::Progress<HciTransferResult>> {
+        use super::completion::Progress;
+        match pending.phase {
+            PioPhase::Tx => {
+                if pending.tx_offset == pending.transfer.tx.len() {
+                    pending.phase = PioPhase::Command;
+                    return Ok(Progress::Advanced);
+                }
+                if !self.try_status(STAT_TX_THLD)? {
+                    return Ok(Progress::Pending);
+                }
+                let end = (pending.tx_offset + 4).min(pending.transfer.tx.len());
+                self.regs.write_pio_tx_data_port(word_from_bytes(
+                    &pending.transfer.tx[pending.tx_offset..end],
+                ));
+                pending.tx_offset = end;
+                Ok(Progress::Advanced)
+            }
+            PioPhase::Command => {
+                if !self.try_status(STAT_CMD_QUEUE_READY)? {
+                    return Ok(Progress::Pending);
+                }
+                self.write_command_words(pending.transfer.command.words());
+                pending.phase = PioPhase::Response;
+                Ok(Progress::Advanced)
+            }
+            PioPhase::Response => {
+                if !self.try_status(STAT_RESP_READY)? {
+                    return Ok(Progress::Pending);
+                }
+                let response = self.consume_response(pending.transfer.command.tid())?;
+                // V1 DAA reports assignment count; writes report untransferred
+                // TX length. Neither authorizes an RX FIFO read. V2 paired DAA
+                // handles its PID payload in submit_pair_raw().
+                let received = if pending.transfer.command.read()
+                    && pending.transfer.command.kind() != HciCommandKind::AddressAssignment
+                {
+                    response.data_len
+                } else {
+                    0
+                };
+                let rx_len = self.read_rx_data(pending.transfer.rx, received)?;
+                self.rearm_pio_irqs(STAT_RESP_READY | STAT_ALL_ERRORS);
+                Ok(Progress::Complete(HciTransferResult { response, rx_len }))
+            }
         }
-        self.wait_status(STAT_CMD_QUEUE_READY)?;
-        if let Some(trace) = self.trace {
-            trace(format_args!(
-                "CMD_QUEUE_READY observed; writing {} command words",
-                transfer.command.words().len()
-            ));
-        }
-        // Keep descriptor writes contiguous; do not print between words.
-        self.write_command_words(transfer.command.words());
-        if let Some(trace) = self.trace {
-            trace(format_args!(
-                "All command words written; waiting for RESP_READY mask=0x{:08x} TID={}",
-                STAT_RESP_READY,
-                transfer.command.tid()
-            ));
-        }
-        let response = self.wait_response(transfer.command.tid())?;
-        let rx_len = self.read_rx_data(transfer.rx, response.data_len)?;
-        self.rearm_pio_irqs(STAT_RESP_READY | STAT_RX_THLD | STAT_TX_THLD | STAT_ALL_ERRORS);
-        Ok(HciTransferResult { response, rx_len })
     }
 
     pub fn submit_no_response(&mut self, transfer: HciTransfer<'_>) -> Result<()> {
+        self.require_command_ready()?;
         validate_transfer(&transfer)?;
         if transfer.command.expects_response() {
             return Err(I3cHciError::InvalidArgs);
         }
         self.check_errors()?;
-        self.write_tx_data(transfer.tx)?;
-        self.queue_command_words(transfer.command.words())?;
-        self.rearm_pio_irqs(STAT_CMD_QUEUE_READY | STAT_TX_THLD | STAT_ALL_ERRORS);
-        Ok(())
+        self.command_sequence(|pio| {
+            pio.write_tx_data(transfer.tx)?;
+            pio.queue_command_words(transfer.command.words())?;
+            pio.rearm_pio_irqs(STAT_RESP_READY | STAT_ALL_ERRORS);
+            Ok(())
+        })
     }
 
     pub fn submit_pair_raw(
@@ -229,6 +284,7 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         second: HciCommand,
         rx: &mut [u8],
     ) -> Result<PioTransferPairResult> {
+        self.require_command_ready()?;
         if !first.expects_response() || !second.expects_response() {
             return Err(I3cHciError::InvalidArgs);
         }
@@ -240,36 +296,37 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         }
 
         self.check_errors()?;
-        self.queue_command_words(first.words())?;
-        self.queue_command_words(second.words())?;
+        self.command_sequence(|pio| {
+            pio.queue_command_words(first.words())?;
+            pio.queue_command_words(second.words())?;
 
-        let first_response = self.wait_response(first.tid())?;
-        let rx_len = self.read_rx_data(rx, first_response.data_len)?;
-        let second_response = self.wait_response(second.tid())?;
-        self.rearm_pio_irqs(STAT_RESP_READY | STAT_RX_THLD | STAT_TX_THLD | STAT_ALL_ERRORS);
+            let first_response = pio.wait_response(first.tid())?;
+            let rx_len = pio.read_rx_data(rx, first_response.data_len)?;
+            let second_response = pio.wait_response(second.tid())?;
+            pio.rearm_pio_irqs(STAT_RESP_READY | STAT_ALL_ERRORS);
 
-        Ok(PioTransferPairResult {
-            first_response,
-            second_response,
-            rx_len,
+            Ok(PioTransferPairResult {
+                first_response,
+                second_response,
+                rx_len,
+            })
         })
-    }
-
-    pub fn submit_v1(&mut self, transfer: HciTransfer<'_>) -> Result<HciTransferResult> {
-        self.submit(transfer)
-    }
-
-    pub fn submit_v1_raw(&mut self, transfer: HciTransfer<'_>) -> Result<HciTransferResult> {
-        self.submit_raw(transfer)
-    }
-
-    pub fn submit_v1_no_response(&mut self, transfer: HciTransfer<'_>) -> Result<()> {
-        self.submit_no_response(transfer)
     }
 
     pub fn target_next_response(&mut self) -> Result<TargetResponse> {
         self.wait_status(STAT_RESP_READY)?;
+        self.target_consume_response()
+    }
 
+    pub(crate) fn target_poll_response(&mut self) -> Result<Option<TargetResponse>> {
+        if !self.try_status(STAT_RESP_READY)? {
+            return Ok(None);
+        }
+        self.target_consume_response().map(Some)
+    }
+
+    /// Caller has established RESP_READY; consume exactly one response.
+    pub(crate) fn target_consume_response(&mut self) -> Result<TargetResponse> {
         let raw = self.regs.pio_response_queue_port();
         let response = TargetResponse::parse(raw);
         // Log before validation: target errors otherwise disappear before the
@@ -289,15 +346,17 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             ));
         }
 
+        let status = self.event_status();
         if !response.success() {
+            self.ack_errors(STAT_TRANSFER_ERR);
+            self.check_status_errors(status & !STAT_TRANSFER_ERR)?;
             if let Some(trace) = self.trace {
                 self.regs
                     .trace_transfer_state("target completion error", trace);
             }
             return Err(I3cHciError::Transfer(response.status));
         }
-
-        self.rearm_pio_irqs(STAT_RESP_READY | STAT_ALL_ERRORS);
+        self.check_status_errors(status)?;
         Ok(response)
     }
 
@@ -325,65 +384,131 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     /// Receive one complete IBI, returning the final descriptor and total bytes.
     /// A descriptor's data_len describes only its segment, not the whole IBI.
     /// Oversized/error transactions are drained through LAST_STATUS before failing.
+    /// Blocking compatibility adapter over the same nonblocking receive path.
     pub fn next_ibi(&mut self, payload: &mut [u8]) -> Result<(IbiStatus, usize)> {
-        let mut total = 0usize;
-        let mut source = None;
-        let mut failure = None;
-        // Bound even a stream of zero-length, non-final descriptors.
-        let mut segments_left = self.timeout_us.max(1);
-        loop {
-            if segments_left == 0 {
-                return Err(I3cHciError::Timeout);
-            }
-            segments_left -= 1;
-            let status = self.read_ibi_status()?;
-            let identity = (status.target_addr, status.read);
-            if source.is_some_and(|previous| previous != identity) {
-                failure = Some(I3cHciError::TransferStatus(status.raw));
-            }
-            source = Some(identity);
-            let offset = core::cmp::min(total, payload.len());
-            let read = self.read_ibi_data(&mut payload[offset..], status.data_len);
-            if let Err(error) = read {
-                if error != I3cHciError::NoSpace {
-                    return Err(error);
+        use super::completion::Progress;
+        if self.ibi.as_ref().is_some_and(|state| state.discard) {
+            return Err(I3cHciError::Busy);
+        }
+        // Bound malformed streams while giving each segment its own wait budget.
+        let mut segments_left = self.poll_budget.max(1);
+        super::completion::drive(
+            self.poll_budget.max(1),
+            || {
+                if segments_left == 0 {
+                    return Err(I3cHciError::Timeout);
                 }
-                failure.get_or_insert(error);
-            }
-            total = total.saturating_add(status.data_len);
-            if status.error {
-                failure = Some(I3cHciError::TransferStatus(status.raw));
-            }
-            // Hot-join and controller-role requests have no target-read payload
-            // sequence. Match Zephyr's separate handling of these notifications.
-            if status.last || !status.read {
-                return match failure {
-                    Some(error) => {
-                        if let Some(trace) = self.trace {
-                            // Log only after the failed transaction is drained;
-                            // successful pending-read notifications stay prompt.
-                            let shown = core::cmp::min(total, core::cmp::min(payload.len(), 8));
-                            trace(format_args!(
-                                "IBI failed: final=0x{:08x} addr=0x{:02x} last={} error={} segment_len={} total={} first={:02x?}",
-                                status.raw,
-                                status.target_addr,
-                                status.last,
-                                status.error,
-                                status.data_len,
-                                total,
-                                &payload[..shown]
-                            ));
-                        }
-                        Err(error)
-                    }
-                    None => Ok((status, total)),
-                };
+                let progress = self.poll_ibi_progress(payload)?;
+                match progress {
+                    Progress::Pending => (self.yield_us)(1),
+                    Progress::Advanced => segments_left -= 1,
+                    Progress::Complete(_) => {}
+                }
+                Ok(progress)
+            },
+            I3cHciError::Timeout,
+        )
+    }
+
+    /// Consume at most one available status and its authorized data. Never wait
+    /// for another segment. Keep the same buffer across calls returning None.
+    pub(crate) fn poll_ibi(&mut self, payload: &mut [u8]) -> Result<Option<(IbiStatus, usize)>> {
+        use super::completion::Progress;
+        let discarding = self.ibi.as_ref().is_some_and(|state| state.discard);
+        Ok(match self.poll_ibi_progress(payload)? {
+            Progress::Complete(event) if !discarding => Some(event),
+            _ => None,
+        })
+    }
+
+    /// Abandon only a partially consumed notification. Each call drains at most
+    /// one available segment; no FIFO reset and no wait for another status.
+    /// True means no partial event remains. A queued, untouched event is retained.
+    pub fn discard_partial_ibi(&mut self) -> Result<bool> {
+        if self.ibi_faulted {
+            return Err(I3cHciError::RecoveryRequired);
+        }
+        let Some(state) = &mut self.ibi else {
+            return Ok(true);
+        };
+        state.discard = true;
+        // Buffer overflow is irrelevant once the caller abandons its payload.
+        if state.failure == Some(I3cHciError::NoSpace) {
+            state.failure = None;
+        }
+        self.poll_ibi_progress(&mut [])?;
+        Ok(self.ibi.is_none())
+    }
+
+    fn poll_ibi_progress(
+        &mut self,
+        payload: &mut [u8],
+    ) -> Result<super::completion::Progress<(IbiStatus, usize)>> {
+        use super::completion::Progress;
+        if self.ibi_faulted {
+            return Err(I3cHciError::RecoveryRequired);
+        }
+        let buffer = payload.as_mut_ptr() as usize;
+        if let Some(state) = &self.ibi {
+            if !state.discard && (state.buffer != buffer || state.capacity != payload.len()) {
+                return Err(I3cHciError::InvalidArgs);
             }
         }
+        if !self.try_status(STAT_IBI_STATUS_THLD)? {
+            return Ok(Progress::Pending);
+        }
+        let status = self.consume_ibi_status()?;
+        let mut state = self.ibi.take().unwrap_or(IbiAssembly {
+            buffer,
+            capacity: payload.len(),
+            ..IbiAssembly::default()
+        });
+        let identity = (status.target_addr, status.read);
+        if state.source.is_some_and(|previous| previous != identity) {
+            state.failure = Some(I3cHciError::TransferStatus(status.raw));
+        }
+        state.source = Some(identity);
+        let offset = state.total.min(payload.len());
+        let output = if state.discard {
+            &mut [][..]
+        } else {
+            &mut payload[offset..]
+        };
+        if let Err(error) = self.read_ibi_data(output, status.data_len) {
+            if error != I3cHciError::NoSpace {
+                // Status is already popped, but the remaining payload position
+                // is uncertain. Never parse a payload word as a new status.
+                self.ibi = Some(state);
+                self.ibi_faulted = true;
+                return Err(error);
+            }
+            if !state.discard {
+                state.failure.get_or_insert(error);
+            }
+        }
+        state.total = state.total.saturating_add(status.data_len);
+        if status.error {
+            state.failure = Some(I3cHciError::TransferStatus(status.raw));
+        }
+        // The ISR masks level-triggered PIO signals while FIFO work is deferred.
+        // Rearm after the entire segment is drained, including intermediate ones.
+        self.rearm_pio_irqs(STAT_IBI_STATUS_THLD | STAT_ALL_ERRORS);
+        if status.last || !status.read {
+            if let Some(error) = state.failure {
+                return Err(error);
+            }
+            return Ok(Progress::Complete((status, state.total)));
+        }
+        self.ibi = Some(state);
+        Ok(Progress::Advanced)
     }
 
     fn read_ibi_status(&mut self) -> Result<IbiStatus> {
         self.wait_status(STAT_IBI_STATUS_THLD)?;
+        self.consume_ibi_status()
+    }
+
+    fn consume_ibi_status(&mut self) -> Result<IbiStatus> {
         let raw = self.regs.pio_ibi_port();
         if let Some(trace) = self.trace {
             trace(format_args!("IBI raw status = 0x{:08x}", raw));
@@ -396,18 +521,33 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
                 status.data_len, status.target_addr, status.last, status.error
             ));
         }
-        // Do not reuse a latched readiness notification after popping its entry.
+        // FIFO readiness is checked live. Preserve only deferred error evidence.
         if let Some(events) = self.irq_events {
-            self.pending_irq_status |= events.take_io_status();
+            self.pending_irq_status |= events.take_io_status() & STAT_ALL_ERRORS;
         }
-        self.pending_irq_status &= !STAT_IBI_STATUS_THLD;
         Ok(status)
     }
 
     /// Low-level single-segment API. Use next_ibi for completed notifications.
     pub fn next_ibi_status(&mut self, payload: &mut [u8]) -> Result<IbiStatus> {
+        if self.ibi_faulted {
+            return Err(I3cHciError::RecoveryRequired);
+        }
+        if self.ibi.is_some() {
+            return Err(I3cHciError::Busy);
+        }
         let status = self.read_ibi_status()?;
         let read = self.read_ibi_data(payload, status.data_len);
+        if read
+            .as_ref()
+            .is_err_and(|error| *error != I3cHciError::NoSpace)
+        {
+            self.ibi_faulted = true;
+        } else {
+            // Even a short output buffer drains the full segment. Restore
+            // notification delivery after returning its FIFO ownership.
+            self.rearm_pio_irqs(STAT_IBI_STATUS_THLD | STAT_ALL_ERRORS);
+        }
 
         if status.error {
             return Err(I3cHciError::TransferStatus(status.raw));
@@ -478,17 +618,11 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     }
 
     pub fn wait_aspeed_cap_ctrl_clear(&mut self, mask: u32) -> Result<()> {
-        let mut remaining = self.timeout_us;
-        loop {
-            if (self.regs.aspeed_slave_cap_ctrl() & mask) == 0 {
-                return Ok(());
-            }
-            if remaining == 0 {
-                return Err(I3cHciError::Timeout);
-            }
-            (self.yield_us)(1);
-            remaining -= 1;
-        }
+        self.wait_register_clear(
+            I3cHciRegisters::aspeed_slave_cap_ctrl,
+            mask,
+            self.poll_budget,
+        )
     }
 
     fn write_command_words(&self, words: &[u32]) {
@@ -516,14 +650,13 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
     }
 
     fn read_rx_data(&mut self, rx: &mut [u8], expected: usize) -> Result<usize> {
-        // Preserve the controller's existing clipped-read behavior. Target RX
-        // and IBI instead drain the full advertised length on overflow.
-        let wanted = rx.len().min(expected);
+        // Drain the entire response on overflow, so the next transfer cannot
+        // consume stale words. drain_fifo copies only the caller's capacity.
         let mut offset = 0;
         // Completion authorizes the short tail even when RX_THLD is clear.
-        drain_fifo(rx, wanted, || {
+        drain_fifo(rx, expected, || {
             let word = self.regs.pio_rx_data_port();
-            let chunk = (wanted - offset).min(4);
+            let chunk = (expected - offset).min(4);
             if let Some(trace) = self.trace {
                 trace(format_args!(
                     "RX offset={} bytes={} raw=0x{:08x} PIO_STATUS=0x{:08x}",
@@ -582,14 +715,11 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
             ));
         }
         self.regs.write_reset_control(mask);
-        let mut remaining = constants::MIPI_I3C_HCI_RESET_TIMEOUT_US;
-        while self.regs.reset_control() & mask != 0 {
-            if remaining == 0 {
-                return Err(I3cHciError::Timeout);
-            }
-            (self.yield_us)(1);
-            remaining -= 1;
-        }
+        self.wait_register_clear(
+            I3cHciRegisters::reset_control,
+            mask,
+            constants::MIPI_I3C_HCI_RESET_TIMEOUT_US,
+        )?;
         self.regs.set_hc_control(constants::HC_CONTROL_RESUME);
         if let Some(trace) = self.trace {
             trace(format_args!(
@@ -602,6 +732,10 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
 
     fn wait_response(&mut self, tid: u8) -> Result<HciResponse> {
         self.wait_status(STAT_RESP_READY)?;
+        self.consume_response(tid)
+    }
+
+    fn consume_response(&mut self, tid: u8) -> Result<HciResponse> {
         let raw = self.regs.pio_response_queue_port();
         let response = HciResponse::parse(raw);
         if let Some(trace) = self.trace {
@@ -613,112 +747,91 @@ impl<'a, Y: FnMut(u32)> I3cHciPio<'a, Y> {
         if response.tid != tid {
             return Err(I3cHciError::InvalidArgs);
         }
-        // A failed command can assert RESP_READY and TRANSFER_ERR together.
-        // Preserve its detailed response for the caller (ENTDAA's final NACK
-        // can mean no more devices), instead of returning only the summary bit.
-        if let Some(events) = self.irq_events {
-            self.pending_irq_status |= events.take_io_status();
-        }
-        self.pending_irq_status &= !STAT_RESP_READY;
+        let status = self.event_status();
+        // DAA's terminal NACK may assert TRANSFER_ERR with a valid response.
+        // Consume that summary only after preserving the detailed response.
         if !response.success() {
-            self.regs.write_pio_intr_status(STAT_TRANSFER_ERR);
-            self.pending_irq_status &= !STAT_TRANSFER_ERR;
+            self.ack_errors(STAT_TRANSFER_ERR);
         }
-        self.check_errors()?;
-        let errors = self.pending_irq_status & STAT_ALL_ERRORS;
-        if errors != 0 {
-            self.pending_irq_status &= !STAT_ALL_ERRORS;
-            return Err(I3cHciError::TransferStatus(errors));
-        }
+        self.check_status_errors(if response.success() {
+            status
+        } else {
+            status & !STAT_TRANSFER_ERR
+        })?;
         Ok(response)
     }
 
-    fn wait_status(&mut self, mask: u32) -> Result<()> {
-        let mut remaining = self.timeout_us;
-        loop {
-            let status = self.regs.pio_intr_status();
-            // Match ASPEED Zephyr's response-before-transfer-error ordering.
-            // A FIFO/programming/abort error still takes precedence.
-            if mask == STAT_RESP_READY
-                && status & STAT_RESP_READY != 0
-                && status & (STAT_ALL_ERRORS & !STAT_TRANSFER_ERR) == 0
-            {
-                return Ok(());
-            }
-            self.check_errors()?;
-            if (status & mask) != 0 {
-                return Ok(());
-            }
+    /// Return live readiness plus latched errors. A FIFO-ready notification
+    /// cannot authorize a read/write after its level has deasserted.
+    fn event_status(&mut self) -> u32 {
+        let (live, latched) = match self.irq_events {
+            Some(events) => events.snapshot_io_status(|| self.regs.pio_intr_status()),
+            None => (self.regs.pio_intr_status(), 0),
+        };
+        self.pending_irq_status |= (live | latched) & STAT_ALL_ERRORS;
+        live | self.pending_irq_status
+    }
 
-            if let Some(events) = self.irq_events {
-                self.pending_irq_status |= events.take_io_status();
-                let pending = self.pending_irq_status;
+    /// Inspect readiness once. Both latched and live fatal errors take precedence.
+    fn try_status(&mut self, mask: u32) -> Result<bool> {
+        let status = self.event_status();
+        if mask == STAT_RESP_READY
+            && status & STAT_RESP_READY != 0
+            && status & (STAT_ALL_ERRORS & !STAT_TRANSFER_ERR) == 0
+        {
+            return Ok(true);
+        }
+        self.check_status_errors(status)?;
+        Ok(status & mask != 0)
+    }
 
-                if (pending & STAT_ALL_ERRORS) != 0 {
-                    let errors = pending & STAT_ALL_ERRORS;
-                    self.pending_irq_status &= !STAT_ALL_ERRORS;
-                    return Err(I3cHciError::TransferStatus(errors));
-                }
+    fn ack_errors(&mut self, mask: u32) {
+        if let Some(events) = self.irq_events {
+            events.ack_io_status(mask, || self.regs.write_pio_intr_status(mask));
+        } else {
+            self.regs.write_pio_intr_status(mask);
+        }
+        self.pending_irq_status &= !mask;
+    }
 
-                if (pending & mask) != 0 {
-                    self.pending_irq_status &= !mask;
-                    return Ok(());
-                }
-            }
-
-            if remaining == 0 {
-                if let Some(trace) = self.trace {
-                    // Snapshot before logging or caller cleanup. No FIFO reads.
-                    let queue_thld = self.regs.pio_queue_thld_ctrl();
-                    let status_enable = self.regs.pio_intr_status_enable();
-                    let signal_enable = self.regs.pio_intr_signal_enable();
-                    let control = self.regs.hc_control();
-                    let present = self.regs.present_state();
-                    let queue_size = self.regs.pio_queue_size();
-                    let hc_status = self.regs.intr_status();
-                    trace(format_args!(
-                        "HCI{} TIMEOUT awaiting_mask=0x{:08x} PIO_STATUS=0x{:08x} pending_irq=0x{:08x} budget={}",
-                        self.regs.bus(),
-                        mask,
-                        status,
-                        self.pending_irq_status,
-                        self.timeout_us
-                    ));
-                    trace(format_args!(
-                        "QUEUE_THLD_CTRL=0x{:08x} STATUS_ENABLE=0x{:08x} SIGNAL_ENABLE=0x{:08x}",
-                        queue_thld, status_enable, signal_enable
-                    ));
-                    trace(format_args!(
-                        "HC_CONTROL=0x{:08x} PRESENT=0x{:08x} QUEUE_SIZE=0x{:08x} HC_STATUS=0x{:08x}",
-                        control, present, queue_size, hc_status
-                    ));
-                }
-                return Err(I3cHciError::Timeout);
-            }
-            (self.yield_us)(1);
-            remaining -= 1;
+    /// Preserve existing subscriptions when the ISR temporarily masks sources.
+    pub(crate) fn enable_irq_signals(&self, mask: u32) {
+        if let Some(events) = self.irq_events {
+            events.rearm_io_signals(|saved| {
+                self.regs.write_pio_intr_signal_enable(
+                    self.regs.pio_intr_signal_enable() | saved | mask,
+                );
+            });
+        } else {
+            self.regs
+                .write_pio_intr_signal_enable(self.regs.pio_intr_signal_enable() | mask);
         }
     }
 
-    fn rearm_pio_irqs(&self, mask: u32) {
+    pub(crate) fn rearm_pio_irqs(&self, mask: u32) {
         if self.irq_events.is_some() {
-            self.regs.write_pio_intr_signal_enable(mask);
+            self.enable_irq_signals(mask);
         }
     }
 
-    fn check_errors(&self) -> Result<()> {
-        let status = self.regs.pio_intr_status();
-        if (status & STAT_ALL_ERRORS) != 0 {
+    fn check_errors(&mut self) -> Result<()> {
+        let status = self.event_status();
+        self.check_status_errors(status)
+    }
+
+    fn check_status_errors(&mut self, status: u32) -> Result<()> {
+        let errors = status & STAT_ALL_ERRORS;
+        if errors != 0 {
             if let Some(trace) = self.trace {
                 trace(format_args!(
                     "HCI{} PIO error before W1C: status=0x{:08x} errors=0x{:08x}",
                     self.regs.bus(),
                     status,
-                    status & STAT_ALL_ERRORS
+                    errors
                 ));
             }
-            self.regs.write_pio_intr_status(status & STAT_ALL_ERRORS);
-            return Err(I3cHciError::TransferStatus(status & STAT_ALL_ERRORS));
+            self.ack_errors(errors);
+            return Err(I3cHciError::TransferStatus(errors));
         }
         Ok(())
     }
@@ -765,4 +878,125 @@ fn drain_fifo(
         return Err(I3cHciError::NoSpace);
     }
     Ok(copy_len)
+}
+
+impl<Y: FnMut(u32)> I3cHciPio<'_, Y> {
+    fn wait_status(&mut self, mask: u32) -> Result<()> {
+        let result = super::completion::poll(
+            self.poll_budget.saturating_add(1),
+            || {
+                if self.try_status(mask)? {
+                    return Ok(Some(()));
+                }
+                (self.yield_us)(1);
+                Ok(None)
+            },
+            I3cHciError::Timeout,
+        );
+        if result == Err(I3cHciError::Timeout) {
+            if let Some(trace) = self.trace {
+                trace(format_args!(
+                    "HCI{} timeout mask={:08x} status={:08x} pending={:08x}",
+                    self.regs.bus(),
+                    mask,
+                    self.regs.pio_intr_status(),
+                    self.pending_irq_status
+                ));
+                self.regs.trace_transfer_state("PIO timeout", trace);
+            }
+        }
+        result
+    }
+    fn wait_register_clear(
+        &mut self,
+        read: fn(&I3cHciRegisters) -> u32,
+        mask: u32,
+        budget: u32,
+    ) -> Result<()> {
+        super::completion::poll(
+            budget.saturating_add(1),
+            || {
+                if read(self.regs) & mask == 0 {
+                    return Ok(Some(()));
+                }
+                (self.yield_us)(1);
+                Ok(None)
+            },
+            I3cHciError::Timeout,
+        )
+    }
+    pub(crate) fn poll_budget(&self) -> u32 {
+        self.poll_budget
+    }
+}
+
+impl<Y: FnMut(u32)> I3cHciPio<'_, Y> {
+    pub(crate) fn trace_callback(&self) -> Option<fn(core::fmt::Arguments<'_>)> {
+        self.trace
+    }
+
+    pub(crate) fn uses_irq_events(&self) -> bool {
+        self.irq_events.is_some()
+    }
+
+    pub(crate) fn into_wait_context(self) -> (Y, u32) {
+        (self.yield_us, self.poll_budget)
+    }
+}
+
+enum PioPhase {
+    Tx,
+    Command,
+    Response,
+}
+struct PioCommand<'a> {
+    transfer: HciTransfer<'a>,
+    tx_offset: usize,
+    phase: PioPhase,
+}
+
+pub(crate) struct PioCommandOperation<'operation, 'regs, 'buffer, Y: FnMut(u32)> {
+    pio: &'operation mut I3cHciPio<'regs, Y>,
+    pending: PioCommand<'buffer>,
+    completed: bool,
+}
+impl<Y: FnMut(u32)> super::completion::Operation for PioCommandOperation<'_, '_, '_, Y> {
+    type Output = HciTransferResult;
+    type Error = I3cHciError;
+    fn advance(&mut self) -> Result<super::completion::Progress<HciTransferResult>> {
+        let progress = self.pio.progress_command(&mut self.pending)?;
+        if matches!(&progress, super::completion::Progress::Complete(_)) {
+            self.completed = true;
+        }
+        Ok(progress)
+    }
+    fn on_poll_pending(&mut self) {
+        (self.pio.yield_us)(1);
+    }
+}
+impl<Y: FnMut(u32)> Drop for PioCommandOperation<'_, '_, '_, Y> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.pio.command_faulted = true;
+        }
+    }
+}
+impl<Y: FnMut(u32)> I3cHciPio<'_, Y> {
+    /// Synchronous multi-step paths need the same failure latch as operation
+    /// guards: a timeout may leave a partial TX or an unconsumed response.
+    fn command_sequence<T>(&mut self, sequence: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.require_command_ready()?;
+        self.command_faulted = true;
+        let value = sequence(self)?;
+        self.command_faulted = false;
+        Ok(value)
+    }
+
+    fn require_command_ready(&self) -> Result<()> {
+        if self.command_faulted {
+            Err(I3cHciError::RecoveryRequired)
+        } else {
+            Ok(())
+        }
+    }
 }

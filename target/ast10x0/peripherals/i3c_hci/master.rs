@@ -3,30 +3,28 @@
 
 //! Minimal OpenProt-facing MIPI I3C HCI master API.
 
-use super::api::ControllerEvent;
+use super::api::{ControllerEvent, I3cBusManagement, I3cController, I3cDevice};
 use super::ccc::{
     I3C_CCC_DISEC_DIRECT, I3C_CCC_ENEC_BROADCAST, I3C_CCC_ENEC_DIRECT, I3C_CCC_EVENT_HJ,
     I3C_CCC_EVENT_SIR, I3C_CCC_GETBCR, I3C_CCC_GETDCR, I3C_CCC_GETMXDS, I3C_CCC_GETPID,
     I3C_CCC_GETSTATUS, I3C_CCC_RSTDAA_BROADCAST, I3C_CCC_RSTDAA_DIRECT, I3C_CCC_SETDASA,
     I3C_CCC_SETNEWDA,
 };
-use super::cmd::{
-    HciCommand, HciCommandKind, HciCommandV1, HciCommandV2, HciResponse, i2c_mode, i2c_v2_rate,
-    i3c_sdr_mode, i3c_sdr_v2_rate,
-};
+use super::cmd::{HciCommand, HciCommandKind, HciResponse};
 use super::core::{CommandDescriptor, HciSections};
-use super::daa::{
-    AddressSlots, DaaResponse, classify_entdaa_response, prepare_entdaa_step,
-    prepare_next_entdaa_step,
-};
+use super::core::{I3cHciCore, IoMode};
+
+use super::cmd::IbiStatus;
 use super::dat::{
     DAT_0_I2C_DEVICE, DAT_0_IBI_PAYLOAD, DAT_0_SIR_REJECT, DAT_V1_ENTRY_SIZE, DatAllocator,
     DatEntryV1,
 };
 use super::dct::{DctEntryV1, read_dct_entry_v1};
+use super::dma::Ring;
 use super::error::{I3cHciError, Result};
-use super::pio::{I3cHciPio, IbiStatus, STAT_ALL_ERRORS, STAT_IBI_STATUS_THLD};
+use super::pio::{STAT_ALL_ERRORS, STAT_IBI_STATUS_THLD};
 use super::registers::I3cHciRegisters;
+use super::transport::Transport;
 
 /// A command and borrowed data buffers shared by PIO and DMA transports.
 pub struct HciTransfer<'a> {
@@ -60,128 +58,7 @@ pub fn validate_transfer(transfer: &HciTransfer<'_>) -> Result<()> {
 pub const I3C_BROADCAST_ADDR: u8 = 0x7e;
 pub const I3C_HOT_JOIN_ADDR: u8 = 0x02;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HciI3cDevice {
-    pub dat_index: u8,
-    pub dynamic_addr: u8,
-    pub pid: u64,
-    pub bcr: u8,
-    pub dcr: u8,
-}
-
-pub struct HciDeviceTable<const N: usize> {
-    entries: [Option<HciI3cDevice>; N],
-    len: usize,
-}
-
-impl<const N: usize> HciDeviceTable<N> {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            entries: [None; N],
-            len: 0,
-        }
-    }
-
-    #[must_use]
-    pub const fn capacity(&self) -> usize {
-        N
-    }
-
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[must_use]
-    pub const fn is_full(&self) -> bool {
-        self.len >= N
-    }
-
-    pub fn clear(&mut self) {
-        let mut idx = 0;
-        while idx < N {
-            self.entries[idx] = None;
-            idx += 1;
-        }
-        self.len = 0;
-    }
-
-    pub fn push(&mut self, device: HciI3cDevice) -> Result<()> {
-        if self.is_full() {
-            return Err(I3cHciError::NoSpace);
-        }
-        self.entries[self.len] = Some(device);
-        self.len += 1;
-        Ok(())
-    }
-
-    pub fn push_or_replace(&mut self, device: HciI3cDevice) -> Result<()> {
-        let mut idx = 0;
-        while idx < self.len {
-            if let Some(entry) = self.entries[idx] {
-                if entry.dat_index == device.dat_index
-                    || (device.pid != 0 && entry.pid == device.pid)
-                {
-                    self.entries[idx] = Some(device);
-                    return Ok(());
-                }
-            }
-            idx += 1;
-        }
-
-        self.push(device)
-    }
-
-    #[must_use]
-    pub fn by_dynamic_addr(&self, dynamic_addr: u8) -> Option<HciI3cDevice> {
-        self.iter()
-            .find(|device| device.dynamic_addr == dynamic_addr)
-    }
-
-    #[must_use]
-    pub fn by_pid(&self, pid: u64) -> Option<HciI3cDevice> {
-        self.iter().find(|device| device.pid == pid)
-    }
-
-    pub fn iter(&self) -> HciDeviceTableIter<'_, N> {
-        HciDeviceTableIter {
-            table: self,
-            index: 0,
-        }
-    }
-}
-
-impl<const N: usize> Default for HciDeviceTable<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct HciDeviceTableIter<'a, const N: usize> {
-    table: &'a HciDeviceTable<N>,
-    index: usize,
-}
-
-impl<const N: usize> Iterator for HciDeviceTableIter<'_, N> {
-    type Item = HciI3cDevice;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.table.len {
-            let index = self.index;
-            self.index += 1;
-            if let Some(device) = self.table.entries[index] {
-                return Some(device);
-            }
-        }
-        None
-    }
-}
+pub use super::dat::{HciDeviceTable, HciDeviceTableIter, HciI3cDevice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HciIbiEvent {
@@ -200,16 +77,12 @@ pub enum HciIbiEvent {
 }
 
 pub struct I3cHciMaster<'a, Y: FnMut(u32)> {
-    regs: &'a I3cHciRegisters,
-    sections: HciSections,
-    pio: I3cHciPio<'a, Y>,
-    dma: Option<super::dma::Ring>,
+    pub(super) regs: &'a I3cHciRegisters,
+    pub(super) sections: HciSections,
+    pub(super) transport: Transport<'a, Y>,
     next_tid: u8,
-    command_descriptor: CommandDescriptor,
-    i3c_mode: u8,
-    i2c_mode: u8,
-    i3c_v2_rate: u8,
-    i2c_v2_rate: u8,
+    pub(super) command_descriptor: CommandDescriptor,
+    encoding: super::cmd::CommandEncoding,
 }
 
 impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
@@ -223,45 +96,37 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         Self {
             regs,
             sections,
-            pio: I3cHciPio::new(regs, yield_us),
-            dma: None,
+            transport: Transport::new(regs, yield_us),
             next_tid: 0,
             command_descriptor: CommandDescriptor::V1,
-            i3c_mode: i3c_sdr_mode(i3c_scl_hz),
-            i2c_mode: i2c_mode(400_000),
-            i3c_v2_rate: i3c_sdr_v2_rate(i3c_scl_hz),
-            i2c_v2_rate: i2c_v2_rate(400_000),
+            encoding: super::cmd::CommandEncoding::new(i3c_scl_hz, 400_000),
         }
     }
 
     #[must_use]
     pub fn with_command_descriptor(mut self, descriptor: CommandDescriptor) -> Self {
         self.command_descriptor = descriptor;
+        self.encoding.v2 = descriptor == CommandDescriptor::V2;
         self
     }
 
-    /// Use an initialized HCI0 DMA ring matching the selected command format.
-    /// V2 discovery publishes its PID-read/address-assignment pair together.
-    /// IBI polling is available through `dma_ring_mut`; PIO IRQ helpers must not
-    /// be used with this transport. The ring currently supports 64-byte buffers.
+    /// Attach an initialized controller ring for this bus and command format.
     pub fn with_dma(mut self, ring: super::dma::Ring) -> Result<Self> {
-        if self.command_descriptor != ring.command_format() || self.regs.bus() != 0 {
-            return Err(I3cHciError::Unsupported);
-        }
-        self.dma = Some(ring);
+        self.transport = self.transport.attach_dma(
+            ring,
+            self.regs.bus(),
+            super::dma::DmaMode::Controller,
+            Some(self.command_descriptor),
+        )?;
         Ok(self)
     }
 
     pub fn dma_ring_mut(&mut self) -> Option<&mut super::dma::Ring> {
-        self.dma.as_mut()
+        self.transport.dma_mut()
     }
 
-    fn submit_raw(&mut self, transfer: HciTransfer<'_>) -> Result<HciTransferResult> {
-        if let Some(ring) = self.dma.as_mut() {
-            ring.submit_raw(transfer)
-        } else {
-            self.pio.submit_raw(transfer)
-        }
+    pub(super) fn submit_raw(&mut self, transfer: HciTransfer<'_>) -> Result<HciTransferResult> {
+        self.transport.submit_raw(transfer)
     }
 
     fn submit(&mut self, transfer: HciTransfer<'_>) -> Result<HciTransferResult> {
@@ -294,40 +159,35 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         })
     }
 
-    fn recover_after_daa_nack(&mut self) -> Result<()> {
-        if let Some(ring) = self.dma.as_mut() {
-            ring.recover_after_daa_nack(self.regs)
-        } else {
-            self.pio.recover_after_daa_nack()
-        }
+    pub(super) fn recover_after_daa_nack(&mut self) -> Result<()> {
+        self.transport.recover_after_daa_nack(self.regs)
     }
 
     pub fn command_descriptor(&self) -> CommandDescriptor {
         self.command_descriptor
     }
 
-    pub fn with_timeout_us(mut self, timeout_us: u32) -> Self {
-        self.pio = self.pio.with_timeout_us(timeout_us);
+    pub fn with_poll_budget(mut self, poll_budget: u32) -> Self {
+        self.transport = self.transport.with_poll_budget(poll_budget);
         self
     }
 
-    /// Forward optional PIO diagnostics without adding a logger dependency.
+    /// Forward optional diagnostics to the selected backend without a logger dependency.
     #[must_use]
     pub fn with_trace(mut self, trace: fn(core::fmt::Arguments<'_>)) -> Self {
-        self.pio = self.pio.with_trace(trace);
+        self.transport = self.transport.with_trace(trace);
         self
     }
 
     #[must_use]
     pub fn with_i2c_scl_hz(mut self, i2c_scl_hz: u32) -> Self {
-        self.i2c_mode = i2c_mode(i2c_scl_hz);
-        self.i2c_v2_rate = i2c_v2_rate(i2c_scl_hz);
+        self.encoding.set_i2c_rate(i2c_scl_hz);
         self
     }
 
     #[must_use]
     pub fn with_irq_events(mut self, bus: usize) -> Self {
-        self.pio = self.pio.with_irq_events(bus);
+        self.transport = self.transport.with_irq_events(bus);
         self
     }
 
@@ -379,269 +239,6 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         })
     }
 
-    pub fn entdaa_once(&mut self, dat_index: u8, dynamic_addr: u8) -> Result<Option<HciI3cDevice>> {
-        match self.command_descriptor {
-            CommandDescriptor::V1 => self.entdaa_once_v1(dat_index, dynamic_addr),
-            CommandDescriptor::V2 => self.entdaa_once_v2(dat_index, dynamic_addr),
-        }
-    }
-
-    pub fn entdaa_all<const N: usize>(
-        &mut self,
-        table: &mut HciDeviceTable<N>,
-        dat_allocator: &mut DatAllocator,
-    ) -> Result<usize> {
-        table.clear();
-        self.entdaa_new_devices(table, dat_allocator)
-    }
-
-    pub fn entdaa_new_devices<const N: usize>(
-        &mut self,
-        table: &mut HciDeviceTable<N>,
-        dat_allocator: &mut DatAllocator,
-    ) -> Result<usize> {
-        let initial_len = table.len();
-        let mut address_slots = AddressSlots::new();
-        let controller_addr = self.regs.controller_device_addr();
-        if controller_addr & super::constants::MASTER_DYNAMIC_ADDR_VALID != 0 {
-            let addr = ((controller_addr & super::constants::MASTER_DYNAMIC_ADDR_MASK)
-                >> super::constants::MASTER_DYNAMIC_ADDR_SHIFT) as u8;
-            address_slots.mark_used(addr)?;
-        }
-
-        for device in table.iter() {
-            address_slots.mark_used(device.dynamic_addr)?;
-        }
-
-        match self.command_descriptor {
-            CommandDescriptor::V1 => {
-                self.entdaa_new_devices_v1(table, dat_allocator, &mut address_slots, initial_len)
-            }
-            CommandDescriptor::V2 => {
-                self.entdaa_new_devices_v2(table, dat_allocator, &mut address_slots, initial_len)
-            }
-        }
-    }
-
-    fn entdaa_once_v1(&mut self, dat_index: u8, dynamic_addr: u8) -> Result<Option<HciI3cDevice>> {
-        let tid = self.next_tid();
-        let step = prepare_entdaa_step(dat_index, dynamic_addr, tid)?;
-        self.regs.aspeed_prepare_daa(step.dynamic_addr);
-        self.write_dat_entry(step.dat_index, step.dat_entry)?;
-        self.regs.reset_dct_index();
-        let mut rx = [];
-        let result = self.submit_raw(HciTransfer {
-            command: HciCommand::V1(step.command),
-            tx: &[],
-            rx: &mut rx,
-        })?;
-
-        match classify_entdaa_response(result.response)? {
-            DaaResponse::Assigned => self
-                .attach_assigned_device_from_dct(step.dat_index, step.dynamic_addr, 0)
-                .map(Some),
-            DaaResponse::NoMoreDevices => {
-                self.write_dat_entry(step.dat_index, DatEntryV1::rejected())?;
-                self.recover_after_daa_nack()?;
-                Ok(None)
-            }
-        }
-    }
-
-    fn entdaa_once_v2(&mut self, dat_index: u8, dynamic_addr: u8) -> Result<Option<HciI3cDevice>> {
-        if dat_index > 0x7f || !valid_i3c_addr(dynamic_addr) {
-            return Err(I3cHciError::InvalidArgs);
-        }
-
-        let mut rx = [0u8; 8];
-        match self.entdaa_submit_v2(dynamic_addr, &mut rx)? {
-            DaaResponse::Assigned => {
-                let device = decode_v2_daa_identity(dat_index, dynamic_addr, &rx)?;
-                self.write_dat_entry(
-                    dat_index,
-                    DatEntryV1::rejected().with_dynamic_addr(dynamic_addr),
-                )?;
-                Ok(Some(device))
-            }
-            DaaResponse::NoMoreDevices => Ok(None),
-        }
-    }
-
-    fn entdaa_new_devices_v1<const N: usize>(
-        &mut self,
-        table: &mut HciDeviceTable<N>,
-        dat_allocator: &mut DatAllocator,
-        address_slots: &mut AddressSlots,
-        initial_len: usize,
-    ) -> Result<usize> {
-        loop {
-            if table.is_full() {
-                return Err(I3cHciError::NoSpace);
-            }
-
-            let tid = self.next_tid();
-            let step = prepare_next_entdaa_step(address_slots, dat_allocator, None, tid)?;
-            self.regs.aspeed_prepare_daa(step.dynamic_addr);
-            self.write_dat_entry(step.dat_index, step.dat_entry)?;
-            self.regs.reset_dct_index();
-            let mut rx = [];
-            let result = match self.submit_raw(HciTransfer {
-                command: HciCommand::V1(step.command),
-                tx: &[],
-                rx: &mut rx,
-            }) {
-                Ok(result) => result,
-                Err(error) => {
-                    let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
-                    let _ = dat_allocator.free(step.dat_index);
-                    return Err(error);
-                }
-            };
-
-            match classify_entdaa_response(result.response) {
-                Ok(DaaResponse::Assigned) => {
-                    let dct = match self.read_dct_entry(0) {
-                        Ok(dct) => dct,
-                        Err(error) => {
-                            let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
-                            let _ = dat_allocator.free(step.dat_index);
-                            return Err(error);
-                        }
-                    };
-                    // Verify that ENTDAA actually discovered a target.
-                    if dct.pid == 0 {
-                        self.write_dat_entry(step.dat_index, DatEntryV1::rejected())?;
-
-                        dat_allocator.free(step.dat_index)?;
-
-                        return Err(I3cHciError::TransferStatus(0));
-                    }
-                    let device = HciI3cDevice {
-                        dat_index: step.dat_index,
-                        dynamic_addr: step.dynamic_addr,
-                        pid: dct.pid,
-                        bcr: dct.bcr,
-                        dcr: dct.dcr,
-                    };
-
-                    if let Err(error) = table.push(device) {
-                        let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
-                        let _ = dat_allocator.free(step.dat_index);
-                        return Err(error);
-                    }
-                    address_slots.mark_used(step.dynamic_addr)?;
-                    if self.dma.is_some() {
-                        return Ok(table.len() - initial_len);
-                    }
-                }
-                Ok(DaaResponse::NoMoreDevices) => {
-                    self.write_dat_entry(step.dat_index, DatEntryV1::rejected())?;
-                    dat_allocator.free(step.dat_index)?;
-                    self.recover_after_daa_nack()?;
-                    return Ok(table.len() - initial_len);
-                }
-                Err(error) => {
-                    let _ = self.write_dat_entry(step.dat_index, DatEntryV1::rejected());
-                    let _ = dat_allocator.free(step.dat_index);
-                    return Err(error);
-                }
-            }
-        }
-    }
-
-    fn entdaa_new_devices_v2<const N: usize>(
-        &mut self,
-        table: &mut HciDeviceTable<N>,
-        dat_allocator: &mut DatAllocator,
-        address_slots: &mut AddressSlots,
-        initial_len: usize,
-    ) -> Result<usize> {
-        loop {
-            if table.is_full() {
-                return Err(I3cHciError::NoSpace);
-            }
-
-            let dynamic_addr = address_slots.next_free(super::daa::DEFAULT_DYNAMIC_ADDR_START)?;
-            let preferred_slot = if dat_allocator.address_indexed() {
-                Some(dynamic_addr)
-            } else {
-                None
-            };
-            let dat_index = dat_allocator.allocate(preferred_slot)?;
-            let mut rx = [0u8; 8];
-
-            match self.entdaa_submit_v2(dynamic_addr, &mut rx) {
-                Ok(DaaResponse::Assigned) => {
-                    let device = match decode_v2_daa_identity(dat_index, dynamic_addr, &rx) {
-                        Ok(device) => device,
-                        Err(error) => {
-                            let _ = dat_allocator.free(dat_index);
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = self.write_dat_entry(
-                        dat_index,
-                        DatEntryV1::rejected().with_dynamic_addr(dynamic_addr),
-                    ) {
-                        let _ = dat_allocator.free(dat_index);
-                        return Err(error);
-                    }
-                    if let Err(error) = table.push(device) {
-                        let _ = self.write_dat_entry(dat_index, DatEntryV1::rejected());
-                        let _ = dat_allocator.free(dat_index);
-                        return Err(error);
-                    }
-                    address_slots.mark_used(dynamic_addr)?;
-                }
-                Ok(DaaResponse::NoMoreDevices) => {
-                    dat_allocator.free(dat_index)?;
-                    return Ok(table.len() - initial_len);
-                }
-                Err(error) => {
-                    let _ = dat_allocator.free(dat_index);
-                    return Err(error);
-                }
-            }
-        }
-    }
-
-    fn entdaa_submit_v2(&mut self, dynamic_addr: u8, rx: &mut [u8; 8]) -> Result<DaaResponse> {
-        let read_tid = self.next_tid();
-        let assign_tid = self.next_tid();
-        let read = HciCommand::V2(HciCommandV2::daa_read_pid(read_tid, rx.len())?);
-        let assign = HciCommand::V2(HciCommandV2::daa_assign_address(assign_tid, dynamic_addr)?);
-        if let Some(ring) = self.dma.as_mut() {
-            let (first, second) = ring.submit_daa_pair(read, assign, rx)?;
-            return match classify_entdaa_response(first)? {
-                DaaResponse::Assigned => {
-                    let response = second.ok_or(I3cHciError::InvalidArgs)?;
-                    if !response.success() {
-                        return Err(I3cHciError::Transfer(response.status));
-                    }
-                    Ok(DaaResponse::Assigned)
-                }
-                DaaResponse::NoMoreDevices => {
-                    ring.recover_after_daa_nack(self.regs)?;
-                    Ok(DaaResponse::NoMoreDevices)
-                }
-            };
-        }
-        let result = self.pio.submit_pair_raw(read, assign, rx)?;
-
-        match classify_entdaa_response(result.first_response)? {
-            DaaResponse::Assigned => {
-                if !result.second_response.success() {
-                    return Err(I3cHciError::Transfer(result.second_response.status));
-                }
-                if result.rx_len != rx.len() {
-                    return Err(I3cHciError::InvalidArgs);
-                }
-                Ok(DaaResponse::Assigned)
-            }
-            DaaResponse::NoMoreDevices => Ok(DaaResponse::NoMoreDevices),
-        }
-    }
-
     pub fn private_write(&mut self, dat_index: u8, data: &[u8]) -> Result<HciTransferResult> {
         let tid = self.next_tid();
         let command = self
@@ -658,50 +255,6 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .with_roc()
             .with_toc();
         self.submit_read(command, out)
-    }
-
-    pub fn private_write_addr<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        dynamic_addr: u8,
-        data: &[u8],
-    ) -> Result<HciTransferResult> {
-        let device = table
-            .by_dynamic_addr(dynamic_addr)
-            .ok_or(I3cHciError::InvalidArgs)?;
-        self.private_write(device.dat_index, data)
-    }
-
-    pub fn private_read_addr<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        dynamic_addr: u8,
-        out: &mut [u8],
-    ) -> Result<HciTransferResult> {
-        let device = table
-            .by_dynamic_addr(dynamic_addr)
-            .ok_or(I3cHciError::InvalidArgs)?;
-        self.private_read(device.dat_index, out)
-    }
-
-    pub fn private_write_pid<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        pid: u64,
-        data: &[u8],
-    ) -> Result<HciTransferResult> {
-        let device = table.by_pid(pid).ok_or(I3cHciError::InvalidArgs)?;
-        self.private_write(device.dat_index, data)
-    }
-
-    pub fn private_read_pid<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        pid: u64,
-        out: &mut [u8],
-    ) -> Result<HciTransferResult> {
-        let device = table.by_pid(pid).ok_or(I3cHciError::InvalidArgs)?;
-        self.private_read(device.dat_index, out)
     }
 
     pub fn i2c_write(&mut self, dat_index: u8, data: &[u8]) -> Result<HciTransferResult> {
@@ -816,56 +369,6 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         self.submit_read(command, out)
     }
 
-    pub fn ccc_direct_write_addr<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        dynamic_addr: u8,
-        ccc: u8,
-        data: &[u8],
-    ) -> Result<HciTransferResult> {
-        let device = table
-            .by_dynamic_addr(dynamic_addr)
-            .ok_or(I3cHciError::InvalidArgs)?;
-        self.ccc_direct_write(device.dat_index, ccc, data)
-    }
-
-    pub fn ccc_direct_read_addr<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        dynamic_addr: u8,
-        ccc: u8,
-        defining_byte: Option<u8>,
-        out: &mut [u8],
-    ) -> Result<HciTransferResult> {
-        let device = table
-            .by_dynamic_addr(dynamic_addr)
-            .ok_or(I3cHciError::InvalidArgs)?;
-        self.ccc_direct_read(device.dat_index, ccc, defining_byte, out)
-    }
-
-    pub fn ccc_direct_write_pid<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        pid: u64,
-        ccc: u8,
-        data: &[u8],
-    ) -> Result<HciTransferResult> {
-        let device = table.by_pid(pid).ok_or(I3cHciError::InvalidArgs)?;
-        self.ccc_direct_write(device.dat_index, ccc, data)
-    }
-
-    pub fn ccc_direct_read_pid<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        pid: u64,
-        ccc: u8,
-        defining_byte: Option<u8>,
-        out: &mut [u8],
-    ) -> Result<HciTransferResult> {
-        let device = table.by_pid(pid).ok_or(I3cHciError::InvalidArgs)?;
-        self.ccc_direct_read(device.dat_index, ccc, defining_byte, out)
-    }
-
     /// Enable IBI with an explicit maximum notification payload length.
     /// The ASPEED hardware limit is shared across targets and only grows.
     /// A zero length enables notifications without payload bytes.
@@ -907,29 +410,6 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         Ok(())
     }
 
-    pub fn enable_ibi_addr<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        dynamic_addr: u8,
-        payload: bool,
-    ) -> Result<HciTransferResult> {
-        let device = table
-            .by_dynamic_addr(dynamic_addr)
-            .ok_or(I3cHciError::InvalidArgs)?;
-        self.enable_ibi(device, payload)
-    }
-
-    pub fn disable_ibi_addr<const N: usize>(
-        &mut self,
-        table: &HciDeviceTable<N>,
-        dynamic_addr: u8,
-    ) -> Result<()> {
-        let device = table
-            .by_dynamic_addr(dynamic_addr)
-            .ok_or(I3cHciError::InvalidArgs)?;
-        self.disable_ibi(device)
-    }
-
     pub fn enable_hotjoin(&mut self) -> Result<()> {
         self.regs
             .clear_hc_control(super::constants::HC_CONTROL_HOT_JOIN_CTRL);
@@ -947,13 +427,18 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
     }
 
     pub fn enable_ibi_irq_events(&self) {
-        self.regs
-            .write_pio_intr_status_enable(STAT_IBI_STATUS_THLD | STAT_ALL_ERRORS);
+        if self.transport.is_dma() {
+            return;
+        }
+        self.regs.write_pio_intr_status_enable(
+            self.regs.pio_intr_status_enable() | STAT_IBI_STATUS_THLD | STAT_ALL_ERRORS,
+        );
         self.rearm_ibi_irq_events();
     }
 
     pub fn rearm_ibi_irq_events(&self) {
-        self.regs.write_pio_intr_signal_enable(STAT_IBI_STATUS_THLD);
+        self.transport
+            .enable_pio_irq_signals(STAT_IBI_STATUS_THLD | STAT_ALL_ERRORS);
     }
 
     pub fn accept_hotjoin<const N: usize>(
@@ -967,30 +452,9 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
     /// Poll one notification through the selected transport. This method does
     /// not enable CPU interrupt signaling; scheduling belongs to the caller.
     pub fn poll_controller_event(&mut self, payload: &mut [u8]) -> Result<Option<ControllerEvent>> {
-        if let Some(ring) = self.dma.as_mut() {
-            return ring
-                .poll_ibi(payload)
-                .map_err(I3cHciError::Dma)
-                .map(|event| {
-                    event.map(|event| ControllerEvent::TargetInterrupt {
-                        dynamic_addr: event.target_addr,
-                        payload_len: event.payload_len,
-                    })
-                });
-        }
-        let pending = self.regs.pio_intr_status();
-        if pending & STAT_ALL_ERRORS != 0 {
-            return Err(I3cHciError::TransferStatus(pending));
-        }
-        if pending & STAT_IBI_STATUS_THLD == 0 {
+        let Some((status, payload_len)) = self.transport.poll_ibi(payload)? else {
             return Ok(None);
-        }
-        // PIO consumption currently rearms its signals. Restore the caller's
-        // signaling policy instead of silently enabling IRQs in a polling app.
-        let signals = self.regs.pio_intr_signal_enable();
-        let received = self.pio.next_ibi(payload);
-        self.regs.write_pio_intr_signal_enable(signals);
-        let (status, payload_len) = received?;
+        };
         if status.error {
             return Err(I3cHciError::TransferStatus(status.raw));
         }
@@ -1011,15 +475,19 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         ))
     }
 
+    pub fn discard_partial_ibi(&mut self) -> Result<bool> {
+        self.transport.discard_partial_ibi()
+    }
+
     pub fn next_ibi_event<const N: usize>(
         &mut self,
         table: &HciDeviceTable<N>,
         payload: &mut [u8],
     ) -> Result<HciIbiEvent> {
-        if self.dma.is_some() {
+        if self.transport.is_dma() {
             return Err(I3cHciError::Unsupported);
         }
-        let (status, payload_len) = self.pio.next_ibi(payload)?;
+        let (status, payload_len) = self.transport.pio_mut()?.next_ibi(payload)?;
 
         let event = if status.target_addr == I3C_HOT_JOIN_ADDR && !status.read {
             HciIbiEvent::HotJoin { status }
@@ -1038,8 +506,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
                 payload_len,
             }
         };
-        // HL:: todo: dont use this
-        self.rearm_ibi_irq_events();
+        // The PIO transport rearms only when IRQ event delivery was selected.
         Ok(event)
     }
 
@@ -1054,84 +521,49 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         })
     }
 
+    fn command_address(&self, dat_index: u8, i2c: bool, broadcast: bool) -> Result<u8> {
+        if self.command_descriptor == CommandDescriptor::V1 {
+            return Ok(dat_index);
+        }
+        if broadcast && dat_index == 0 {
+            return Ok(I3C_BROADCAST_ADDR);
+        }
+        if i2c {
+            self.i2c_addr_from_dat(dat_index)
+        } else {
+            self.i3c_addr_from_dat(dat_index)
+        }
+    }
     fn i3c_private_write_regular_command(
         &self,
         dat_index: u8,
         tid: u8,
-        data_len: usize,
+        len: usize,
     ) -> Result<HciCommand> {
-        match self.command_descriptor {
-            CommandDescriptor::V1 => Ok(HciCommand::V1(HciCommandV1::i3c_private_write_regular(
-                dat_index,
-                tid,
-                data_len,
-                self.i3c_mode,
-            )?)),
-            CommandDescriptor::V2 => Ok(HciCommand::V2(HciCommandV2::i3c_private_write_regular(
-                self.i3c_addr_from_dat(dat_index)?,
-                tid,
-                data_len,
-                self.i3c_v2_rate,
-            )?)),
-        }
+        self.encoding.i3c_private_write_regular_command(
+            self.command_address(dat_index, false, false)?,
+            tid,
+            len,
+        )
     }
-
     fn i3c_private_read_command(&self, dat_index: u8, tid: u8, len: usize) -> Result<HciCommand> {
-        match self.command_descriptor {
-            CommandDescriptor::V1 => Ok(HciCommand::V1(HciCommandV1::i3c_private_read(
-                dat_index,
-                tid,
-                len,
-                self.i3c_mode,
-            )?)),
-            CommandDescriptor::V2 => Ok(HciCommand::V2(HciCommandV2::i3c_private_read(
-                self.i3c_addr_from_dat(dat_index)?,
-                tid,
-                len,
-                self.i3c_v2_rate,
-            )?)),
-        }
+        self.encoding.i3c_private_read_command(
+            self.command_address(dat_index, false, false)?,
+            tid,
+            len,
+        )
     }
-
-    fn i2c_write_regular_command(
-        &self,
-        dat_index: u8,
-        tid: u8,
-        data_len: usize,
-    ) -> Result<HciCommand> {
-        match self.command_descriptor {
-            CommandDescriptor::V1 => Ok(HciCommand::V1(HciCommandV1::i2c_write_regular(
-                dat_index,
-                tid,
-                data_len,
-                self.i2c_mode,
-            )?)),
-            CommandDescriptor::V2 => Ok(HciCommand::V2(HciCommandV2::i2c_write_regular(
-                self.i2c_addr_from_dat(dat_index)?,
-                tid,
-                data_len,
-                self.i2c_v2_rate,
-            )?)),
-        }
+    fn i2c_write_regular_command(&self, dat_index: u8, tid: u8, len: usize) -> Result<HciCommand> {
+        self.encoding.i2c_write_regular_command(
+            self.command_address(dat_index, true, false)?,
+            tid,
+            len,
+        )
     }
-
     fn i2c_read_command(&self, dat_index: u8, tid: u8, len: usize) -> Result<HciCommand> {
-        match self.command_descriptor {
-            CommandDescriptor::V1 => Ok(HciCommand::V1(HciCommandV1::i2c_read(
-                dat_index,
-                tid,
-                len,
-                self.i2c_mode,
-            )?)),
-            CommandDescriptor::V2 => Ok(HciCommand::V2(HciCommandV2::i2c_read(
-                self.i2c_addr_from_dat(dat_index)?,
-                tid,
-                len,
-                self.i2c_v2_rate,
-            )?)),
-        }
+        self.encoding
+            .i2c_read_command(self.command_address(dat_index, true, false)?, tid, len)
     }
-
     fn ccc_command(
         &self,
         dat_index: u8,
@@ -1141,32 +573,15 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         data: &[u8],
         defining_byte: Option<u8>,
     ) -> Result<HciCommand> {
-        match self.command_descriptor {
-            CommandDescriptor::V1 => Ok(HciCommand::V1(HciCommandV1::ccc(
-                dat_index,
-                tid,
-                read,
-                ccc,
-                data,
-                self.i3c_mode,
-                defining_byte,
-            )?)),
-            CommandDescriptor::V2 => Ok(HciCommand::V2(HciCommandV2::ccc(
-                if dat_index == 0 {
-                    I3C_BROADCAST_ADDR
-                } else {
-                    self.i3c_addr_from_dat(dat_index)?
-                },
-                tid,
-                read,
-                ccc,
-                data,
-                self.i3c_v2_rate,
-                defining_byte,
-            )?)),
-        }
+        self.encoding.ccc_command(
+            self.command_address(dat_index, false, true)?,
+            tid,
+            read,
+            ccc,
+            data,
+            defining_byte,
+        )
     }
-
     fn ccc_regular_command(
         &self,
         dat_index: u8,
@@ -1176,39 +591,18 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         data_len: usize,
         defining_byte: Option<u8>,
     ) -> Result<HciCommand> {
-        match self.command_descriptor {
-            CommandDescriptor::V1 => Ok(HciCommand::V1(HciCommandV1::ccc_regular(
-                dat_index,
-                tid,
-                read,
-                ccc,
-                data_len,
-                self.i3c_mode,
-                defining_byte,
-            )?)),
-            CommandDescriptor::V2 => Ok(HciCommand::V2(HciCommandV2::ccc_regular(
-                self.i3c_addr_from_dat(dat_index)?,
-                tid,
-                read,
-                ccc,
-                data_len,
-                self.i3c_v2_rate,
-                defining_byte,
-            )?)),
-        }
+        self.encoding.ccc_regular_command(
+            self.command_address(dat_index, false, false)?,
+            tid,
+            read,
+            ccc,
+            data_len,
+            defining_byte,
+        )
     }
-
     fn internal_command(&self, tid: u8, sub_cmd: u8, param: u32) -> Result<HciCommand> {
-        match self.command_descriptor {
-            CommandDescriptor::V1 => {
-                Ok(HciCommand::V1(HciCommandV1::internal(tid, sub_cmd, param)?))
-            }
-            CommandDescriptor::V2 => {
-                Ok(HciCommand::V2(HciCommandV2::internal(tid, sub_cmd, param)?))
-            }
-        }
+        self.encoding.internal_command(tid, sub_cmd, param)
     }
-
     fn i3c_addr_from_dat(&self, dat_index: u8) -> Result<u8> {
         let entry = self.read_dat_entry(dat_index)?;
         let dynamic_addr = entry.dynamic_addr();
@@ -1237,7 +631,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         Ok(addr)
     }
 
-    fn read_dat_entry(&self, dat_index: u8) -> Result<DatEntryV1> {
+    pub(super) fn read_dat_entry(&self, dat_index: u8) -> Result<DatEntryV1> {
         if self.sections.dat.offset == 0
             || self.sections.dat.entry_size != DAT_V1_ENTRY_SIZE
             || u16::from(dat_index) >= self.sections.dat.entries
@@ -1267,7 +661,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
         Ok(DatEntryV1 { word0, word1 })
     }
 
-    fn write_dat_entry(&self, dat_index: u8, entry: DatEntryV1) -> Result<()> {
+    pub(super) fn write_dat_entry(&self, dat_index: u8, entry: DatEntryV1) -> Result<()> {
         if self.sections.dat.offset == 0
             || self.sections.dat.entry_size != DAT_V1_ENTRY_SIZE
             || u16::from(dat_index) >= self.sections.dat.entries
@@ -1294,7 +688,7 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
             .ok_or(I3cHciError::InvalidArgs)
     }
 
-    fn next_tid(&mut self) -> u8 {
+    pub(super) fn next_tid(&mut self) -> u8 {
         let tid = self.next_tid & 0x0f;
         self.next_tid = self.next_tid.wrapping_add(1) & 0x0f;
         tid
@@ -1304,30 +698,6 @@ impl<'a, Y: FnMut(u32)> I3cHciMaster<'a, Y> {
 #[must_use]
 const fn valid_i3c_addr(address: u8) -> bool {
     address > 0x07 && address < I3C_BROADCAST_ADDR
-}
-
-fn decode_v2_daa_identity(
-    dat_index: u8,
-    dynamic_addr: u8,
-    identity: &[u8; 8],
-) -> Result<HciI3cDevice> {
-    if dat_index > 0x7f || !valid_i3c_addr(dynamic_addr) {
-        return Err(I3cHciError::InvalidArgs);
-    }
-
-    let pid_low = u32::from_le_bytes([identity[0], identity[1], identity[2], identity[3]]) as u64;
-    let upper = u32::from_le_bytes([identity[4], identity[5], identity[6], identity[7]]);
-    let pid = (((upper & 0xffff) as u64) << 32) | pid_low;
-    let bcr = ((upper >> 16) & 0xff) as u8;
-    let dcr = ((upper >> 24) & 0xff) as u8;
-
-    Ok(HciI3cDevice {
-        dat_index,
-        dynamic_addr,
-        pid,
-        bcr,
-        dcr,
-    })
 }
 
 #[must_use]
@@ -1342,4 +712,312 @@ pub fn dynamic_address_payload(address: u8) -> Result<u8> {
         1
     };
     Ok((address << 1) | parity)
+}
+
+impl From<HciI3cDevice> for I3cDevice {
+    fn from(device: HciI3cDevice) -> Self {
+        Self {
+            pid: device.pid,
+            dynamic_addr: device.dynamic_addr,
+            bcr: device.bcr,
+            dcr: device.dcr,
+        }
+    }
+}
+
+/// Owns a fresh controller's discovery table, allocator and selected transport.
+/// Keep one session for the bus lifetime; do not independently reset/readdress
+/// devices through the low-level API while a session owns their assignments.
+#[must_use = "controller sessions require explicit shutdown"]
+pub struct Controller<'a, Y: FnMut(u32), const N: usize> {
+    master: I3cHciMaster<'a, Y>,
+    devices: HciDeviceTable<N>,
+    allocator: DatAllocator,
+    topology: super::daa::TopologyState,
+}
+
+impl<'a, Y: FnMut(u32), const N: usize> Controller<'a, Y, N> {
+    /// Attach using the firmware-selected command rate and timeout.
+    pub fn from_configured_core<F: FnMut(u32)>(
+        core: &'a mut I3cHciCore<F>,
+        yield_us: Y,
+    ) -> Result<Self> {
+        let config = core.board_config().ok_or(I3cHciError::InvalidArgs)?;
+        if !matches!(config.role, super::config::BusRole::Controller { .. })
+            || core.init_mode() != Some(config.role.init_mode())
+            || core.selected_io() != Some(config.io_mode)
+        {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        Self::new(core, config.scl_hz, yield_us).map(|bus| bus.with_poll_budget(config.poll_budget))
+    }
+
+    /// Attach to an initialized, idle primary before discovery. The core's
+    /// command capability and selected transport are applied automatically.
+    /// scl_hz selects command timing; board setup must configure matching PHY.
+    pub fn new<F: FnMut(u32)>(
+        core: &'a mut I3cHciCore<F>,
+        scl_hz: u32,
+        yield_us: Y,
+    ) -> Result<Self> {
+        let format = core.command_descriptor().ok_or(I3cHciError::InvalidArgs)?;
+        let mode = core.selected_io().ok_or(I3cHciError::InvalidArgs)?;
+        if core.init_mode() != Some(super::types::InitMode::Primary)
+            || N == 0
+            || scl_hz == 0
+            || core.sections().dat.entries == 0
+            || core.regs().controller_device_addr() & super::constants::MASTER_DYNAMIC_ADDR_VALID
+                == 0
+        {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        let mut master = I3cHciMaster::new(core.regs(), core.sections(), scl_hz, yield_us)
+            .with_command_descriptor(format);
+        if mode == IoMode::Dma {
+            master = master.with_dma(Ring::init(core).map_err(I3cHciError::from)?)?;
+        }
+        Self::from_master(master)
+    }
+
+    /// Wrap a freshly initialized, undiscovered master, taking ownership of its
+    /// transport. Board lifecycle code must not create another session on it.
+    pub fn from_master(master: I3cHciMaster<'a, Y>) -> Result<Self> {
+        let entries = master.sections.dat.entries.min(128) as u8;
+        if N == 0 || entries == 0 {
+            let mut master = master;
+            master.transport.shutdown()?;
+            return Err(I3cHciError::InvalidArgs);
+        }
+        Ok(Self {
+            master,
+            devices: HciDeviceTable::new(),
+            allocator: DatAllocator::new(entries, true),
+            topology: super::daa::TopologyState::Known,
+        })
+    }
+
+    pub fn with_poll_budget(mut self, poll_budget: u32) -> Self {
+        self.master = self.master.with_poll_budget(poll_budget);
+        self
+    }
+
+    /// Connect the pre-registered IRQ event source. Board setup owns NVIC.
+    pub fn with_irq_events(mut self, bus: usize) -> Self {
+        self.master = self.master.with_irq_events(bus);
+        self
+    }
+
+    pub fn devices(&self) -> impl Iterator<Item = I3cDevice> + '_ {
+        self.devices
+            .iter()
+            .filter(|_| self.topology == super::daa::TopologyState::Known)
+            .map(I3cDevice::from)
+    }
+
+    fn resolve(&self, device: I3cDevice) -> Result<HciI3cDevice> {
+        self.topology.require_known()?;
+        self.devices
+            .by_dynamic_addr(device.dynamic_addr)
+            .filter(|entry| I3cDevice::from(*entry) == device)
+            .ok_or(I3cHciError::InvalidArgs)
+    }
+
+    /// Explicit shutdown, since stopping DMA can fail and cannot be hidden in Drop.
+    pub fn shutdown(mut self) -> Result<()> {
+        self.master.transport.shutdown()
+    }
+}
+
+impl<Y: FnMut(u32), const N: usize> I3cController for Controller<'_, Y, N> {
+    fn discover(&mut self) -> Result<usize> {
+        self.topology.require_known()?;
+        if self.devices.is_full() {
+            return Err(I3cHciError::NoSpace);
+        }
+        self.topology = super::daa::TopologyState::RecoveryRequired;
+        let count = self
+            .master
+            .entdaa_new_devices(&mut self.devices, &mut self.allocator)?;
+        self.topology = super::daa::TopologyState::Known;
+        Ok(count)
+    }
+    fn device_by_pid(&self, pid: u64) -> Option<I3cDevice> {
+        self.topology.require_known().ok()?;
+        self.devices.by_pid(pid).map(I3cDevice::from)
+    }
+    fn device_by_address(&self, address: u8) -> Option<I3cDevice> {
+        self.topology.require_known().ok()?;
+        self.devices.by_dynamic_addr(address).map(I3cDevice::from)
+    }
+    fn write(&mut self, device: I3cDevice, data: &[u8]) -> Result<()> {
+        let device = self.resolve(device)?;
+        self.master
+            .private_write(device.dat_index, data)
+            .map(|_| ())
+    }
+    fn read(&mut self, device: I3cDevice, data: &mut [u8]) -> Result<usize> {
+        let device = self.resolve(device)?;
+        self.master
+            .private_read(device.dat_index, data)
+            .and_then(checked_read_length)
+    }
+    fn ccc_write(&mut self, device: I3cDevice, ccc: u8, data: &[u8]) -> Result<()> {
+        // Address-changing CCCs must go through I3cBusManagement so the
+        // session updates its discovery table along with the hardware.
+        if ccc < 0x80 || matches!(ccc, 0x86 | 0x87 | 0x88) {
+            return Err(I3cHciError::Unsupported);
+        }
+        let device = self.resolve(device)?;
+        self.master
+            .ccc_direct_write(device.dat_index, ccc, data)
+            .map(|_| ())
+    }
+    fn ccc_read(&mut self, device: I3cDevice, ccc: u8, data: &mut [u8]) -> Result<usize> {
+        if ccc < 0x80 {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        let device = self.resolve(device)?;
+        self.master
+            .ccc_direct_read(device.dat_index, ccc, None, data)
+            .and_then(checked_read_length)
+    }
+    fn enable_ibi(&mut self, device: I3cDevice, max_payload: u16) -> Result<()> {
+        let device = self.resolve(device)?;
+        self.master
+            .enable_ibi_with_max_payload(device, max_payload)
+            .map(|_| ())
+    }
+    fn disable_ibi(&mut self, device: I3cDevice) -> Result<()> {
+        let device = self.resolve(device)?;
+        self.master.disable_ibi(device)
+    }
+    fn discard_partial_ibi(&mut self) -> Result<bool> {
+        self.master.discard_partial_ibi()
+    }
+    fn poll_event(&mut self, payload: &mut [u8]) -> Result<Option<ControllerEvent>> {
+        self.topology.require_known()?;
+        self.master.poll_controller_event(payload)
+    }
+}
+
+impl<Y: FnMut(u32), const N: usize> I3cBusManagement for Controller<'_, Y, N> {
+    fn broadcast_ccc(&mut self, ccc: u8, data: &[u8]) -> Result<()> {
+        self.topology.require_known()?;
+        // Do not permit raw broadcasts to silently invalidate discovery state.
+        if ccc >= 0x80 || matches!(ccc, I3C_CCC_RSTDAA_BROADCAST | super::ccc::I3C_CCC_ENTDAA) {
+            return Err(I3cHciError::Unsupported);
+        }
+        self.master.ccc_broadcast_write(ccc, data)
+    }
+
+    fn reset_addresses(&mut self, device: Option<I3cDevice>) -> Result<()> {
+        if let Some(device) = device {
+            if self.devices.len() != 1 {
+                return Err(I3cHciError::Unsupported);
+            }
+            let device = self.resolve(device)?;
+            self.topology = super::daa::TopologyState::RecoveryRequired;
+            self.master.rstdaa_direct(device.dat_index)?;
+        } else {
+            self.topology = super::daa::TopologyState::RecoveryRequired;
+            self.master.rstdaa_broadcast()?;
+        }
+        self.devices.clear();
+        self.allocator = DatAllocator::new(self.master.sections.dat.entries.min(128) as u8, true);
+        self.topology = super::daa::TopologyState::Known;
+        Ok(())
+    }
+
+    fn set_address(&mut self, device: I3cDevice, address: u8) -> Result<I3cDevice> {
+        let old = self.resolve(device)?;
+        self.check_new_address(address)?;
+        let entry = self.master.read_dat_entry(old.dat_index)?;
+        // Discovery uses address-indexed DAT allocation. Reserve the new slot
+        // before changing the bus address, then release the old slot only after
+        // the hardware entry and cached identity agree. Otherwise discovery can
+        // choose the freed old address but fail to allocate its still-used slot.
+        let slot = self.allocator.allocate(Some(address))?;
+        // A failed transfer may already have changed the target's address. Keep
+        // both reservations on error; the caller must reset/re-enumerate.
+        self.topology = super::daa::TopologyState::RecoveryRequired;
+        self.master.setnewda(old.dat_index, address)?;
+        self.master
+            .write_dat_entry(slot, entry.with_dynamic_addr(address))?;
+        self.master
+            .write_dat_entry(old.dat_index, DatEntryV1::rejected())?;
+        let moved = HciI3cDevice {
+            dat_index: slot,
+            dynamic_addr: address,
+            ..old
+        };
+        // Replace by the old slot, including targets whose PID happens to be 0.
+        // Every existing entry is copied exactly once, so capacity cannot grow.
+        let mut updated = HciDeviceTable::new();
+        for device in self.devices.iter() {
+            updated.push(if device.dat_index == old.dat_index {
+                moved
+            } else {
+                device
+            })?;
+        }
+        self.devices = updated;
+        self.allocator.free(old.dat_index)?;
+        self.topology = super::daa::TopologyState::Known;
+        Ok(moved.into())
+    }
+
+    fn assign_static_address(&mut self, static_addr: u8, identity: I3cDevice) -> Result<I3cDevice> {
+        self.check_new_address(static_addr)?;
+        self.check_new_address(identity.dynamic_addr)?;
+        if self.devices.is_full()
+            || identity.pid >= (1u64 << 48)
+            || self.devices.by_pid(identity.pid).is_some()
+        {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        let slot = self.allocator.allocate(Some(identity.dynamic_addr))?;
+        self.topology = super::daa::TopologyState::RecoveryRequired;
+        let result = (|| {
+            self.master.attach_static_i3c_device(slot, static_addr)?;
+            self.master.setdasa(slot, identity.dynamic_addr)?;
+            self.master.attach_i3c_device(slot, identity.dynamic_addr)?;
+            self.devices.push(HciI3cDevice {
+                dat_index: slot,
+                dynamic_addr: identity.dynamic_addr,
+                pid: identity.pid,
+                bcr: identity.bcr,
+                dcr: identity.dcr,
+            })?;
+            self.topology = super::daa::TopologyState::Known;
+            Ok(identity)
+        })();
+        // On an uncertain bus error keep the slot reserved; callers should stop
+        // traffic and reset/re-enumerate, rather than reuse possibly live state.
+        result
+    }
+}
+
+impl<Y: FnMut(u32), const N: usize> Controller<'_, Y, N> {
+    fn check_new_address(&self, address: u8) -> Result<()> {
+        self.topology.require_known()?;
+        let controller = self.master.regs.controller_device_addr();
+        let controller_address = ((controller & super::constants::MASTER_DYNAMIC_ADDR_MASK)
+            >> super::constants::MASTER_DYNAMIC_ADDR_SHIFT) as u8;
+        if !valid_i3c_addr(address)
+            || address == controller_address
+            || self.devices.by_dynamic_addr(address).is_some()
+        {
+            return Err(I3cHciError::InvalidArgs);
+        }
+        Ok(())
+    }
+}
+
+/// Do not report a clipped PIO read as a complete application transfer.
+/// DMA already rejects overflow; both transports expose the same contract.
+fn checked_read_length(result: HciTransferResult) -> Result<usize> {
+    if result.rx_len != result.response.data_len {
+        return Err(I3cHciError::NoSpace);
+    }
+    Ok(result.rx_len)
 }

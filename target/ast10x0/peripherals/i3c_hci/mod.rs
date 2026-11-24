@@ -9,31 +9,38 @@
 //! setup and low-level diagnostics.
 
 pub mod api;
+mod aspeed;
 pub mod ccc;
 pub mod cmd;
+mod completion;
+pub mod config;
 pub mod constants;
-pub mod controller;
-pub mod core;
+mod core;
 pub mod daa;
 pub mod dat;
 pub mod dct;
+mod diagnostics;
 pub mod dma;
-pub mod error;
-pub mod irq;
-pub mod master;
-pub mod pio;
-pub mod registers;
-pub mod target;
-pub mod types;
+mod error;
+mod irq;
+mod master;
+mod pio;
+mod registers;
+mod target;
+mod transport;
+mod types;
 
-pub use api::{ControllerEvent, I3cController, I3cDevice, I3cTarget, TargetEvent};
+pub use api::{
+    ControllerEvent, I3cBusManagement, I3cController, I3cDevice, I3cTarget, TargetEvent,
+};
 pub use ccc::*;
 pub use cmd::{
     HciCommand, HciCommandKind, HciCommandV1, HciCommandV2, HciResponse, HciTargetCommand,
-    TID_TARGET_IBI, TID_TARGET_RD_DATA, i2c_mode, i2c_v2_rate, i3c_sdr_mode, i3c_sdr_v2_rate,
+    IbiStatus, TID_TARGET_IBI, TID_TARGET_RD_DATA, i2c_mode, i2c_v2_rate, i3c_sdr_mode,
+    i3c_sdr_v2_rate,
 };
+pub use config::{BusConfig, BusRole, SclPeriods, TimingConfig, bus_config};
 pub use constants::*;
-pub use controller::Controller;
 pub use core::{
     CommandDescriptor, HciSections, HciVersion, I3cHciConfig, I3cHciCore, IoMode, TableSection,
     discover_sections_from_regs, parse_hci_version, select_command_descriptor,
@@ -47,22 +54,19 @@ pub use dat::{
     DatAllocator, DatEntryV1, odd_parity7,
 };
 pub use dct::{DCT_V1_ENTRY_SIZE, DCT_V1_ENTRY_WORDS, DctEntryV1, read_dct_entry_v1};
-pub use dma::{
-    DmaIbiEvent, DmaRing, DmaRingEntry, RhsInfo, Ring, init_rhs, parse_rhs_control, rhs_info,
-};
-pub use error::{I3cHciError, Result};
+pub use dma::{DmaIbiEvent, RhsInfo, Ring, init_rhs, parse_rhs_control, rhs_info};
+pub use error::{DmaError, I3cHciError, Result};
 pub use irq::{
     IsrCtx, IsrEvents, dispatch_i3c_hci_irq, isr_events, register_i3c_hci_irq_handler,
     unregister_i3c_hci_irq_handler,
 };
+pub use master::Controller;
 pub use master::{
     HciDeviceTable, HciDeviceTableIter, HciI3cDevice, HciIbiEvent, HciTransfer, HciTransferResult,
     I3C_BROADCAST_ADDR, I3C_HOT_JOIN_ADDR, I3cHciMaster, dynamic_address_payload,
     validate_transfer,
 };
-pub use pio::{
-    I3cHciPio, IbiStatus, PioTransferPairResult, TargetResponse, bytes_from_word, word_from_bytes,
-};
+pub use pio::{I3cHciPio, PioTransferPairResult, TargetResponse, bytes_from_word, word_from_bytes};
 pub use registers::I3cHciRegisters;
 pub use target::{
     HciTargetCcc, HciTargetConfig, HciTargetEvent, I3cHciTarget, classify_target_ccc,

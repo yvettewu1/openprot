@@ -758,3 +758,210 @@ mod target_descriptor_tests {
         assert_eq!(HciTargetCommand::ibi_payload(0).unwrap().word, 0x0000_0009);
     }
 }
+
+/// Encoding selection has no MMIO, waiting, device table or buffer ownership.
+pub(crate) struct CommandEncoding {
+    pub(crate) v2: bool,
+    i3c_mode: u8,
+    i2c_mode: u8,
+    i3c_v2_rate: u8,
+    i2c_v2_rate: u8,
+}
+impl CommandEncoding {
+    pub(crate) fn new(i3c_hz: u32, i2c_hz: u32) -> Self {
+        Self {
+            v2: false,
+            i3c_mode: i3c_sdr_mode(i3c_hz),
+            i2c_mode: i2c_mode(i2c_hz),
+            i3c_v2_rate: i3c_sdr_v2_rate(i3c_hz),
+            i2c_v2_rate: i2c_v2_rate(i2c_hz),
+        }
+    }
+    pub(crate) fn set_i2c_rate(&mut self, hz: u32) {
+        self.i2c_mode = i2c_mode(hz);
+        self.i2c_v2_rate = i2c_v2_rate(hz);
+    }
+    pub(crate) fn i3c_private_write_regular_command(
+        &self,
+        dat_index: u8,
+        tid: u8,
+        data_len: usize,
+    ) -> Result<HciCommand> {
+        match self.v2 {
+            false => Ok(HciCommand::V1(HciCommandV1::i3c_private_write_regular(
+                dat_index,
+                tid,
+                data_len,
+                self.i3c_mode,
+            )?)),
+            true => Ok(HciCommand::V2(HciCommandV2::i3c_private_write_regular(
+                dat_index,
+                tid,
+                data_len,
+                self.i3c_v2_rate,
+            )?)),
+        }
+    }
+
+    pub(crate) fn i3c_private_read_command(
+        &self,
+        dat_index: u8,
+        tid: u8,
+        len: usize,
+    ) -> Result<HciCommand> {
+        match self.v2 {
+            false => Ok(HciCommand::V1(HciCommandV1::i3c_private_read(
+                dat_index,
+                tid,
+                len,
+                self.i3c_mode,
+            )?)),
+            true => Ok(HciCommand::V2(HciCommandV2::i3c_private_read(
+                dat_index,
+                tid,
+                len,
+                self.i3c_v2_rate,
+            )?)),
+        }
+    }
+
+    pub(crate) fn i2c_write_regular_command(
+        &self,
+        dat_index: u8,
+        tid: u8,
+        data_len: usize,
+    ) -> Result<HciCommand> {
+        match self.v2 {
+            false => Ok(HciCommand::V1(HciCommandV1::i2c_write_regular(
+                dat_index,
+                tid,
+                data_len,
+                self.i2c_mode,
+            )?)),
+            true => Ok(HciCommand::V2(HciCommandV2::i2c_write_regular(
+                dat_index,
+                tid,
+                data_len,
+                self.i2c_v2_rate,
+            )?)),
+        }
+    }
+
+    pub(crate) fn i2c_read_command(
+        &self,
+        dat_index: u8,
+        tid: u8,
+        len: usize,
+    ) -> Result<HciCommand> {
+        match self.v2 {
+            false => Ok(HciCommand::V1(HciCommandV1::i2c_read(
+                dat_index,
+                tid,
+                len,
+                self.i2c_mode,
+            )?)),
+            true => Ok(HciCommand::V2(HciCommandV2::i2c_read(
+                dat_index,
+                tid,
+                len,
+                self.i2c_v2_rate,
+            )?)),
+        }
+    }
+
+    pub(crate) fn ccc_command(
+        &self,
+        dat_index: u8,
+        tid: u8,
+        read: bool,
+        ccc: u8,
+        data: &[u8],
+        defining_byte: Option<u8>,
+    ) -> Result<HciCommand> {
+        match self.v2 {
+            false => Ok(HciCommand::V1(HciCommandV1::ccc(
+                dat_index,
+                tid,
+                read,
+                ccc,
+                data,
+                self.i3c_mode,
+                defining_byte,
+            )?)),
+            true => Ok(HciCommand::V2(HciCommandV2::ccc(
+                dat_index,
+                tid,
+                read,
+                ccc,
+                data,
+                self.i3c_v2_rate,
+                defining_byte,
+            )?)),
+        }
+    }
+
+    pub(crate) fn ccc_regular_command(
+        &self,
+        dat_index: u8,
+        tid: u8,
+        read: bool,
+        ccc: u8,
+        data_len: usize,
+        defining_byte: Option<u8>,
+    ) -> Result<HciCommand> {
+        match self.v2 {
+            false => Ok(HciCommand::V1(HciCommandV1::ccc_regular(
+                dat_index,
+                tid,
+                read,
+                ccc,
+                data_len,
+                self.i3c_mode,
+                defining_byte,
+            )?)),
+            true => Ok(HciCommand::V2(HciCommandV2::ccc_regular(
+                dat_index,
+                tid,
+                read,
+                ccc,
+                data_len,
+                self.i3c_v2_rate,
+                defining_byte,
+            )?)),
+        }
+    }
+
+    pub(crate) fn internal_command(&self, tid: u8, sub_cmd: u8, param: u32) -> Result<HciCommand> {
+        match self.v2 {
+            false => Ok(HciCommand::V1(HciCommandV1::internal(tid, sub_cmd, param)?)),
+            true => Ok(HciCommand::V2(HciCommandV2::internal(tid, sub_cmd, param)?)),
+        }
+    }
+}
+
+/// Controller IBI status format shared by PIO and DMA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IbiStatus {
+    pub raw: u32,
+    pub error: bool,
+    pub last: bool,
+    pub chunks: u8,
+    pub target_addr: u8,
+    pub read: bool,
+    pub data_len: usize,
+}
+
+impl IbiStatus {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Self {
+        Self {
+            raw,
+            error: ((raw >> 30) & 1) != 0,
+            last: ((raw >> 24) & 1) != 0,
+            chunks: ((raw >> 16) & 0xff) as u8,
+            target_addr: ((raw >> 9) & 0x7f) as u8,
+            read: ((raw >> 8) & 1) != 0,
+            data_len: (raw & 0xff) as usize,
+        }
+    }
+}

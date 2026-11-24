@@ -4,8 +4,12 @@
 //! Standalone SRAM startup, IRQ vectors and plain-text UART12 logging.
 #![no_std]
 
-pub mod i3c_setup;
+pub mod i3c_controller;
+pub mod i3c_loopback;
+pub mod i3c_mctp_controller;
 pub mod i3c_mctp_setup;
+pub mod i3c_mctp_target;
+pub mod i3c_setup;
 
 use core::arch::global_asm;
 use core::fmt::{self, Write};
@@ -27,7 +31,13 @@ global_asm!(
     .endr
     .word interrupt_handler_96
     .word interrupt_handler_97
-    .rept 398
+    .word interrupt_handler_98
+    .word interrupt_handler_99
+    .word interrupt_handler_100
+    .word interrupt_handler_101
+    .word interrupt_handler_102
+    .word interrupt_handler_103
+    .rept 392
     .word DefaultHandler
     .endr
 
@@ -87,9 +97,21 @@ DefaultHandler:
     b DefaultHandler
 
     .weak interrupt_handler_96
-    .thumb_set interrupt_handler_96, DefaultHandler
+    .thumb_set interrupt_handler_96, i3c_test_irq_0
     .weak interrupt_handler_97
-    .thumb_set interrupt_handler_97, DefaultHandler
+    .thumb_set interrupt_handler_97, i3c_test_irq_1
+    .weak interrupt_handler_98
+    .thumb_set interrupt_handler_98, i3c_test_irq_2
+    .weak interrupt_handler_99
+    .thumb_set interrupt_handler_99, i3c_test_irq_3
+    .weak interrupt_handler_100
+    .thumb_set interrupt_handler_100, i3c_test_irq_4
+    .weak interrupt_handler_101
+    .thumb_set interrupt_handler_101, i3c_test_irq_5
+    .weak interrupt_handler_102
+    .thumb_set interrupt_handler_102, i3c_test_irq_6
+    .weak interrupt_handler_103
+    .thumb_set interrupt_handler_103, i3c_test_irq_7
 "#
 );
 
@@ -136,4 +158,38 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+// Shared dispatch for the existing optional IRQ tests on any configured port.
+#[unsafe(no_mangle)]
+pub extern "C" fn i3c_test_irq_0() {
+    ast10x0_i3c_hci::dispatch_i3c_hci_irq(0);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn i3c_test_irq_1() {
+    ast10x0_i3c_hci::dispatch_i3c_hci_irq(1);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn i3c_test_irq_2() {
+    ast10x0_i3c_hci::dispatch_i3c_hci_irq(2);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn i3c_test_irq_3() {
+    ast10x0_i3c_hci::dispatch_i3c_hci_irq(3);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn i3c_test_irq_4() {
+    ast10x0_i3c_hci::dispatch_i3c_hci_irq(4);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn i3c_test_irq_5() {
+    ast10x0_i3c_hci::dispatch_i3c_hci_irq(5);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn i3c_test_irq_6() {
+    ast10x0_i3c_hci::dispatch_i3c_hci_irq(6);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn i3c_test_irq_7() {
+    ast10x0_i3c_hci::dispatch_i3c_hci_irq(7);
 }

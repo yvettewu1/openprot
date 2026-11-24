@@ -7,9 +7,6 @@ use core::marker::PhantomData;
 
 use ast1080_pac as device;
 
-use super::constants;
-use super::types::{InitMode, TargetRole};
-
 pub struct I3cHciRegisters {
     regs: *const device::i3c::RegisterBlock,
     bus: u8,
@@ -76,14 +73,6 @@ impl I3cHciRegisters {
     pub fn clear_hc_control(&self, mask: u32) {
         self.write_hc_control(self.hc_control() & !mask);
     }
-    #[inline]
-    pub fn set_bus_enable(&self, enable: bool) {
-        if enable {
-            self.set_hc_control(constants::HC_CONTROL_BUS_ENABLE);
-        } else {
-            self.clear_hc_control(constants::HC_CONTROL_BUS_ENABLE);
-        }
-    }
 
     #[inline]
     pub fn controller_device_addr(&self) -> u32 {
@@ -146,13 +135,11 @@ impl I3cHciRegisters {
     }
     #[inline]
     pub fn write_dct_section(&self, value: u32) {
-        let ptr = unsafe { (self.regs as *mut u8).add(0x34).cast::<u32>() };
-        unsafe { core::ptr::write_volatile(ptr, value) };
+        self.regs()
+            .hcicapability034()
+            .write(|w| unsafe { w.bits(value) });
     }
-    #[inline]
-    pub fn reset_dct_index(&self) {
-        self.write_dct_section(self.dct_section() & !constants::DCT_TABLE_INDEX_MASK);
-    }
+
     #[inline]
     pub fn ring_headers_section(&self) -> u32 {
         self.regs().hcicapability038().read().bits()
@@ -259,14 +246,23 @@ impl I3cHciRegisters {
         entry_size: u8,
         index: u8,
         word: u8,
-    ) -> Option<*mut u32> {
-        if section_offset == 0 || entry_size == 0 || word >= 4 {
+    ) -> Option<*const device::i3c::Hcidatsingle000> {
+        if section_offset == 0
+            || entry_size == 0
+            || word >= 4
+            || usize::from(word) * 4 >= usize::from(entry_size)
+        {
             return None;
         }
         let byte_offset = usize::from(section_offset)
             + usize::from(index) * usize::from(entry_size)
             + usize::from(word) * core::mem::size_of::<u32>();
-        Some(unsafe { (self.regs as *mut u8).add(byte_offset).cast::<u32>() })
+        if byte_offset % 4 != 0 || byte_offset + 4 > 0x1000 {
+            return None;
+        }
+        // PAC has no dynamic DAT array. Its raw DWORD register type is valid
+        // at each aligned word in the hardware-reported table window.
+        Some(unsafe { (self.regs as *const u8).add(byte_offset).cast() })
     }
 
     #[inline]
@@ -278,7 +274,7 @@ impl I3cHciRegisters {
         word: u8,
     ) -> Option<u32> {
         self.table_word_ptr(section_offset, entry_size, index, word)
-            .map(|ptr| unsafe { core::ptr::read_volatile(ptr) })
+            .map(|ptr| unsafe { (&*ptr).read().bits() })
     }
 
     #[inline]
@@ -291,7 +287,9 @@ impl I3cHciRegisters {
         value: u32,
     ) -> Option<()> {
         self.table_word_ptr(section_offset, entry_size, index, word)
-            .map(|ptr| unsafe { core::ptr::write_volatile(ptr, value) })
+            .map(|ptr| unsafe {
+                (&*ptr).write(|w| w.bits(value));
+            })
     }
 
     #[inline]
@@ -521,55 +519,6 @@ impl I3cHciRegisters {
     pub fn write_dma_ring_ibi_data_base_hi(&self, value: u32) {
         self.regs().hcirhs07c().write(|w| unsafe { w.bits(value) });
     }
-    /// Use the SDR4 timing for SDR0 too, for slow-bus bring-up.
-    /// Call with an idle bus before discovery or enabling target events.
-    /// Zephyr programs both the selected SDR bank and SDR0 in
-    /// mipi_i3c_hci_aspeed_populate_bus_timing. A command's mode selection
-    /// alone does not change the default bank used outside that command.
-    pub fn aspeed_copy_sdr4_to_sdr0(&self) {
-        let regs = self.regs();
-        let scl = regs.i3cphyctrlreg068().read().bits();
-        let tbit = regs.i3cphyctrlreg06c().read().bits();
-        let hold = regs.i3cphyctrlreg070().read().bits();
-        regs.i3cphyctrlreg038().write(|w| unsafe { w.bits(scl) });
-        regs.i3cphyctrlreg03c().write(|w| unsafe { w.bits(tbit) });
-        regs.i3cphyctrlreg040().write(|w| unsafe { w.bits(hold) });
-        unsafe {
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-        }
-    }
-
-    /// Non-destructive snapshots; never read FIFO ports for diagnostics.
-    pub fn trace_transfer_state(&self, stage: &str, trace: fn(core::fmt::Arguments<'_>)) {
-        let queue = self.regs().i3ccontrol0d8().read().bits();
-        trace(format_args!(
-            "HCI{} {} QUEUE_PTR0={:08x} CMD W/R={}/{} TX W/R={}/{} CTRL={:08x}",
-            self.bus,
-            stage,
-            queue,
-            queue & 3,
-            (queue >> 2) & 3,
-            (queue >> 12) & 0x1f,
-            (queue >> 20) & 0x1f,
-            self.aspeed_ctrl()
-        ));
-        trace(format_args!(
-            "HCI{} PHY SDR0 SCL={:08x} TBIT={:08x} HOLD={:08x} TARGET_HOLD={:08x} OPTION={:08x}",
-            self.bus,
-            self.regs().i3cphyctrlreg038().read().bits(),
-            self.regs().i3cphyctrlreg03c().read().bits(),
-            self.regs().i3cphyctrlreg040().read().bits(),
-            self.regs().i3cphyctrlreg090().read().bits(),
-            self.regs().i3cphyctrlreg0cc().read().bits()
-        ));
-        trace(format_args!(
-            "HCI{} PHY SDR4 SCL={:08x} TBIT={:08x} HOLD={:08x}",
-            self.bus,
-            self.regs().i3cphyctrlreg068().read().bits(),
-            self.regs().i3cphyctrlreg06c().read().bits(),
-            self.regs().i3cphyctrlreg070().read().bits()
-        ));
-    }
 
     #[inline]
     pub fn aspeed_ctrl(&self) -> u32 {
@@ -581,35 +530,7 @@ impl I3cHciRegisters {
             .i3ccontrol000()
             .write(|w| unsafe { w.bits(value) });
     }
-    #[inline]
-    pub fn aspeed_init(&self, mode: InitMode) {
-        self.write_aspeed_ctrl(constants::ASPEED_I3C_CTRL_INIT | mode as u32);
-    }
-    #[inline]
-    pub fn aspeed_prepare_daa(&self, dynamic_addr: u8) {
-        // ASPEED Zephyr vendor_aspeed.c: prep_daa_step selects one address
-        // in the corresponding 32-address DAA bitmap before each ENTDAA.
-        let value = 1u32 << (dynamic_addr & 31);
-        match dynamic_addr / 32 {
-            0 => self
-                .regs()
-                .i3ccontrol010()
-                .write(|w| unsafe { w.bits(value) }),
-            1 => self
-                .regs()
-                .i3ccontrol014()
-                .write(|w| unsafe { w.bits(value) }),
-            2 => self
-                .regs()
-                .i3ccontrol018()
-                .write(|w| unsafe { w.bits(value) }),
-            3 => self
-                .regs()
-                .i3ccontrol01c()
-                .write(|w| unsafe { w.bits(value) }),
-            _ => unreachable!("DAA requires a seven-bit address"),
-        };
-    }
+
     #[inline]
     pub fn aspeed_status(&self) -> u32 {
         self.regs().i3ccontrol004().read().bits()
@@ -618,38 +539,7 @@ impl I3cHciRegisters {
     pub fn aspeed_ibi_terminate_control(&self) -> u32 {
         self.regs().i3ccontrol008().read().bits()
     }
-    #[inline]
-    pub fn aspeed_ibi_terminate(&self, max_len: u16) {
-        // This limit is shared by all targets. Match ASPEED Linux/Zephyr:
-        // enabling another subscriber must not shorten an existing limit.
-        let previous =
-            self.aspeed_ibi_terminate_control() & constants::ASPEED_I3C_IBI_TERMINATE_LEN_MASK;
-        let max_len = core::cmp::max(previous, u32::from(max_len));
-        self.regs()
-            .i3ccontrol008()
-            .write(|w| unsafe { w.bits(constants::ASPEED_I3C_IBI_TERMINATE_EN | max_len) });
-    }
-    #[inline]
-    pub fn aspeed_set_slave_char_ctrl(&self, bcr: u8, dcr: u8, static_addr: Option<u8>) {
-        let mut value = (u32::from(dcr) << constants::ASPEED_I3C_SLV_CHAR_CTRL_DCR_SHIFT)
-            | (u32::from(bcr) << constants::ASPEED_I3C_SLV_CHAR_CTRL_BCR_SHIFT);
-        if let Some(addr) = static_addr {
-            value |= constants::ASPEED_I3C_SLV_CHAR_CTRL_STATIC_ADDR_EN
-                | (u32::from(addr) & constants::ASPEED_I3C_SLV_CHAR_CTRL_STATIC_ADDR_MASK);
-        }
-        self.regs()
-            .i3ccontrol0a0()
-            .write(|w| unsafe { w.bits(value) });
-    }
-    #[inline]
-    pub fn aspeed_set_slave_pid(&self, pid: u64) {
-        self.regs()
-            .i3ccontrol0a4()
-            .write(|w| unsafe { w.bits(pid as u32) });
-        self.regs()
-            .i3ccontrol0a8()
-            .write(|w| unsafe { w.bits(((pid >> 32) & 0xffff) as u32) });
-    }
+
     #[inline]
     pub fn aspeed_slave_status1(&self) -> u32 {
         self.regs().i3ccontrol0b4().read().bits()
@@ -664,29 +554,7 @@ impl I3cHciRegisters {
             .i3ccontrol0b0()
             .write(|w| unsafe { w.bits(value) });
     }
-    #[inline]
-    pub fn aspeed_target_dynamic_addr(&self) -> Option<u8> {
-        let status = self.aspeed_status();
-        if (status & constants::ASPEED_I3C_STS_SLV_DYNAMIC_ADDRESS_VALID) == 0 {
-            return None;
-        }
-        Some(
-            ((status & constants::ASPEED_I3C_STS_SLV_DYNAMIC_ADDRESS_MASK)
-                >> constants::ASPEED_I3C_STS_SLV_DYNAMIC_ADDRESS_SHIFT) as u8,
-        )
-    }
-    #[inline]
-    pub fn aspeed_target_role(&self) -> TargetRole {
-        let status = self.aspeed_status();
-        let secondary = (status
-            & (constants::ASPEED_I3C_STS_MODE_SECONDARY_SLV
-                | constants::ASPEED_I3C_STS_MODE_SECONDARY_MST
-                | constants::ASPEED_I3C_STS_MODE_SECONDARY_SLV_TO_MST
-                | constants::ASPEED_I3C_STS_MODE_SECONDARY_MST_TO_SLV))
-            != 0;
-        let target = secondary || (status & constants::ASPEED_I3C_STS_MODE_PURE_SLV) != 0;
-        TargetRole { secondary, target }
-    }
+
     #[inline]
     pub fn aspeed_intr_summary(&self) -> u32 {
         self.regs().i3ccontrol0f0().read().bits()
@@ -710,5 +578,232 @@ impl I3cHciRegisters {
             9 => Some(self.regs().hciextcap024().read().bits()),
             _ => None,
         }
+    }
+}
+
+impl I3cHciRegisters {
+    pub(crate) fn phy_038(&self) -> u32 {
+        self.regs().i3cphyctrlreg038().read().bits()
+    }
+    pub(crate) fn phy_03c(&self) -> u32 {
+        self.regs().i3cphyctrlreg03c().read().bits()
+    }
+    pub(crate) fn phy_040(&self) -> u32 {
+        self.regs().i3cphyctrlreg040().read().bits()
+    }
+    pub(crate) fn phy_068(&self) -> u32 {
+        self.regs().i3cphyctrlreg068().read().bits()
+    }
+    pub(crate) fn phy_06c(&self) -> u32 {
+        self.regs().i3cphyctrlreg06c().read().bits()
+    }
+    pub(crate) fn phy_070(&self) -> u32 {
+        self.regs().i3cphyctrlreg070().read().bits()
+    }
+    pub(crate) fn phy_090(&self) -> u32 {
+        self.regs().i3cphyctrlreg090().read().bits()
+    }
+    pub(crate) fn phy_0cc(&self) -> u32 {
+        self.regs().i3cphyctrlreg0cc().read().bits()
+    }
+    /// Raw PAC access only; calculation and programming policy live in aspeed.rs.
+    pub(crate) fn write_phy_timing_word(
+        &self,
+        offset: u16,
+        value: u32,
+    ) -> super::error::Result<()> {
+        match offset {
+            0x004 => self
+                .regs()
+                .i3cphyctrlreg004()
+                .write(|w| unsafe { w.bits(value) }),
+            0x008 => self
+                .regs()
+                .i3cphyctrlreg008()
+                .write(|w| unsafe { w.bits(value) }),
+            0x00c => self
+                .regs()
+                .i3cphyctrlreg00c()
+                .write(|w| unsafe { w.bits(value) }),
+            0x010 => self
+                .regs()
+                .i3cphyctrlreg010()
+                .write(|w| unsafe { w.bits(value) }),
+            0x014 => self
+                .regs()
+                .i3cphyctrlreg014()
+                .write(|w| unsafe { w.bits(value) }),
+            0x018 => self
+                .regs()
+                .i3cphyctrlreg018()
+                .write(|w| unsafe { w.bits(value) }),
+            0x01c => self
+                .regs()
+                .i3cphyctrlreg01c()
+                .write(|w| unsafe { w.bits(value) }),
+            0x020 => self
+                .regs()
+                .i3cphyctrlreg020()
+                .write(|w| unsafe { w.bits(value) }),
+            0x024 => self
+                .regs()
+                .i3cphyctrlreg024()
+                .write(|w| unsafe { w.bits(value) }),
+            0x028 => self
+                .regs()
+                .i3cphyctrlreg028()
+                .write(|w| unsafe { w.bits(value) }),
+            0x02c => self
+                .regs()
+                .i3cphyctrlreg02c()
+                .write(|w| unsafe { w.bits(value) }),
+            0x030 => self
+                .regs()
+                .i3cphyctrlreg030()
+                .write(|w| unsafe { w.bits(value) }),
+            0x034 => self
+                .regs()
+                .i3cphyctrlreg034()
+                .write(|w| unsafe { w.bits(value) }),
+            0x038 => self
+                .regs()
+                .i3cphyctrlreg038()
+                .write(|w| unsafe { w.bits(value) }),
+            0x03c => self
+                .regs()
+                .i3cphyctrlreg03c()
+                .write(|w| unsafe { w.bits(value) }),
+            0x040 => self
+                .regs()
+                .i3cphyctrlreg040()
+                .write(|w| unsafe { w.bits(value) }),
+            0x044 => self
+                .regs()
+                .i3cphyctrlreg044()
+                .write(|w| unsafe { w.bits(value) }),
+            0x048 => self
+                .regs()
+                .i3cphyctrlreg048()
+                .write(|w| unsafe { w.bits(value) }),
+            0x04c => self
+                .regs()
+                .i3cphyctrlreg04c()
+                .write(|w| unsafe { w.bits(value) }),
+            0x050 => self
+                .regs()
+                .i3cphyctrlreg050()
+                .write(|w| unsafe { w.bits(value) }),
+            0x054 => self
+                .regs()
+                .i3cphyctrlreg054()
+                .write(|w| unsafe { w.bits(value) }),
+            0x058 => self
+                .regs()
+                .i3cphyctrlreg058()
+                .write(|w| unsafe { w.bits(value) }),
+            0x05c => self
+                .regs()
+                .i3cphyctrlreg05c()
+                .write(|w| unsafe { w.bits(value) }),
+            0x060 => self
+                .regs()
+                .i3cphyctrlreg060()
+                .write(|w| unsafe { w.bits(value) }),
+            0x064 => self
+                .regs()
+                .i3cphyctrlreg064()
+                .write(|w| unsafe { w.bits(value) }),
+            0x068 => self
+                .regs()
+                .i3cphyctrlreg068()
+                .write(|w| unsafe { w.bits(value) }),
+            0x06c => self
+                .regs()
+                .i3cphyctrlreg06c()
+                .write(|w| unsafe { w.bits(value) }),
+            0x070 => self
+                .regs()
+                .i3cphyctrlreg070()
+                .write(|w| unsafe { w.bits(value) }),
+            0x074 => self
+                .regs()
+                .i3cphyctrlreg074()
+                .write(|w| unsafe { w.bits(value) }),
+            0x078 => self
+                .regs()
+                .i3cphyctrlreg078()
+                .write(|w| unsafe { w.bits(value) }),
+            0x07c => self
+                .regs()
+                .i3cphyctrlreg07c()
+                .write(|w| unsafe { w.bits(value) }),
+            0x080 => self
+                .regs()
+                .i3cphyctrlreg080()
+                .write(|w| unsafe { w.bits(value) }),
+            0x098 => self
+                .regs()
+                .i3cphyctrlreg098()
+                .write(|w| unsafe { w.bits(value) }),
+            0x0d8 => self
+                .regs()
+                .i3cphyctrlreg0d8()
+                .write(|w| unsafe { w.bits(value) }),
+            _ => return Err(super::error::I3cHciError::InvalidArgs),
+        };
+        Ok(())
+    }
+
+    /// Snapshot read-only SCU clock inputs. BSP must serialize clock changes.
+    pub(crate) fn i3c_clock_registers(&self) -> (u32, u32) {
+        // SAFETY: fixed PAC SCU address; these are read-only accesses, not a claim
+        // of exclusive ownership or permission to change the shared clock tree.
+        let scu = unsafe { &*device::Scu::ptr() };
+        (scu.scu300().read().bits(), scu.scu284().read().bits())
+    }
+
+    pub(crate) fn aspeed_queue_pointers(&self) -> u32 {
+        self.regs().i3ccontrol0d8().read().bits()
+    }
+    pub(crate) fn write_aspeed_ibi_terminate_control(&self, value: u32) {
+        self.regs()
+            .i3ccontrol008()
+            .write(|w| unsafe { w.bits(value) });
+    }
+    pub(crate) fn write_aspeed_slave_char_ctrl(&self, value: u32) {
+        self.regs()
+            .i3ccontrol0a0()
+            .write(|w| unsafe { w.bits(value) });
+    }
+    pub(crate) fn write_aspeed_slave_pid_low(&self, value: u32) {
+        self.regs()
+            .i3ccontrol0a4()
+            .write(|w| unsafe { w.bits(value) });
+    }
+    pub(crate) fn write_aspeed_slave_pid_high(&self, value: u32) {
+        self.regs()
+            .i3ccontrol0a8()
+            .write(|w| unsafe { w.bits(value) });
+    }
+    pub(crate) fn write_aspeed_daa_bitmap(&self, bank: u8, value: u32) {
+        match bank {
+            0 => self
+                .regs()
+                .i3ccontrol010()
+                .write(|w| unsafe { w.bits(value) }),
+            1 => self
+                .regs()
+                .i3ccontrol014()
+                .write(|w| unsafe { w.bits(value) }),
+            2 => self
+                .regs()
+                .i3ccontrol018()
+                .write(|w| unsafe { w.bits(value) }),
+            3 => self
+                .regs()
+                .i3ccontrol01c()
+                .write(|w| unsafe { w.bits(value) }),
+            _ => unreachable!("DAA bitmap bank"),
+        };
     }
 }

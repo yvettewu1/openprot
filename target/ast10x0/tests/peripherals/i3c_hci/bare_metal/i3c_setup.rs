@@ -200,9 +200,21 @@ fn show_table(
 /// Prepare clocks and display the initial state before any test transfers.
 ///
 /// # Safety
-/// Call once at startup with exclusive ownership of SCU, I3C0-3 and I3C DMA.
-/// This resets all four controllers; no transfer may be active on any of them.
+/// Call once at startup with exclusive ownership of SCU, I3C0-7 and I3C DMA.
+/// This resets all eight register instances; no transfer may be active on any of them.
 pub unsafe fn prepare_and_show(buses: &[u8], hv: bool) {
+    unsafe { prepare(buses, hv, true) };
+}
+
+/// Same board setup with startup register dumps suppressed.
+///
+/// # Safety
+/// Same exclusive startup ownership requirements as prepare_and_show().
+pub unsafe fn prepare_loopback(buses: &[u8], hv: bool) {
+    unsafe { prepare(buses, hv, false) };
+}
+
+unsafe fn prepare(buses: &[u8], hv: bool, verbose: bool) {
     let scu = unsafe { ast10x0_scu_pinctrl::ScuRegisters::new_global_unlocked() };
     // pin control
     if hv {
@@ -222,39 +234,44 @@ pub unsafe fn prepare_and_show(buses: &[u8], hv: bool) {
         scu.regs().scu428().write(|w| unsafe { w.bits(0x11111111) });
         scu.regs().scu42c().write(|w| unsafe { w.bits(0x00001111) });
 
-        crate::info!("disable dram cache");
+        if verbose {
+            crate::info!("disable dram cache");
+        }
         scu.regs().scu910().write(|w| unsafe { w.bits(0x0) });
         scu.regs().scu918().write(|w| unsafe { w.bits(0x0) });
     }
-    crate::info!("SCU pinctrl applied for I3C HCI0");
-    let scu400 = scu.regs().scu400().read().bits();
-    let scu408 = scu.regs().scu408().read().bits();
-    let scu420 = scu.regs().scu420().read().bits();
-    crate::info!(
-        "SCU400 [0x74C02400] = 0x{:08x}, I3C0 SCL mux={} SDA mux={}, SCU408 = 0x{:08x} , SCU420 = 0x{:08x}",
-        scu400,
-        scu400 & 0x7,
-        (scu400 >> 4) & 0x7,
-        scu408,
-        scu420
-    );
-    crate::info!(
-        "SCU900 = 0x{:08x}, SCU910 = 0x{:08x},SCU914 = 0x{:08x},SCU918 = 0x{:08x}",
-        scu.regs().scu900().read().bits(),
-        scu.regs().scu910().read().bits(),
-        scu.regs().scu914().read().bits(),
-        scu.regs().scu918().read().bits()
-    );
-
+    if verbose {
+        crate::info!("Shared test-board LV/HV pinctrl applied");
+        let scu400 = scu.regs().scu400().read().bits();
+        let scu408 = scu.regs().scu408().read().bits();
+        let scu420 = scu.regs().scu420().read().bits();
+        crate::info!(
+            "SCU400 [0x74C02400] = 0x{:08x}, I3C0 SCL mux={} SDA mux={}, SCU408 = 0x{:08x} , SCU420 = 0x{:08x}",
+            scu400,
+            scu400 & 0x7,
+            (scu400 >> 4) & 0x7,
+            scu408,
+            scu420
+        );
+        crate::info!(
+            "SCU900 = 0x{:08x}, SCU910 = 0x{:08x},SCU914 = 0x{:08x},SCU918 = 0x{:08x}",
+            scu.regs().scu900().read().bits(),
+            scu.regs().scu910().read().bits(),
+            scu.regs().scu914().read().bits(),
+            scu.regs().scu918().read().bits()
+        );
+    }
     reset_and_enable_i3cs(scu.regs());
-    show_scu(scu.regs());
-    for &bus in buses {
-        let Some(regs) = (unsafe { ast10x0_i3c_hci::I3cHciRegisters::new(bus) }) else {
-            crate::error!("Invalid diagnostic HCI bus {}", bus);
-            continue;
-        };
-        if let Err(error) = show_registers(&regs, "startup, before core init") {
-            crate::error!("HCI{} startup decode error: {:?}", bus, error);
+    if verbose {
+        show_scu(scu.regs());
+        for &bus in buses {
+            let Some(regs) = (unsafe { ast10x0_i3c_hci::I3cHciRegisters::new(bus) }) else {
+                crate::error!("Invalid diagnostic HCI bus {}", bus);
+                continue;
+            };
+            if let Err(error) = show_registers(&regs, "startup, before core init") {
+                crate::error!("HCI{} startup decode error: {:?}", bus, error);
+            }
         }
     }
 }
@@ -262,47 +279,111 @@ pub unsafe fn prepare_and_show(buses: &[u8], hv: bool) {
 pub fn display_pio_reg(hci: u32) {
     let start_addr = 0x74C20000 + (hci * 0x1000);
 
-    for addr in (start_addr..=(start_addr+0x4c)).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
+    for addr in (start_addr..=(start_addr + 0x4c)).step_by(4) {
+        let value = unsafe { core::ptr::read_volatile(addr as *const u32) };
 
         crate::info!("Capability:0x00 [0x{:08x}] = 0x{:08x}", addr, value);
     }
-    for addr in ((start_addr+0xe0)..=(start_addr+0xfc)).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
+    for addr in ((start_addr + 0xe0)..=(start_addr + 0xfc)).step_by(4) {
+        let value = unsafe { core::ptr::read_volatile(addr as *const u32) };
 
         crate::info!("PIO [0x{:08x}] = 0x{:08x}", addr, value);
     } /*
     for addr in (0x74C20100usize..=0x74C20200).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
+    let value = unsafe {
+    core::ptr::read_volatile(addr as *const u32)
+    };
 
-        crate::info!("DAT [0x{:08x}] = 0x{:08x}", addr, value);
+    crate::info!("DAT [0x{:08x}] = 0x{:08x}", addr, value);
     }
     for addr in (0x74C20500usize..=0x74C20600).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
+    let value = unsafe {
+    core::ptr::read_volatile(addr as *const u32)
+    };
 
-        crate::info!("DCT [0x{:08x}] = 0x{:08x}", addr, value);
+    crate::info!("DCT [0x{:08x}] = 0x{:08x}", addr, value);
     }
     for addr in (0x74C20d00usize..=0x74C20e00).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
+    let value = unsafe {
+    core::ptr::read_volatile(addr as *const u32)
+    };
 
-        crate::info!("control [0x{:08x}] = 0x{:08x}", addr, value);
+    crate::info!("control [0x{:08x}] = 0x{:08x}", addr, value);
     }
     for addr in (0x74C20F00usize..=0x74C20ff0).step_by(4) {
-        let value = unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        };
+    let value = unsafe {
+    core::ptr::read_volatile(addr as *const u32)
+    };
 
-        crate::info!("ext cap [0x{:08x}] = 0x{:08x}", addr, value);
+    crate::info!("ext cap [0x{:08x}] = 0x{:08x}", addr, value);
     }
-        */
+     */
+}
+/// Select the dedicated board port, then apply this test's transport.
+/// Extra enabled buses cannot change the test wiring.
+pub fn test_bus(
+    controller: bool,
+    io: ast10x0_i3c_hci::IoMode,
+) -> Result<(u8, ast10x0_i3c_hci::BusConfig), &'static str> {
+    use ast10x0_i3c_hci::{
+        BusRole,
+        config::{CONTROLLER_BUS, TARGET_BUS, bus_config},
+    };
+    let bus = if controller {
+        CONTROLLER_BUS
+    } else {
+        TARGET_BUS
+    };
+    let config = bus_config(bus).map_err(|_| "invalid or disabled dedicated board port")?;
+    if matches!(config.role, BusRole::Controller { .. }) != controller {
+        return Err("dedicated board port has the wrong role");
+    }
+    let config = config
+        .with_io_mode(io)
+        .map_err(|_| "requested transport lacks valid board resources")?;
+    Ok((bus, config))
+}
+
+pub fn bus_interrupt(bus: u8) -> ast1080_pac::Interrupt {
+    use ast1080_pac::Interrupt;
+    match bus {
+        0 => Interrupt::i3c,
+        1 => Interrupt::i3c1,
+        2 => Interrupt::i3c2,
+        3 => Interrupt::i3c3,
+        4 => Interrupt::i3c4,
+        5 => Interrupt::i3c5,
+        6 => Interrupt::i3c6,
+        7 => Interrupt::i3c7,
+        _ => unreachable!("validated board bus"),
+    }
+}
+
+/// Failure-only, non-destructive loopback snapshots. Never read FIFO ports.
+pub fn show_loopback_failure(regs: &ast10x0_i3c_hci::I3cHciRegisters, io: ast10x0_i3c_hci::IoMode) {
+    crate::error!(
+        "HCI{} state: HC={:08x} INTR={:08x} ASPEED={:08x} TARGET={:08x}",
+        regs.bus(),
+        regs.hc_control(),
+        regs.intr_status(),
+        regs.aspeed_status(),
+        regs.aspeed_slave_status1()
+    );
+    match io {
+        ast10x0_i3c_hci::IoMode::Dma => crate::error!(
+            "HCI{} DMA: STATUS={:08x} INTR={:08x} OP1={:08x} OP2={:08x} CHUNK={:08x}",
+            regs.bus(),
+            regs.dma_ring_status(),
+            regs.dma_ring_intr_status(),
+            regs.dma_ring_operation1(),
+            regs.dma_ring_operation2(),
+            regs.dma_ring_chunk_control()
+        ),
+        ast10x0_i3c_hci::IoMode::Pio => crate::error!(
+            "HCI{} PIO: STATUS={:08x} QUEUE_THLD={:08x}",
+            regs.bus(),
+            regs.pio_intr_status(),
+            regs.pio_queue_thld_ctrl()
+        ),
+    }
 }

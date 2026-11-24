@@ -85,6 +85,9 @@ pub struct I3cHciCore<Y: FnMut(u32)> {
     sections: HciSections,
     command_descriptor: Option<CommandDescriptor>,
     selected_io: Option<IoMode>,
+    init_mode: Option<InitMode>,
+    board_config: Option<super::config::BusConfig>,
+    programmed_timing: Option<super::aspeed::PhyTiming>,
 }
 
 impl<Y: FnMut(u32)> I3cHciCore<Y> {
@@ -103,7 +106,72 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
             sections: HciSections::default(),
             command_descriptor: None,
             selected_io: None,
+            init_mode: None,
+            board_config: None,
+            programmed_timing: None,
         })
+    }
+
+    /// Construct from the firmware bus table. BSP pins/clocks/cache setup must
+    /// precede init_configured(). Disabled bus nodes are rejected without MMIO.
+    ///
+    /// # Safety
+    /// Caller must own and serialize access to this physical bus.
+    pub unsafe fn from_board(bus: u8, yield_us: Y) -> Result<Self> {
+        let board = super::config::bus_config(bus)?;
+        unsafe { Self::from_board_config(bus, board, yield_us) }
+    }
+
+    /// Use the board's role/timing/resources with an explicit transport selection.
+    /// Selection is construction-time only; this never switches a running bus.
+    ///
+    /// # Safety
+    /// Same unique ownership and BSP setup requirements as from_board().
+    pub unsafe fn from_board_with_io(bus: u8, io_mode: IoMode, yield_us: Y) -> Result<Self> {
+        let board = super::config::bus_config(bus)?.with_io_mode(io_mode)?;
+        unsafe { Self::from_board_config(bus, board, yield_us) }
+    }
+
+    unsafe fn from_board_config(
+        bus: u8,
+        board: super::config::BusConfig,
+        yield_us: Y,
+    ) -> Result<Self> {
+        let mut core = unsafe {
+            Self::new(
+                I3cHciConfig {
+                    bus,
+                    io_mode: board.io_mode,
+                    data_big_endian: board.data_big_endian,
+                },
+                yield_us,
+            )
+        }?;
+        core.board_config = Some(board);
+        Ok(core)
+    }
+
+    pub fn board_config(&self) -> Option<super::config::BusConfig> {
+        self.board_config
+    }
+
+    pub(crate) fn programmed_timing(&self) -> Option<super::aspeed::PhyTiming> {
+        self.programmed_timing
+    }
+
+    /// Initialize the configured role and calculate/program its PHY timing.
+    /// Does not enable NVIC or construct a controller/target session.
+    pub fn init_configured(&mut self) -> Result<()> {
+        use super::config::BusRole;
+        let config = self.board_config.ok_or(I3cHciError::InvalidArgs)?;
+        config.validate()?;
+        match config.role {
+            BusRole::Controller { dynamic_addr } => self.init_primary(dynamic_addr)?,
+            BusRole::Secondary { .. } => self.init_secondary()?,
+            BusRole::Target { .. } => self.init_target()?,
+        }
+        self.disable_irq_signals();
+        Ok(())
     }
 
     #[inline]
@@ -148,11 +216,42 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
         self.init_with_mode(Some(InitMode::Primary), Some(address))
     }
 
+    /// Logical role selected by successful initialization, independent of bus.
+    pub fn init_mode(&self) -> Option<InitMode> {
+        self.init_mode
+    }
+
+    pub fn init_target(&mut self) -> Result<()> {
+        self.init_with_mode(Some(InitMode::Target), None)
+    }
+
     pub fn init_secondary(&mut self) -> Result<()> {
         self.init_with_mode(Some(InitMode::Secondary), None)
     }
 
     fn init_with_mode(&mut self, mode: Option<InitMode>, primary_addr: Option<u8>) -> Result<()> {
+        // A failed reinitialization must not retain a previous role.
+        self.init_mode = None;
+        self.programmed_timing = None;
+        // Validate every timing field before resetting hardware. Clock/divider
+        // configuration belongs to BSP and must remain stable while the bus runs.
+        let timing = if let Some(board) = self.board_config {
+            board.validate()?;
+            let input_hz = match board.timing.input_clock_hz {
+                Some(hz) => hz,
+                None => {
+                    let (hpll, selection) = self.regs.i3c_clock_registers();
+                    super::aspeed::i3c_input_clock_hz(hpll, selection)?
+                }
+            };
+            Some(super::aspeed::PhyTiming::calculate(
+                board.timing,
+                board.scl_hz,
+                input_hz,
+            )?)
+        } else {
+            None // Explicit low-level initialization retains BSP-owned timing.
+        };
         self.detect_version()?;
         self.discover_sections()?;
         self.soft_reset()?;
@@ -178,8 +277,13 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
                 );
             }
         }
+        if let Some(timing) = timing {
+            self.regs.aspeed_program_timing(&timing)?;
+        }
         self.configure_polling_status();
         self.enable_bus()?;
+        self.programmed_timing = timing;
+        self.init_mode = mode;
         Ok(())
     }
 
@@ -269,6 +373,9 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
     pub fn disable_irq_signals(&self) {
         self.regs.write_intr_signal_enable(0);
         self.regs.write_pio_intr_signal_enable(0);
+        if self.selected_io == Some(IoMode::Dma) {
+            self.regs.write_dma_ring_intr_signal_enable(0);
+        }
     }
 
     pub fn resume(&self) {
@@ -343,16 +450,6 @@ impl<Y: FnMut(u32)> I3cHciCore<Y> {
 
     fn wait_hc_control_clear(&mut self, mask: u32) -> Result<()> {
         self.wait_register_clear(I3cHciRegisters::hc_control, mask)
-    }
-
-    fn wait_register_clear(&mut self, read: fn(&I3cHciRegisters) -> u32, mask: u32) -> Result<()> {
-        for _ in 0..constants::MIPI_I3C_HCI_RESET_TIMEOUT_US {
-            if read(&self.regs) & mask == 0 {
-                return Ok(());
-            }
-            (self.yield_us)(1);
-        }
-        Err(I3cHciError::Timeout)
     }
 
     fn setup_interrupts(&self) {
@@ -524,4 +621,20 @@ pub fn discover_sections_from_regs(
 #[inline]
 fn field(value: u32, mask: u32, shift: u32) -> u32 {
     (value & mask) >> shift
+}
+
+impl<Y: FnMut(u32)> I3cHciCore<Y> {
+    fn wait_register_clear(&mut self, read: fn(&I3cHciRegisters) -> u32, mask: u32) -> Result<()> {
+        super::completion::poll(
+            constants::MIPI_I3C_HCI_RESET_TIMEOUT_US,
+            || {
+                if read(&self.regs) & mask == 0 {
+                    return Ok(Some(()));
+                }
+                (self.yield_us)(1);
+                Ok(None)
+            },
+            I3cHciError::Timeout,
+        )
+    }
 }

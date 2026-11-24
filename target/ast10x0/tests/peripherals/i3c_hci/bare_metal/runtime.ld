@@ -7,6 +7,7 @@ ENTRY(Reset)
 MEMORY
 {
     SRAM (rwx) : ORIGIN = 0x00000000, LENGTH = 640K
+    DMA_NC (rw) : ORIGIN = 0x000A0000, LENGTH = 128K
 }
 __stack_top = ORIGIN(SRAM) + LENGTH(SRAM);
 
@@ -42,6 +43,15 @@ SECTIONS
         __bss_end = .;
     } > SRAM
 
+    /* Reserved CPU-address window, not inherently non-cacheable on G2.
+     * NOLOAD memory is initialized explicitly before ring enable. */
+    .dma_nc (NOLOAD) : ALIGN(64)
+    {
+        __dma_nc_start = .;
+        KEEP(*(.dma_nc))
+        . = ALIGN(64);
+        __dma_nc_end = .;
+    } > DMA_NC
     /DISCARD/ : { *(.eh_frame*) }
 }
 ASSERT(SIZEOF(.vector_table) <= 0x800, "Vector table overlaps code")

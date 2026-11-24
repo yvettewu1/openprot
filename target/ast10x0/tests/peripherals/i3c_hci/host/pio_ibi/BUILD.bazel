@@ -1,0 +1,19 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+rust_test(
+    name = "pio_ibi",
+    srcs = [
+        "host_ibi.rs",
+        "//target/ast10x0/peripherals:i3c_hci_pio_model_sources",
+    ],
+    crate_root = "host_ibi.rs",
+    crate_name = "pio_ibi",
+    edition = "2024",
+    tags = ["manual"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
